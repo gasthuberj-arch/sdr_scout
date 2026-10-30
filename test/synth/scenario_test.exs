@@ -10,11 +10,15 @@ defmodule SdrScout.Synth.ScenarioTest do
 
     pos_even = Scenario.make_airborne_pos_frame(0x4840D6, 32000, 52.3676, 4.9041, :even)
     assert CRC.valid?(pos_even)
-    assert {:ok, %{type: :airborne_position, altitude: 32000, cpr_format: :even}} = Decoder.decode(pos_even)
+
+    assert {:ok, %{type: :airborne_position, altitude: 32000, cpr_format: :even}} =
+             Decoder.decode(pos_even)
 
     pos_odd = Scenario.make_airborne_pos_frame(0x4840D6, 32000, 52.3676, 4.9041, :odd)
     assert CRC.valid?(pos_odd)
-    assert {:ok, %{type: :airborne_position, altitude: 32000, cpr_format: :odd}} = Decoder.decode(pos_odd)
+
+    assert {:ok, %{type: :airborne_position, altitude: 32000, cpr_format: :odd}} =
+             Decoder.decode(pos_odd)
 
     vel_frame = Scenario.make_airborne_velocity_frame(0x4840D6, 450, 90.0, -1200)
     assert CRC.valid?(vel_frame)
@@ -28,6 +32,7 @@ defmodule SdrScout.Synth.ScenarioTest do
   test "generates multi-chunk stream of 64 KB blocks" do
     chunks = Scenario.generate_stream(num_chunks: 3)
     assert length(chunks) == 3
+
     for chunk <- chunks do
       assert byte_size(chunk) == 65_536
     end

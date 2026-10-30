@@ -9,7 +9,9 @@ defmodule SdrScout.Native.Dsp do
   - In-Zig CRC-24 verification and 1-bit syndrome error recovery
   - Live DSP telemetry metrics
   """
-  use Zig, otp_app: :sdr_scout
+  use Zig,
+    otp_app: :sdr_scout,
+    resources: [:DspContext]
 
   ~Z"""
   const std = @import("std");
@@ -107,35 +109,36 @@ defmodule SdrScout.Native.Dsp do
       }
   }
 
-  // Stateful DSP Resource
-  pub const DspContext = struct {
+  // Stateful DSP Data
+  pub const DspData = struct {
       overlap_buf: [480]u8,
       overlap_len: usize,
       samples_processed: u64,
       preambles_detected: u64,
       crc_valid: u64,
       single_bit_recovered: u64,
-
-      pub fn init() DspContext {
-          init_syndromes();
-          var ctx = DspContext{
-              .overlap_buf = undefined,
-              .overlap_len = 0,
-              .samples_processed = 0,
-              .preambles_detected = 0,
-              .crc_valid = 0,
-              .single_bit_recovered = 0,
-          };
-          @memset(&ctx.overlap_buf, 127);
-          return ctx;
-      }
   };
 
-  pub fn new_context() DspContext {
-      return DspContext.init();
+  pub const DspContext = beam.Resource(*DspData, @import("root"), .{});
+
+  pub fn new_context() !DspContext {
+      init_syndromes();
+      const allocator = std.heap.c_allocator;
+      const data = try allocator.create(DspData);
+      data.* = .{
+          .overlap_buf = undefined,
+          .overlap_len = 0,
+          .samples_processed = 0,
+          .preambles_detected = 0,
+          .crc_valid = 0,
+          .single_bit_recovered = 0,
+      };
+      @memset(&data.overlap_buf, 127);
+      return DspContext.create(data, .{});
   }
 
-  pub fn get_telemetry(ctx: *DspContext) [4]u64 {
+  pub fn get_telemetry(res: DspContext) [4]u64 {
+      const ctx = res.unpack();
       return .{
           ctx.samples_processed,
           ctx.preambles_detected,
@@ -147,7 +150,8 @@ defmodule SdrScout.Native.Dsp do
   // Process incoming chunk of raw I/Q bytes
   // Prepend overlap tail, compute SIMD magnitude, scan preambles,
   // slice PPM, check & fix CRC-24, and emit 14-byte frames.
-  pub fn process_chunk(ctx: *DspContext, chunk: []const u8) beam.term {
+  pub fn process_chunk(res: DspContext, chunk: []const u8) beam.term {
+      const ctx = res.unpack();
       init_syndromes();
 
       // Allocate total stream buffer = overlap + chunk
@@ -159,9 +163,7 @@ defmodule SdrScout.Native.Dsp do
           return beam.make_empty_list(.{});
       }
 
-      var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-      defer _ = gpa.deinit();
-      const allocator = gpa.allocator();
+      const allocator = std.heap.c_allocator;
 
       const iq_buf = allocator.alloc(u8, total_bytes) catch return beam.make_empty_list(.{});
       defer allocator.free(iq_buf);
@@ -213,13 +215,13 @@ defmodule SdrScout.Native.Dsp do
       }
 
       // Preamble scanning and frame extraction
-      var frames = std.ArrayList([14]u8).init(allocator);
-      defer frames.deinit();
+      var frames: [64][14]u8 = undefined;
+      var num_frames: usize = 0;
 
       var sample_idx: usize = 0;
       const search_limit = if (num_samples >= 240) num_samples - 240 else 0;
 
-      while (sample_idx < search_limit) {
+      while (sample_idx < search_limit and num_frames < 64) {
           if (is_preamble(mag_buf, sample_idx)) {
               ctx.preambles_detected += 1;
               var candidate_frame: [14]u8 = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -229,7 +231,8 @@ defmodule SdrScout.Native.Dsp do
               const syndrome = compute_crc24(&candidate_frame);
               if (syndrome == 0) {
                   ctx.crc_valid += 1;
-                  frames.append(candidate_frame) catch {};
+                  frames[num_frames] = candidate_frame;
+                  num_frames += 1;
                   sample_idx += 240; // Skip past the message duration
                   continue;
               } else {
@@ -241,7 +244,8 @@ defmodule SdrScout.Native.Dsp do
                           // Found the exact corrupted bit: flip it
                           candidate_frame[bit_pos / 8] ^= (@as(u8, 1) << @intCast(7 - (bit_pos % 8)));
                           ctx.single_bit_recovered += 1;
-                          frames.append(candidate_frame) catch {};
+                          frames[num_frames] = candidate_frame;
+                          num_frames += 1;
                           recovered = true;
                           break;
                       }
@@ -257,10 +261,10 @@ defmodule SdrScout.Native.Dsp do
 
       // Build return list of binaries for Elixir
       var out_list = beam.make_empty_list(.{});
-      var f_idx = frames.items.len;
+      var f_idx = num_frames;
       while (f_idx > 0) {
           f_idx -= 1;
-          const bin_term = beam.make(frames.items[f_idx][0..14], .{ .as = .binary });
+          const bin_term = beam.make(frames[f_idx][0..14], .{ .as = .binary });
           out_list = beam.make_list_cell(bin_term, out_list, .{});
       }
 

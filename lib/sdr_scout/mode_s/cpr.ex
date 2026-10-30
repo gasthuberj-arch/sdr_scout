@@ -67,18 +67,26 @@ defmodule SdrScout.ModeS.CPR do
     # Lat encoding
     lat_even_cpr = round(rem_floor(floor(131_072.0 * (rem_floor(lat, 6.0) / 6.0) + 0.5), 131_072))
     d_lat_odd = 360.0 / 59.0
-    lat_odd_cpr = round(rem_floor(floor(131_072.0 * (rem_floor(lat, d_lat_odd) / d_lat_odd) + 0.5), 131_072))
+
+    lat_odd_cpr =
+      round(rem_floor(floor(131_072.0 * (rem_floor(lat, d_lat_odd) / d_lat_odd) + 0.5), 131_072))
 
     nl_val = nl(lat)
 
     # Lon encoding - even
     d_lon_even = if nl_val > 0, do: 360.0 / nl_val, else: 360.0
-    lon_even_cpr = round(rem_floor(floor(131_072.0 * (rem_floor(lon, d_lon_even) / d_lon_even) + 0.5), 131_072))
+
+    lon_even_cpr =
+      round(
+        rem_floor(floor(131_072.0 * (rem_floor(lon, d_lon_even) / d_lon_even) + 0.5), 131_072)
+      )
 
     # Lon encoding - odd
     nl_odd = max(nl_val - 1, 1)
     d_lon_odd = 360.0 / nl_odd
-    lon_odd_cpr = round(rem_floor(floor(131_072.0 * (rem_floor(lon, d_lon_odd) / d_lon_odd) + 0.5), 131_072))
+
+    lon_odd_cpr =
+      round(rem_floor(floor(131_072.0 * (rem_floor(lon, d_lon_odd) / d_lon_odd) + 0.5), 131_072))
 
     %{
       even: {lat_even_cpr, lon_even_cpr},

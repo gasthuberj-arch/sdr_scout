@@ -21,7 +21,7 @@ defmodule SdrScout.ModeS.CRC do
   defp do_lfsr([], reg), do: band(reg, 0xFFFFFF)
 
   defp do_lfsr([bit | rest], reg) do
-    msb = (reg >>> 23) &&& 1
+    msb = reg >>> 23 &&& 1
     new_reg = band(reg <<< 1, 0xFFFFFF) ||| bit
 
     next_reg =

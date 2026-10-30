@@ -2,7 +2,7 @@ defmodule SdrScout.Pipeline.Producer do
   @moduledoc """
   GenStage Producer for raw I/Q chunks.
   Supports:
-  - `:benchmark` mode: drains chunks unthrottled to measure peak DSP throughput.
+  - `:benchmark` mode: drains chunks fulfilling batches up to the requested demand.
   - `:realtime` mode: paces chunks at 2.0 MSPS (32.768 ms per 64 KB chunk).
   """
   use GenStage
@@ -49,10 +49,14 @@ defmodule SdrScout.Pipeline.Producer do
     {:noreply, [], state}
   end
 
-  defp dispatch(%{chunks: [chunk | rest], demand: demand, mode: :benchmark} = state) do
-    {:noreply, [chunk], %{state | chunks: rest, demand: demand - 1}}
+  # Benchmark mode: batch take up to demand chunks
+  defp dispatch(%{chunks: chunks, demand: demand, mode: :benchmark} = state) when chunks != [] do
+    {to_emit, remaining} = Enum.split(chunks, demand)
+    emitted_count = length(to_emit)
+    {:noreply, to_emit, %{state | chunks: remaining, demand: demand - emitted_count}}
   end
 
+  # Realtime mode: emit one chunk and pace next tick
   defp dispatch(
          %{chunks: [chunk | rest], demand: demand, mode: :realtime, timer_active: false} = state
        ) do
@@ -60,8 +64,7 @@ defmodule SdrScout.Pipeline.Producer do
     {:noreply, [chunk], %{state | chunks: rest, demand: demand - 1, timer_active: true}}
   end
 
-  defp dispatch(%{chunks: [], source_fun: fun, demand: _demand} = state)
-       when is_function(fun, 0) do
+  defp dispatch(%{chunks: [], source_fun: fun} = state) when is_function(fun, 0) do
     case fun.() do
       :eof ->
         {:stop, :normal, state}

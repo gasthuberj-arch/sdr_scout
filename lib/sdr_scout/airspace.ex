@@ -1,44 +1,25 @@
 defmodule SdrScout.Airspace do
   @moduledoc """
-  Cluster-ready state tracker for all detected aircraft in airspace.
-  Maintains current state per 24-bit ICAO address:
-  - Callsign
-  - Altitude (ft)
-  - Lat / Lon (resolved via CPR odd/even pairing)
-  - Speed (knots)
-  - Heading (degrees)
-  - Vertical rate (ft/min)
-  - Messages received count
-  - Last updated timestamp
-
-  Publishes state updates via Registry so local (TUI radar) or distributed
-  (Phoenix LiveView / multi-node clusters) subscribers can track live movements.
+  Cluster-ready state manager for all tracked aircraft in the monitored airspace.
+  Features:
+  - Tracks aircraft by 24-bit ICAO address via `SdrScout.Aircraft`
+  - Periodically evicts stale aircraft after configurable timeout (default: 60s)
+  - Broadcasts updates and evictions via local `Registry` and distributed `:pg`
   """
   use GenServer
-  alias SdrScout.ModeS.{Decoder, CPR}
+  alias SdrScout.ModeS.Decoder
+  alias SdrScout.Aircraft
 
   @pubsub_registry SdrScout.Airspace.PubSub
-
-  defstruct [
-    :icao,
-    :icao_hex,
-    :callsign,
-    :altitude,
-    :latitude,
-    :longitude,
-    :speed,
-    :heading,
-    :vertical_rate,
-    :cpr_even,
-    :cpr_odd,
-    :last_seen,
-    message_count: 0
-  ]
+  @pg_group :sdr_scout_airspace
+  @default_stale_timeout_ms 60_000
+  @eviction_interval_ms 5_000
 
   # Client API
 
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    name = Keyword.get(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: name)
   end
 
   @doc """
@@ -49,7 +30,7 @@ defmodule SdrScout.Airspace do
   end
 
   @doc """
-  Returns a snapshot map of all currently tracked aircraft.
+  Returns a snapshot map of all currently active aircraft.
   """
   def get_airspace do
     GenServer.call(__MODULE__, :get_airspace)
@@ -65,8 +46,18 @@ defmodule SdrScout.Airspace do
   # Server Callbacks
 
   @impl true
-  def init(_opts) do
-    {:ok, %{aircraft: %{}}}
+  def init(opts) do
+    # Join distributed :pg group if available
+    try do
+      :pg.join(@pg_group, self())
+    catch
+      _, _ -> :ok
+    end
+
+    stale_timeout = Keyword.get(opts, :stale_timeout_ms, @default_stale_timeout_ms)
+    schedule_eviction()
+
+    {:ok, %{aircraft: %{}, stale_timeout_ms: stale_timeout}}
   end
 
   @impl true
@@ -78,81 +69,54 @@ defmodule SdrScout.Airspace do
   def handle_cast({:process_frame, frame}, state) do
     case Decoder.decode(frame) do
       {:ok, decoded} ->
-        updated_aircraft = update_aircraft(state.aircraft, decoded)
-        {:noreply, %{state | aircraft: updated_aircraft}}
+        now = System.monotonic_time(:millisecond)
+        icao = decoded.icao
+        existing = Map.get(state.aircraft, icao, Aircraft.new(icao, decoded.icao_hex))
+        updated = Aircraft.apply_message(existing, decoded, now)
+
+        broadcast({:aircraft_updated, updated})
+        {:noreply, %{state | aircraft: Map.put(state.aircraft, icao, updated)}}
 
       {:error, _} ->
         {:noreply, state}
     end
   end
 
-  defp update_aircraft(aircraft_map, decoded) do
-    icao = decoded.icao
-    existing = Map.get(aircraft_map, icao, %__MODULE__{icao: icao, icao_hex: decoded.icao_hex})
-
+  @impl true
+  def handle_info(:evict_stale, state) do
     now = System.monotonic_time(:millisecond)
+    cutoff = now - state.stale_timeout_ms
 
-    updated =
-      existing
-      |> Map.update!(:message_count, &(&1 + 1))
-      |> Map.put(:last_seen, now)
-      |> apply_message(decoded, now)
+    {active, evicted} =
+      Enum.split_with(state.aircraft, fn {_icao, ac} ->
+        ac.last_seen >= cutoff
+      end)
 
-    broadcast({:aircraft_updated, updated})
-    Map.put(aircraft_map, icao, updated)
-  end
-
-  defp apply_message(ac, %{type: :identification, callsign: cs}, _now) do
-    %{ac | callsign: cs}
-  end
-
-  defp apply_message(
-         ac,
-         %{type: :airborne_velocity, speed: spd, heading: hdg, vertical_rate: vr},
-         _now
-       ) do
-    %{ac | speed: spd, heading: hdg, vertical_rate: vr}
-  end
-
-  defp apply_message(
-         ac,
-         %{
-           type: :airborne_position,
-           altitude: alt,
-           cpr_format: fmt,
-           lat_cpr: lat_cpr,
-           lon_cpr: lon_cpr
-         },
-         now
-       ) do
-    cpr_report = %{lat_cpr: lat_cpr, lon_cpr: lon_cpr, time: now}
-
-    ac = %{ac | altitude: alt}
-
-    ac =
-      case fmt do
-        :even -> %{ac | cpr_even: cpr_report}
-        :odd -> %{ac | cpr_odd: cpr_report}
-      end
-
-    if ac.cpr_even != nil and ac.cpr_odd != nil do
-      case CPR.decode_global(ac.cpr_even, ac.cpr_odd) do
-        {:ok, {lat, lon}} ->
-          %{ac | latitude: lat, longitude: lon}
-
-        {:error, _} ->
-          ac
-      end
-    else
-      ac
+    for {icao, _} <- evicted do
+      broadcast({:aircraft_evicted, icao})
     end
+
+    schedule_eviction()
+    {:noreply, %{state | aircraft: Map.new(active)}}
   end
 
-  defp apply_message(ac, _other, _now), do: ac
+  defp schedule_eviction do
+    Process.send_after(self(), :evict_stale, @eviction_interval_ms)
+  end
 
   defp broadcast(event) do
+    # 1. Local Registry
     Registry.dispatch(@pubsub_registry, "airspace", fn entries ->
       for {pid, _} <- entries, do: send(pid, event)
     end)
+
+    # 2. Distributed :pg group
+    try do
+      for pid <- :pg.get_members(@pg_group), pid != self() do
+        send(pid, event)
+      end
+    catch
+      _, _ -> :ok
+    end
   end
 end

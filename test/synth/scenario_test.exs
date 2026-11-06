@@ -1,28 +1,28 @@
 defmodule SdrScout.Synth.ScenarioTest do
   use ExUnit.Case, async: true
   alias SdrScout.Synth.Scenario
-  alias SdrScout.ModeS.{CRC, Decoder}
+  alias SdrScout.ModeS
 
   test "generates valid scenario frames" do
     id_frame = Scenario.make_identification_frame(0x4840D6, "KLM1023")
-    assert CRC.valid?(id_frame)
-    assert {:ok, %{type: :identification, callsign: "KLM1023"}} = Decoder.decode(id_frame)
+    assert ModeS.valid?(id_frame)
+    assert {:ok, %{type: :identification, callsign: "KLM1023"}} = ModeS.decode(id_frame)
 
     pos_even = Scenario.make_airborne_pos_frame(0x4840D6, 32000, 52.3676, 4.9041, :even)
-    assert CRC.valid?(pos_even)
+    assert ModeS.valid?(pos_even)
 
     assert {:ok, %{type: :airborne_position, altitude: 32000, cpr_format: :even}} =
-             Decoder.decode(pos_even)
+             ModeS.decode(pos_even)
 
     pos_odd = Scenario.make_airborne_pos_frame(0x4840D6, 32000, 52.3676, 4.9041, :odd)
-    assert CRC.valid?(pos_odd)
+    assert ModeS.valid?(pos_odd)
 
     assert {:ok, %{type: :airborne_position, altitude: 32000, cpr_format: :odd}} =
-             Decoder.decode(pos_odd)
+             ModeS.decode(pos_odd)
 
     vel_frame = Scenario.make_airborne_velocity_frame(0x4840D6, 450, 90.0, -1200)
-    assert CRC.valid?(vel_frame)
-    assert {:ok, decoded_vel} = Decoder.decode(vel_frame)
+    assert ModeS.valid?(vel_frame)
+    assert {:ok, decoded_vel} = ModeS.decode(vel_frame)
     assert decoded_vel.type == :airborne_velocity
     assert_in_delta decoded_vel.speed, 450, 2
     assert_in_delta decoded_vel.heading, 90.0, 2.0

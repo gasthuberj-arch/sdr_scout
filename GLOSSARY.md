@@ -72,9 +72,9 @@ _Avoid_: Sub-bin guess, peak smoother
 A mesh of independent BEAM virtual machine nodes communicating transparently via TCP sockets, providing location-agnostic actor messaging and distributed process groups (`:pg`) with zero external middleware.
 _Avoid_: Microservice cluster, REST gateway network
 
-**Distributed Erlang Cluster**:
-A mesh of independent BEAM virtual machine nodes communicating transparently via TCP sockets, providing location-agnostic actor messaging and distributed process groups (`:pg`) with zero external middleware.
-_Avoid_: Microservice cluster, REST gateway network
+**Airspace Tracking**:
+The stateful process of ingesting decoded Mode-S Extended Squitter frames, calculating aircraft kinematics (latitude/longitude from even/odd CPR pairs, barometric/geometric altitude, ground speed, heading, callsign), and evicting stale flight contacts after a timeout threshold.
+_Avoid_: Radar database, flight store
 
 **Downconversion / Mixing**:
 Multiplying a high-frequency bandpass RF signal by a local oscillator tone ($e^{-j 2\pi f_c t}$) to translate the center frequency from carrier frequency $f_c$ down to $0\text{ Hz}$ (baseband).

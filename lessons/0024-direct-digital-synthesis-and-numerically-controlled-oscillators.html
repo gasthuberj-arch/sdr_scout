@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 24: Direct Digital Synthesis (DDS) &amp; Numerically Controlled Oscillators (NCO) — Phase Accumulators, LUT Quantization, and CORDIC</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0024</span>
+    <span class="badge badge-arch">Synthesizers &amp; NCOs</span>
+    <span>Reading time: 18 minutes</span>
+  </div>
+
+  <h1>Direct Digital Synthesis (DDS) &amp; Numerically Controlled Oscillators (NCO): Phase Accumulators, LUT Quantization, and CORDIC</h1>
+
+  <p>
+    In software-defined radio, generating and manipulating sinusoidal carriers is ubiquitous. Whether translating an RF passband down to complex baseband (Digital Down-Conversion, DDC), tracking carrier frequency offset in a Costas loop (as explored in <a href="0016-costas-loops-and-carrier-phase-synchronization.html">Lesson 16</a>), steering beams in a phased array (<a href="0020-phased-array-beamforming-and-spatial-filtering.html">Lesson 20</a>), or synthesizing agile FSK tones for APRS (<a href="0023-fsk-afsk-demodulation-and-quadrature-discriminators.html">Lesson 23</a>) and FT8 (<a href="0018-weak-signal-dsp-ft8-mfsk-and-ldpc.html">Lesson 18</a>), SDR engines must generate continuous-frequency sinusoids with micro-Hertz precision, zero settling time, and pristine spectral purity.
+  </p>
+
+  <p>
+    In high-level languages, developers often write <code>:math.cos(theta)</code> or <code>sinf(phase)</code> (as seen in <a href="file:///home/johannes/code/sdr_scout/lib/sdr_scout/synth/aprs.ex"><code>SdrScout.Synth.APRS</code></a>). While acceptable for offline packet generation at 48 kHz, computing transcendental functions per sample at line rates of 20 to 100+ MSPS cripples memory pipelines and exhausts CPU cycles. 
+  </p>
+
+  <p>
+    This lesson demystifies the two foundational architectures powering digital frequency synthesis in hardware and high-performance software: <strong>Direct Digital Synthesis (DDS) / Numerically Controlled Oscillators (NCO)</strong> using truncated phase accumulators with look-up tables (LUTs), and <strong>COordinate Rotation DIgital Computation (CORDIC)</strong> for multiplierless vector rotation.
+  </p>
+
+  <h2>1. The Fundamental SDR Problem: The Demise of Analog LOs</h2>
+
+  <p>
+    Traditional superheterodyne transceivers rely on analog Local Oscillators (LOs) constructed from LC tank circuits, varactor diodes, and analog Phase-Locked Loops (PLLs). While mature, analog synthesizers impose severe physical constraints on software-defined architectures:
+  </p>
+
+  <ul>
+    <li><strong>Settling Latency &amp; Phase Transients:</strong> Analog PLLs require hundreds of microseconds or milliseconds to change frequency due to loop filter charge dynamics. Switching frequencies introduces chaotic phase transients, ruling out zero-overhead fast frequency hopping (FHSS) or agile radar chirps.</li>
+    <li><strong>Phase Noise &amp; Thermal Drift:</strong> Analog LC resonators suffer from mechanical microphonics, component aging, and thermal frequency drift, requiring constant calibration against temperature-compensated crystal oscillators (TCXOs).</li>
+    <li><strong>Coherence Bottlenecks in Phased Arrays:</strong> Synchronizing $M$ distinct analog local oscillators with absolute, deterministic phase alignment across power cycles is an analog calibration nightmare.</li>
+  </ul>
+
+  <p>
+    A purely digital frequency synthesizer—termed a <strong>Numerically Controlled Oscillator (NCO)</strong> in software/DSP and a <strong>Direct Digital Synthesizer (DDS)</strong> when coupled directly to a digital-to-analog converter (DAC)—solves every one of these problems:
+  </p>
+
+  <ol>
+    <li><strong>Instantaneous Frequency Switching:</strong> Changing frequency is achieved by writing a single integer register in a single clock cycle, maintaining seamless phase continuity ($\mathcal{C}^0$).</li>
+    <li><strong>Micro-Hertz Tuning Resolution:</strong> Frequency resolution is governed strictly by accumulator bit-width, achieving micro-Hertz precision across hundreds of megahertz.</li>
+    <li><strong>Exact Mathematical Phase Coherence:</strong> Multiple NCO instances clocked by the same master clock share identical, deterministic phase states, enabling effortless beamforming and MIMO channel alignment.</li>
+  </ol>
+
+  <h2>2. DDS / NCO Architecture: The Core Engine</h2>
+
+  <p>
+    The classic DDS architecture consists of four sequential stages:
+  </p>
+
+  <ol>
+    <li><strong>The $N$-bit Phase Accumulator:</strong> A digital register that increments by a fixed <strong>Frequency Tuning Word ($FTW$)</strong> on every clock edge of $f_{\text{clk}}$.</li>
+    <li><strong>Phase Truncation:</strong> Extracting the $W$ most significant bits ($W \ll N$) of the accumulator to address memory.</li>
+    <li><strong>Phase-to-Amplitude Converter (Sine/Cosine LUT):</strong> A memory table mapping discrete phase angles into quantized amplitude samples.</li>
+    <li><strong>Mixing / Conversion Stage:</strong> In a transmitter, feeding an analog DAC with a low-pass reconstruction filter; in a digital receiver (DDC), performing a complex multiplication with incoming $I/Q$ baseband data.</li>
+  </ol>
+
+  <pre><code>                     +---------------------------------------+
+                     |         N-bit Phase Accumulator       |
+                     +---------------------------------------+
+Clock (f_clk) ------>|  [ + ] <--- Frequency Tuning Word     |
+                     |    |         (FTW, N bits)            |
+                     |    v                                  |
+                     | [Reg]--------+                        |
+                     +----|---------|------------------------+
+                          | (N bits)| Feedback Loop
+                          v         +------------------------>
+                  [ Phase Truncation ] (Discard N - W bits)
+                          |
+                          | (W bits Address)
+                          v
+               +----------------------+
+               | Phase-to-Amplitude   |
+               | Sine / Cosine LUT    |
+               +----------------------+
+                     |          |
+            (D bits) |          | (D bits)
+                     v          v
+                  cos(theta)  sin(theta)
+                     |          |
+                     v          v
+               [ Baseband Mixer / DAC Stage ]</code></pre>
+
+  <h3>Two's Complement Modular Arithmetic as Circle Traversal</h3>
+
+  <p>
+    The genius of the phase accumulator lies in binary modulo arithmetic. An $N$-bit unsigned integer register naturally wraps around modulo $2^N$:
+  </p>
+
+  $$\theta[n] = (\theta[n-1] + FTW) \pmod{2^N}$$
+
+  <p>
+    This digital overflow directly mirrors the geometric topology of the unit circle: traversing an angle from $2\pi - \epsilon$ to $0$ radians is identical to an unsigned accumulator wrapping from $2^N - 1$ back to $0$. There are no conditional branches, no bounds checks, and no transcendental calls. An ordinary hardware adder executes this modulo $2^N$ phase wrapping in a single machine instruction.
+  </p>
+
+  <h2>3. Frequency Derivation &amp; Micro-Hertz Resolution</h2>
+
+  <p>
+    Let's derive the exact mathematical relationship governing the synthesized output frequency $f_{\text{out}}$.
+  </p>
+
+  <p>
+    The phase accumulator maps the continuous interval $[0, 2\pi)$ onto $2^N$ discrete digital phase states. Each increment of $FTW$ advances the phase by:
+  </p>
+
+  $$\Delta\theta = FTW \cdot \frac{2\pi}{2^N}\text{ radians}$$
+
+  <p>
+    Since the accumulator updates once per master clock period $T_{\text{clk}} = 1/f_{\text{clk}}$, the discrete-time phase velocity (angular frequency $\omega_{\text{out}}$) is:
+  </p>
+
+  $$\omega_{\text{out}} = \frac{\Delta\theta}{T_{\text{clk}}} = \Delta\theta \cdot f_{\text{clk}} = \frac{2\pi \cdot FTW \cdot f_{\text{clk}}}{2^N}\text{ rad/s}$$
+
+  <p>
+    Equating $\omega_{\text{out}} = 2\pi f_{\text{out}}$ yields the foundational <strong>DDS Frequency Equation</strong>:
+  </p>
+
+  $$f_{\text{out}} = \frac{f_{\text{clk}} \cdot FTW}{2^N}$$
+
+  <h3>Deriving Minimum Frequency Step Resolution</h3>
+
+  <p>
+    The finest frequency adjustment possible corresponds to incrementing the tuning word by the least significant bit ($FTW = 1$):
+  </p>
+
+  $$\Delta f_{\text{min}} = \frac{f_{\text{clk}}}{2^N}$$
+
+  <p>
+    Notice that the tuning resolution is decoupled from analog components; it depends entirely on the accumulator register width $N$:
+  </p>
+
+  <ul>
+    <li>
+      <strong>32-bit Accumulator at $f_{\text{clk}} = 100\text{ MHz}$ (Standard SDR DDC):</strong>
+      $$\Delta f_{\text{min}} = \frac{100 \times 10^6\text{ Hz}}{2^{32}} = \frac{100 \times 10^6}{4,294,967,296} \approx \mathbf{0.02328\text{ Hz}} \quad (23.3\text{ mHz})$$
+      At 100 MHz, a 32-bit register resolves carrier frequency steps of less than a quarter of a tenth of a Hertz!
+    </li>
+    <li>
+      <strong>48-bit Accumulator at $f_{\text{clk}} = 100\text{ MHz}$ (e.g., AD9910 / AD9954 DDS chips):</strong>
+      $$\Delta f_{\text{min}} = \frac{100 \times 10^6\text{ Hz}}{2^{48}} = \frac{100 \times 10^6}{281,474,976,710,656} \approx \mathbf{3.55 \times 10^{-7}\text{ Hz}} = \mathbf{0.355\,\mu\text{Hz}}$$
+      Sub-micro-Hertz precision allows an SDR transmitter to track satellite Doppler drift or earth-moon-earth (EME) lunar orbital velocity with zero measurable quantization drift over months.
+    </li>
+  </ul>
+
+  <div class="callout">
+    <div class="callout-title">Nyquist Limits &amp; Negative Frequencies</div>
+    <p>
+      In a real-valued DDS driving an analog DAC, the maximum synthesized frequency cannot exceed the Nyquist boundary $f_{\text{out}} < f_{\text{clk}} / 2$, which corresponds to $FTW < 2^{N-1}$. In practice, anti-aliasing reconstruction filter roll-off limits practical analog DDS outputs to approximately $0.4 f_{\text{clk}}$.
+    </p>
+    <p>
+      In a <strong>complex baseband NCO</strong> (mixing complex $I/Q$ signals), the phase accumulator represents analytic rotation $e^{j \omega n}$. Here, $FTW$ can be a signed two's complement integer spanning $[-2^{N-1}, 2^{N-1}-1]$, directly synthesizing negative and positive frequency shifts across $[-f_s/2, +f_s/2]$ without analog aliasing ambiguity.
+    </p>
+  </div>
+
+  <h2>4. Quantization Dynamics: Phase Truncation vs. Amplitude Quantization</h2>
+
+  <p>
+    Why can we not simply use the full $N$-bit accumulator to look up sine values?
+  </p>
+
+  <p>
+    Consider a 32-bit accumulator. An unconstrained look-up table would require $2^{32}$ entries. If each table entry stores a 16-bit word (2 bytes), the required memory is:
+  </p>
+
+  $$2^{32} \times 2\text{ bytes} = 4,294,967,296 \times 2\text{ B} = \mathbf{8.589\text{ Gigabytes}}$$
+
+  <p>
+    Storing an 8.5 GB table inside an FPGA block RAM (which tops out at a few tens of megabits) or in high-speed CPU L1 cache (32–64 KB) is physically impossible. Therefore, the system designer must <strong>truncate the phase</strong>, preserving only the $W$ most significant bits (typically $W = 10$ to $16$) to address the LUT, discarding the lower $B_{\text{trunc}} = N - W$ bits.
+  </p>
+
+  <h3>Phase Truncation Noise: The Origin of Discrete Spurs</h3>
+
+  <p>
+    Discarding the lower $(N - W)$ bits introduces a deterministic phase error $\epsilon_\theta[n]$:
+  </p>
+
+  $$\theta_{\text{LUT}}[n] = \theta[n] - \epsilon_\theta[n], \quad 0 \le \epsilon_\theta[n] < 2^{N-W}$$
+
+  <p>
+    When scaled to radians, $\epsilon_\theta[n] \in [0, 2\pi \cdot 2^{-W})$. The synthesized waveform becomes:
+  </p>
+
+  $$s[n] = \cos(\omega_0 n - \epsilon_\theta[n]) \approx \cos(\omega_0 n) + \epsilon_\theta[n] \sin(\omega_0 n)$$
+
+  <p>
+    Because $\epsilon_\theta[n]$ is generated by a deterministic accumulator overflow, it is a <strong>periodic sawtooth waveform</strong> in the time domain. Multiplying the carrier $\sin(\omega_0 n)$ by a periodic error $\epsilon_\theta[n]$ phase-modulates the carrier, producing distinct, sharp spectral spikes: <strong>Phase Truncation Spurs</strong>.
+  </p>
+
+  <p>
+    The Spurious-Free Dynamic Range (SFDR) due to phase truncation is bounded by the famous <strong>Nicholas &amp; Samueli Rule</strong>:
+  </p>
+
+  $$\text{SFDR}_{\text{phase truncation}} \approx 6.02 \cdot W\text{ dBc}$$
+
+  <ul>
+    <li>$W = 10\text{ bits} \implies \text{SFDR} \approx 60.2\text{ dBc}$ (Table size: 1024 words $= 2\text{ KB}$)</li>
+    <li>$W = 12\text{ bits} \implies \text{SFDR} \approx 72.2\text{ dBc}$ (Table size: 4096 words $= 8\text{ KB}$, fits comfortably in L1)</li>
+    <li>$W = 14\text{ bits} \implies \text{SFDR} \approx 84.3\text{ dBc}$ (Table size: 16384 words $= 32\text{ KB}$)</li>
+    <li>$W = 16\text{ bits} \implies \text{SFDR} \approx 96.3\text{ dBc}$ (Table size: 65536 words $= 128\text{ KB}$)</li>
+  </ul>
+
+  <h3>Amplitude Quantization Noise</h3>
+
+  <p>
+    In addition to phase truncation, the amplitude values stored in the table are quantized to $D$ bits (e.g., $D = 12, 14, 16$). As derived in <a href="0021-adc-dynamic-range-quantization-and-agc.html">Lesson 21</a>, uniform amplitude quantization error has variance $\sigma_q^2 = \Delta^2 / 12$, producing a broadband white noise floor:
+  </p>
+
+  $$\text{SQNR} \approx 6.02 D + 1.76\text{ dB}$$
+
+  <div class="callout upside">
+    <div class="callout-title">The Balanced Design Rule</div>
+    <p>
+      There is no architectural benefit in making the amplitude word width $D$ significantly larger than the phase address width $W$. If $D = 16$ but $W = 10$, the output will possess a theoretical $98\text{ dB}$ SNR broadband floor, but will be plagued by massive discrete phase spurs at $-60\text{ dBc}$.
+    </p>
+    <p>
+      Optimal DDS design adheres to the rule: <strong>$W \approx D + 2$ to $D + 3$</strong>. This guarantees that phase truncation spurs are suppressed beneath the amplitude quantization noise floor.
+    </p>
+  </div>
+
+  <h2>5. Spurious Reduction Techniques</h2>
+
+  <h3>1. Phase Dithering via PRNG / LFSR</h3>
+
+  <p>
+    In narrow-band amateur radio receivers, discrete spurs are fatal: if an LO phase spur lands on top of a weak CW or FT8 signal ($-120\text{ dBm}$), it creates a permanent phantom carrier. A uniform white noise floor, however, can be easily integrated out via coherent DSP.
+  </p>
+
+  <p>
+    <strong>Phase Dithering</strong> breaks the periodicity of the phase truncation error $\epsilon_\theta[n]$ by adding a small pseudo-random noise sequence before truncation:
+  </p>
+
+  $$\theta_{\text{dithered}}[n] = \theta[n] + \text{LFSR}[n]$$
+
+  <pre><code>Phase Accumulator [N bits] ----> [ + ] ----> [ Truncate to W bits ] ----> LUT
+                                    ^
+                                    |
+                        [ (N - W)-bit LFSR / PRNG ]</code></pre>
+
+  <p>
+    By injecting pseudo-random dither with an amplitude of a few LSBs of the truncated word, the deterministic phase error is modulated into a random, uncorrelated process. The sharp, line-spectrum spurs collapse into a flat, benign Gaussian/uniform noise floor. 
+  </p>
+  <p>
+    <strong>Engineering Trade-off:</strong> Dithering improves SFDR by <strong>$12\text{ dB}$ to $18\text{ dB}$</strong>, pushing spurs down toward the amplitude quantization floor at the expense of a negligible $1 - 2\text{ dB}$ increase in the total broadband noise floor.
+  </p>
+
+  <h3>2. Taylor Series Polynomial Interpolation</h3>
+
+  <p>
+    Instead of adding noise, we can algebraically approximate the discarded phase bits using Taylor polynomial expansion. Let the accumulator phase $\theta$ be split into a coarse angle $\theta_c$ (the $W$ MSBs) and a fine fractional angle $\theta_f$ (the $N-W$ LSBs):
+  </p>
+
+  $$\theta = \theta_c + \theta_f, \quad \text{where } \theta_f \ll 1\text{ rad}$$
+
+  <p>
+    Applying the standard trigonometric sum formula:
+  </p>
+
+  $$\sin(\theta_c + \theta_f) = \sin(\theta_c)\cos(\theta_f) + \cos(\theta_c)\sin(\theta_f)$$
+
+  <p>
+    Since $\theta_f$ is very small, we use first-order Taylor approximations $\cos(\theta_f) \approx 1$ and $\sin(\theta_f) \approx \theta_f$:
+  </p>
+
+  $$\sin(\theta_c + \theta_f) \approx \sin(\theta_c) + \theta_f \cdot \cos(\theta_c)$$
+
+  <p>
+    With a single hardware Multiply-Accumulate (MAC) unit, the DDS computes:
+  </p>
+
+  $$y[n] = \text{LUT}_{\sin}[\theta_c] + \theta_f \cdot \text{LUT}_{\cos}[\theta_c]$$
+
+  <p>
+    This technique achieves the spur performance of a 16-bit to 20-bit table ($> 110\text{ dBc}$ SFDR) while using only a compact 10-bit look-up table ($1\text{ KB}$), dramatically reducing memory footprint.
+  </p>
+
+  <h2>6. The CORDIC Algorithm: Multiplierless Vector Rotation</h2>
+
+  <p>
+    While LUT-based DDS is fast, look-up tables face severe limitations:
+  </p>
+  <ul>
+    <li>They consume valuable on-chip RAM (FPGA Block RAM or CPU L1/L2 cache lines).</li>
+    <li>Memory lookups in SIMD vector engines require vector gathers (e.g., AVX2 <code>_mm256_i32gather_ps</code>), which introduce high latency and memory port contention.</li>
+    <li>In digital down-converters, generating $\cos\theta$ and $\sin\theta$ is only half the battle; the samples must then be multiplied by $I_{\text{in}}$ and $Q_{\text{in}}$ using four real hardware multipliers.</li>
+  </ul>
+
+  <p>
+    In 1959, Jack E. Volder invented <strong>CORDIC (COordinate Rotation DIgital Computation)</strong>. CORDIC generates sine and cosine—and simultaneously performs complex mixing—using <strong>only arithmetic bit-shifts and additions</strong>.
+  </p>
+
+  <h3>Mathematical Derivation of CORDIC Rotation</h3>
+
+  <p>
+    To rotate an arbitrary Cartesian 2D vector $\mathbf{v}_i = [x_i, y_i]^T$ by an angle $\alpha_i$, we apply the standard rotation matrix:
+  </p>
+
+  $$\begin{bmatrix} x_{i+1} \\ y_{i+1} \end{bmatrix} = \begin{bmatrix} \cos\alpha_i & -\sin\alpha_i \\ \sin\alpha_i & \cos\alpha_i \end{bmatrix} \begin{bmatrix} x_i \\ y_i \end{bmatrix}$$
+
+  <p>
+    Factoring out $\cos\alpha_i$:
+  </p>
+
+  $$\begin{bmatrix} x_{i+1} \\ y_{i+1} \end{bmatrix} = \cos\alpha_i \begin{bmatrix} 1 & -\tan\alpha_i \\ \tan\alpha_i & 1 \end{bmatrix} \begin{bmatrix} x_i \\ y_i \end{bmatrix}$$
+
+  <p>
+    <strong>Volder's Critical Insight:</strong> Constrain the elementary rotation steps $\alpha_i$ such that the tangent is an exact negative power of two:
+  </p>
+
+  $$\tan\alpha_i = 2^{-i} \quad \implies \quad \alpha_i = \arctan(2^{-i})$$
+
+  <p>
+    With this constraint, multiplying by $\tan\alpha_i$ is nothing more than an <strong>arithmetic right bit-shift by $i$ bits ($x \gg i$)</strong>!
+  </p>
+
+  <p>
+    Defining rotation direction $d_i \in \{-1, +1\}$, the pseudo-rotation equations become:
+  </p>
+
+  $$x_{i+1} = x_i - d_i \cdot (y_i \gg i)$$
+  $$y_{i+1} = y_i + d_i \cdot (x_i \gg i)$$
+  $$z_{i+1} = z_i - d_i \cdot \alpha_i$$
+
+  <p>
+    where $z_i$ is the residual angle accumulator. If $z_i \ge 0$, we rotate counter-clockwise ($d_i = +1$); if $z_i < 0$, we rotate clockwise ($d_i = -1$).
+  </p>
+
+  <table style="width: 100%; border-collapse: collapse; margin: 1.5rem 0;">
+    <thead>
+      <tr style="border-bottom: 2px solid var(--border-color); text-align: left;">
+        <th style="padding: 6px;">Iteration $i$</th>
+        <th style="padding: 6px;">Shift $2^{-i}$</th>
+        <th style="padding: 6px;">Angle $\alpha_i = \arctan(2^{-i})$</th>
+        <th style="padding: 6px;">Angle (Degrees)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr style="border-bottom: 1px solid var(--border-color);">
+        <td style="padding: 6px;">0</td>
+        <td style="padding: 6px;">$2^0 = 1$</td>
+        <td style="padding: 6px;">$0.785398\text{ rad}$</td>
+        <td style="padding: 6px;">$45.0000^\circ$</td>
+      </tr>
+      <tr style="border-bottom: 1px solid var(--border-color);">
+        <td style="padding: 6px;">1</td>
+        <td style="padding: 6px;">$2^{-1} = 0.5$</td>
+        <td style="padding: 6px;">$0.463648\text{ rad}$</td>
+        <td style="padding: 6px;">$26.5651^\circ$</td>
+      </tr>
+      <tr style="border-bottom: 1px solid var(--border-color);">
+        <td style="padding: 6px;">2</td>
+        <td style="padding: 6px;">$2^{-2} = 0.25$</td>
+        <td style="padding: 6px;">$0.244979\text{ rad}$</td>
+        <td style="padding: 6px;">$14.0362^\circ$</td>
+      </tr>
+      <tr style="border-bottom: 1px solid var(--border-color);">
+        <td style="padding: 6px;">3</td>
+        <td style="padding: 6px;">$2^{-3} = 0.125$</td>
+        <td style="padding: 6px;">$0.124355\text{ rad}$</td>
+        <td style="padding: 6px;">$7.1250^\circ$</td>
+      </tr>
+      <tr style="border-bottom: 1px solid var(--border-color);">
+        <td style="padding: 6px;">4</td>
+        <td style="padding: 6px;">$2^{-4} = 0.0625$</td>
+        <td style="padding: 6px;">$0.062419\text{ rad}$</td>
+        <td style="padding: 6px;">$3.5763^\circ$</td>
+      </tr>
+      <tr style="border-bottom: 1px solid var(--border-color);">
+        <td style="padding: 6px;">$M$</td>
+        <td style="padding: 6px;">$2^{-M}$</td>
+        <td style="padding: 6px;">$\approx 2^{-M}\text{ rad}$</td>
+        <td style="padding: 6px;">$\approx 2^{-M} \times \frac{180}{\pi}$</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>The CORDIC Scale Factor $K$</h3>
+
+  <p>
+    Notice that at each stage, we dropped the cosine pre-factor $\cos\alpha_i$. Therefore, each pseudo-rotation expands the vector magnitude by:
+  </p>
+
+  $$\frac{1}{\cos\alpha_i} = \sqrt{1 + \tan^2\alpha_i} = \sqrt{1 + 2^{-2i}}$$
+
+  <p>
+    After $M$ iterations, the cumulative scaling gain $A_M$ converges to a fixed mathematical constant:
+  </p>
+
+  $$A = \lim_{M \to \infty} \prod_{i=0}^{M-1} \sqrt{1 + 2^{-2i}} \approx 1.646760258121...$$
+
+  <p>
+    To obtain true unit-magnitude sine and cosine outputs, we simply pre-scale the initial vector by the reciprocal constant $K = 1/A$:
+  </p>
+
+  $$K = \frac{1}{A} \approx \mathbf{0.60725293500888...}$$
+
+  <p>
+    Setting initial state:
+  </p>
+
+  $$\begin{bmatrix} x_0 \\ y_0 \\ z_0 \end{bmatrix} = \begin{bmatrix} K \\ 0 \\ \theta \end{bmatrix} \quad \implies \quad \lim_{M \to \infty} \begin{bmatrix} x_M \\ y_M \\ z_M \end{bmatrix} = \begin{bmatrix} \cos\theta \\ \sin\theta \\ 0 \end{bmatrix}$$
+
+  <p>
+    Each CORDIC iteration adds exactly <strong>1 bit of angular precision</strong>. Executing 16 iterations yields 16 bits of precision ($> 96\text{ dB}$ dynamic range) with zero multipliers!
+  </p>
+
+  <h2>7. Architectural Comparison: FPGA DSP Slices vs. SIMD Registers</h2>
+
+  <table style="width: 100%; border-collapse: collapse; margin: 1.5rem 0;">
+    <thead>
+      <tr style="border-bottom: 2px solid var(--border-color); text-align: left;">
+        <th style="padding: 6px;">Metric / Attribute</th>
+        <th style="padding: 6px;">LUT-Based NCO</th>
+        <th style="padding: 6px;">Taylor-Interpolated NCO</th>
+        <th style="padding: 6px;">Pipelined CORDIC Engine</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr style="border-bottom: 1px solid var(--border-color);">
+        <td style="padding: 6px;"><strong>Memory Footprint</strong></td>
+        <td style="padding: 6px;">Moderate/High ($2\text{ KB} - 128\text{ KB}$)</td>
+        <td style="padding: 6px;">Very Low ($1\text{ KB} - 2\text{ KB}$)</td>
+        <td style="padding: 6px;"><strong>Zero RAM</strong> (16 constant words)</td>
+      </tr>
+      <tr style="border-bottom: 1px solid var(--border-color);">
+        <td style="padding: 6px;"><strong>Multiplier Usage</strong></td>
+        <td style="padding: 6px;">0 (NCO) + 4 (External Mixer)</td>
+        <td style="padding: 6px;">1 MAC (NCO) + 4 (External Mixer)</td>
+        <td style="padding: 6px;"><strong>Zero Multipliers</strong> (Rotates $I/Q$ directly)</td>
+      </tr>
+      <tr style="border-bottom: 1px solid var(--border-color);">
+        <td style="padding: 6px;"><strong>FPGA Implementation</strong></td>
+        <td style="padding: 6px;">Consumes 1-2 Block RAM tiles</td>
+        <td style="padding: 6px;">1 BRAM tile + 1 DSP48 slice</td>
+        <td style="padding: 6px;">Pure Logic Fabric (LUTs + Flip-Flops)</td>
+      </tr>
+      <tr style="border-bottom: 1px solid var(--border-color);">
+        <td style="padding: 6px;"><strong>SIMD Vectorization</strong></td>
+        <td style="padding: 6px;">Requires non-contiguous gathers</td>
+        <td style="padding: 6px;">Small table fits in L1 cache</td>
+        <td style="padding: 6px;">Pure in-register arithmetic shifts</td>
+      </tr>
+      <tr style="border-bottom: 1px solid var(--border-color);">
+        <td style="padding: 6px;"><strong>Latency</strong></td>
+        <td style="padding: 6px;">1 - 2 clock cycles</td>
+        <td style="padding: 6px;">3 - 4 clock cycles</td>
+        <td style="padding: 6px;">$M$ pipelined stages ($M$ cycles)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Why CORDIC Excels in FPGAs</h3>
+  <p>
+    In an FPGA (such as the AMD Xilinx Artix-7 on a USRP or LimeSDR), dedicated hardware multipliers (DSP48E1 slices) are scarce resources needed for FIR decimation filterbanks and polyphase channelizers. CORDIC unrolls into a deep pipeline of pure logic slices (CLBs, adders, and flip-flops). At every clock cycle, a new sample enters stage 0, and a fully rotated $I/Q$ sample exits stage 16. The engine sustains <strong>1 complex sample per clock cycle at 300+ MHz</strong> without utilizing a single DSP block or Block RAM tile.
+  </p>
+
+  <h2>8. High-Performance C / Rust Implementation</h2>
+
+  <p>
+    Below is a cache-conscious, production-grade C implementation of an integer NCO with phase truncation, LFSR dithering, and a fixed-point CORDIC vector rotation kernel:
+  </p>
+
+  <pre><code>#include &lt;stdint.h&gt;
+#include &lt;math.h&gt;
+
+#define CORDIC_STAGES 16
+
+// Pre-scaled constant K = 0.6072529350 in Q15 format (0.6072529350 * 32768 = 19898)
+#define CORDIC_K_Q15 19898
+
+// Precomputed arctan(2^-i) angles scaled to full 32-bit circle (2^32 = 2*pi)
+static const uint32_t CORDIC_ANGLES[CORDIC_STAGES] = {
+    0x20000000, // atan(1)   = pi/4  (45.000 deg)
+    0x12E4051D, // atan(1/2) = 0.463 rad (26.565 deg)
+    0x09FB385B, // atan(1/4) = 0.244 rad (14.036 deg)
+    0x051111D4, // atan(1/8) = 0.124 rad ( 7.125 deg)
+    0x028B0D43, // atan(1/16)= 0.062 rad ( 3.576 deg)
+    0x0145D7E1, // atan(1/32)
+    0x00A2F61E, // atan(1/64)
+    0x00517C55, // atan(1/128)
+    0x0028BE53, // atan(1/256)
+    0x00145F2E, // atan(1/512)
+    0x000A2F98, // atan(1/1024)
+    0x000517CC, // atan(1/2048)
+    0x00028BE6, // atan(1/4096)
+    0x000145F3, // atan(1/8192)
+    0x0000A2FA, // atan(1/16384)
+    0x0000517D  // atan(1/32768)
+};
+
+// 32-bit Galois Linear Feedback Shift Register (LFSR) for Phase Dithering
+static inline uint32_t step_lfsr(uint32_t *state) {
+    uint32_t lsb = *state &amp; 1;
+    *state &gt;&gt;= 1;
+    if (lsb) {
+        *state ^= 0xD0000001u; // 32-bit maximal polynomial
+    }
+    return *state;
+}
+
+// CORDIC Direct Complex Mixer:
+// Rotates incoming (I_in, Q_in) by angle phase_acc using only shifts and adds!
+void cordic_rotate_sample(int16_t i_in, int16_t q_in, uint32_t phase,
+                          int16_t *i_out, int16_t *q_out) {
+    // Map full 32-bit circle into [-pi/2, +pi/2] first quadrant rotation
+    int32_t x, y;
+    uint32_t z;
+
+    if (phase &gt;= 0x40000000 &amp;&amp; phase &lt; 0xC0000000) {
+        // Quadrants 2 and 3: rotate by 180 degrees first
+        x = -((int32_t)i_in);
+        y = -((int32_t)q_in);
+        z = phase - 0x80000000;
+    } else {
+        x = (int32_t)i_in;
+        y = (int32_t)q_in;
+        z = phase;
+    }
+
+    // Pre-scale initial vector by CORDIC gain K (in Q15)
+    x = (x * CORDIC_K_Q15) &gt;&gt; 15;
+    y = (y * CORDIC_K_Q15) &gt;&gt; 15;
+
+    // Execute 16 shift-and-add stages
+    for (int i = 0; i &lt; CORDIC_STAGES; ++i) {
+        int32_t x_shift = x &gt;&gt; i;
+        int32_t y_shift = y &gt;&gt; i;
+        uint32_t target_angle = CORDIC_ANGLES[i];
+
+        if ((int32_t)z &gt;= 0) {
+            x -= y_shift;
+            y += x_shift;
+            z -= target_angle;
+        } else {
+            x += y_shift;
+            y -= x_shift;
+            z += target_angle;
+        }
+    }
+
+    *i_out = (int16_t)x;
+    *q_out = (int16_t)y;
+}
+</code></pre>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-24-1">
+    <div class="quiz-question">
+      1. A digital down-converter (DDC) employs a 32-bit phase accumulator clocked at $f_{\text{clk}} = 125\text{ MHz}$. What is the frequency step resolution $\Delta f_{\text{min}}$, and how does the accumulator maintain continuous phase when frequency is shifted instantaneously?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="true">
+        $\Delta f \approx 0.029\text{ Hz}$; unsigned integer modular overflow automatically preserves phase continuity across tuning word updates.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        $\Delta f \approx 0.058\text{ Hz}$; a software interrupt service routine resets the accumulator phase to zero upon tuning word changes.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        $\Delta f \approx 0.015\text{ Hz}$; a fractional phase-locked loop filter smooths the frequency transition over several clock periods.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        $\Delta f \approx 0.073\text{ Hz}$; hardware floating-point registers interpolate the phase trajectory via cubic spline smoothing.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> The frequency resolution is $\Delta f_{\text{min}} = \frac{f_{\text{clk}}}{2^N} = \frac{125 \times 10^6}{2^{32}} \approx 0.0291\text{ Hz}$. Because the phase state $\theta[n]$ is maintained in the register and only the step size $FTW$ changes on the next clock edge, $\theta[n+1] = \theta[n] + FTW_{\text{new}} \pmod{2^N}$. The phase trajectory remains continuous ($\mathcal{C}^0$) with zero transient settling time.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-24-2">
+    <div class="quiz-question">
+      2. In a DDS architecture with a 32-bit phase accumulator and a 12-bit LUT address ($W = 12$) storing 14-bit amplitude samples ($D = 14$), what is the dominant spectral degradation, and how does LFSR phase dithering eliminate it?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="true">
+        Periodic phase truncation creates discrete spectral spurs around $-72\text{ dBc}$; adding dither decorrelates truncation error into benign white noise.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Amplitude quantization noise generates a flat noise floor at $-86\text{ dBc}$; adding dither cancels the quantization error via negative feedback.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Accumulator integer overflow injects harmonic distortion at $-48\text{ dBc}$; adding dither limits the phase range to the first Nyquist zone.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Lookup table address aliasing introduces intermodulation distortion at $-60\text{ dBc}$; adding dither dynamically expands the table dimensions.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> Truncating the phase from 32 bits to $W = 12$ bits produces a periodic sawtooth phase error that acts as phase modulation, creating discrete spurs bounded by $\approx 6.02 \cdot W = 72.2\text{ dBc}$. In contrast, 14-bit amplitude quantization creates a flat broadband noise floor at $6.02(14) + 1.76 \approx 86\text{ dB}$. Adding pseudo-random LFSR dither randomizes the phase error periodicity, converting discrete spurs into flat white noise and boosting SFDR by $12\text{--}18\text{ dB}$.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-24-3">
+    <div class="quiz-question">
+      3. Why does the CORDIC vector rotation algorithm outperform memory lookup tables (LUTs) in high-throughput FPGA DSP slices and wide SIMD vector registers?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="true">
+        It relies strictly on bit-shifts and additions, avoiding memory bandwidth bottlenecks, cache misses, and dedicated hardware multiplier consumption.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It computes full floating-point transcendental trigonometric functions directly within hardware logic slices in a single clock cycle.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It completely eliminates amplitude scaling error without requiring initial vector pre-scaling or post-rotation normalization stages.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It compresses large trigonometric lookup tables into specialized L1 instruction cache lines using lossless entropy coding techniques.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> In FPGAs, CORDIC maps entirely to distributed logic slices (LUTs and adders), saving scarce hardware multipliers (DSP slices) and Block RAM. In SIMD CPU registers, CORDIC eliminates non-contiguous table gather loads and cache misses, operating entirely within vector ALU registers via pipelined arithmetic bit-shifts.
+    </div>
+  </div>
+
+  <h2>Summary &amp; Architecture Implications</h2>
+
+  <p>
+    Direct Digital Synthesis and Numerically Controlled Oscillators represent the bridge between pure discrete mathematics and real-world RF signals:
+  </p>
+
+  <ol>
+    <li><strong>The Phase Accumulator:</strong> Natural $N$-bit modular arithmetic converts a simple integer addition into continuous traversal of the unit circle, offering micro-Hertz resolution ($\Delta f = f_{\text{clk}} / 2^N$) and instantaneous phase-continuous tuning.</li>
+    <li><strong>The Truncation Trade-off:</strong> Memory constraints mandate truncating the phase to $W$ bits. This periodic truncation generates discrete phase spurs bounded by $\text{SFDR} \approx 6.02 W\text{ dBc}$.</li>
+    <li><strong>Spur Remediation:</strong> LFSR phase dithering smears discrete spurs into benign white noise floor ($+12 - 18\text{ dB}$ SFDR gain), while Taylor interpolation achieves $>110\text{ dBc}$ SFDR using a compact 10-bit table and a single MAC unit.</li>
+    <li><strong>CORDIC Supremacy:</strong> By constraining rotation angles to $\arctan(2^{-i})$, CORDIC eliminates memory lookups and multipliers entirely, rotating complex baseband vectors via pure bit-shifts and additions.</li>
+  </ol>
+
+  <div class="footer">
+    <span>Have questions on CORDIC pipeline depth, LFSR tap polynomials, or Taylor series interpolation? Ask your tutor agent!</span>
+    <span><a href="0023-fsk-afsk-demodulation-and-quadrature-discriminators.html">&larr; Lesson 0023</a> | Lesson 0024</span>
+  </div>
+</body>
+</html>

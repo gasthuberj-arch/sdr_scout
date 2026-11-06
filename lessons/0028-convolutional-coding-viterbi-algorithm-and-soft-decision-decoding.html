@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 28: Forward Error Correction — Convolutional Codes, Viterbi Trellis Decoding, and Soft-Decision Slicing</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0028</span>
+    <span class="badge badge-arch">Channel Coding &amp; DSP</span>
+    <span>Reading time: 20 minutes</span>
+  </div>
+
+  <h1>Forward Error Correction: Convolutional Codes, Viterbi Trellis Decoding, and Soft-Decision Slicing</h1>
+
+  <p>
+    In high-SNR laboratory environments and line-of-sight packet telemetry (such as ADS-B Mode-S on 1090 MHz or AX.25 APRS on 144.390 MHz), simple cyclic redundancy checks (CRC-16 or CRC-24) suffice to detect corrupt frames and discard them. However, when operating across the <strong>weak-signal channel frontier</strong>—such as amateur satellite downlinks (AMSAT OSCAR, CubeSats), geostationary transponders (QO-100 / Es'hail-2), deep-space probes (Voyager, Mars Reconnaissance Orbiter), and digital voice modes (D-STAR, DMR)—signals frequently plunge deep into the thermal noise floor, where $E_b/N_0$ drops below $3\text{ dB}$.
+  </p>
+
+  <p>
+    Under these channel conditions, raw bit error rates (BER) hover between $10^{-2}$ and $10^{-1}$. Discarding uncorrectable packets causes total link starvation. Because satellite downlinks lack bidirectional low-latency ARQ (Automatic Repeat reQuest) retransmission channels, the receiver must actively correct transmission errors on the fly.
+  </p>
+
+  <p>
+    This lesson develops the theoretical foundations and high-performance software implementation of <strong>Forward Error Correction (FEC)</strong> using <strong>Convolutional Codes</strong> and the <strong>Viterbi Algorithm</strong>. We will trace the signal path from finite state shift registers to time-expanded trellises, examine why passing soft-quantized analog I/Q metrics delivers a "free" $+2.2\text{ dB}$ coding gain over hard 1/0 decisions, and engineer an AVX2-vectorized Add-Compare-Select (ACS) butterfly kernel capable of line-rate decoding at hundreds of megabits per second.
+  </p>
+
+  <h2>1. The Channel Coding Frontier: The Physics of Weak Signals</h2>
+
+  <p>
+    Consider an uncoded binary phase-shift keying (BPSK) signal propagating through an Additive White Gaussian Noise (AWGN) channel. The theoretical bit error rate is governed by the complementary error function:
+  </p>
+
+  $$P_b = Q\left(\sqrt{\frac{2 E_b}{N_0}}\right) = \frac{1}{2} \text{erfc}\left(\sqrt{\frac{E_b}{N_0}}\right)$$
+
+  <p>
+    where $E_b$ is energy per bit and $N_0$ is the noise power spectral density. To achieve an acceptable digital communications BER of $10^{-5}$ without coding, the channel must provide an $E_b/N_0$ of at least:
+  </p>
+
+  $$\left.\frac{E_b}{N_0}\right|_{\text{uncoded, } 10^{-5}} \approx 9.6\text{ dB}$$
+
+  <p>
+    In satellite and space communications, transmitter power ($P_t$) is severely limited by solar panel surface area and battery mass, while path attenuation over hundreds or thousands of kilometers follows the free-space path loss formula:
+  </p>
+
+  $$\text{FSPL} = \left(\frac{4\pi d}{\lambda}\right)^2$$
+
+  <p>
+    A low-Earth-orbit (LEO) CubeSat transmitting at $500\text{ mW}$ on 437 MHz to a handheld Yagi antenna routinely arrives at the receiver front-end with an SNR between $-2\text{ dB}$ and $+3\text{ dB}$. At $E_b/N_0 = 3\text{ dB}$, uncoded BPSK experiences a BER of $P_b \approx Q(\sqrt{4}) = Q(2) \approx 2.3 \times 10^{-2}$. More than 2 out of every 100 bits are inverted! In a 100-byte frame (800 bits), the probability of receiving an error-free packet without FEC is:
+  </p>
+
+  $$P_{\text{frame}} = (1 - P_b)^N = (1 - 0.023)^{800} \approx 7.8 \times 10^{-9}$$
+
+  <p>
+    The communication link is completely dead: not a single packet survives intact.
+  </p>
+
+  <div class="callout upside">
+    <div class="callout-title">The Shannon Channel Capacity Bound</div>
+    <p>
+      Claude Shannon's noisy-channel coding theorem establishes that reliable communication with arbitrarily small error probability is mathematically possible as long as the information transmission rate $R$ is strictly less than the channel capacity $C$:
+    </p>
+    $$C = B \log_2 \left(1 + \frac{S}{N}\right) = B \log_2 \left(1 + \frac{R \cdot E_b}{B \cdot N_0}\right)$$
+    <p>
+      As bandwidth $B \to \infty$, the fundamental limit for error-free transmission converges to:
+    </p>
+    $$\frac{E_b}{N_0} > \ln(2) \approx 0.693 \implies -1.59\text{ dB}$$
+    <p>
+      The gap between uncoded BPSK ($9.6\text{ dB}$) and Shannon's ultimate channel limit ($-1.59\text{ dB}$) represents an enormous $11.2\text{ dB}$ frontier. Channel coding bridges this gap.
+    </p>
+  </div>
+
+  <h2>2. Convolutional Encoding: Shift Registers and Polynomial Rings</h2>
+
+  <p>
+    Unlike block codes (such as Hamming, Reed-Solomon, or BCH codes) that partition a continuous bitstream into independent, non-overlapping blocks of $k$ input bits and append parity bits to form codewords of length $n$, <strong>convolutional codes</strong> process a continuous stream of input bits through a linear time-invariant finite state machine. Every encoded symbol depends not only on the current input bit, but on a rolling window of previous information bits.
+  </p>
+
+  <h3>Key Parameters of Convolutional Codes</h3>
+  <ul>
+    <li><strong>Constraint Length ($K$):</strong> The total number of bits in the encoder memory window (including the current input bit). The memory order of the filter is $m = K - 1$.</li>
+    <li><strong>Code Rate ($R = k/n$):</strong> For every $k$ input information bits, the encoder outputs $n$ channel symbols ($n > k$). For the ubiquitous rate $R = 1/2$, every input bit generates two output symbols.</li>
+    <li><strong>Encoder States ($S = 2^{K-1}$):</strong> The internal state is completely determined by the $K-1$ previous bits stored in the shift register flip-flops.</li>
+    <li><strong>Generator Polynomials ($G_i$):</strong> Binary tap vectors defining which shift register stages are modulo-2 summed (XORed) to produce output symbol $i$.</li>
+  </ul>
+
+  <h3>The NASA / Voyager Standard: $K = 7, R = 1/2$</h3>
+
+  <p>
+    Originally developed by the Jet Propulsion Laboratory for deep-space missions (Voyager 1 &amp; 2, Galileo) and subsequently standardized by CCSDS, amateur satellites (AO-40, D-STAR voice headers, QO-100 WB digital TV), and IEEE 802.11a/g Wi-Fi, the canonical convolutional code operates with constraint length $K = 7$ and rate $R = 1/2$.
+  </p>
+
+  <p>
+    Because $K = 7$, the encoder shift register stores $m = K - 1 = 6$ historical bits, yielding:
+  </p>
+
+  $$S = 2^6 = 64\text{ internal states } (s \in [0, 63])$$
+
+  <p>
+    The code is defined by two generator polynomials, traditionally written in octal notation:
+  </p>
+
+  <ul>
+    <li><strong>Polynomial 1:</strong> $G_1 = 171_8 = 1111001_2 \implies g_1(D) = 1 + D + D^2 + D^3 + D^6$</li>
+    <li><strong>Polynomial 2:</strong> $G_2 = 133_8 = 1011011_2 \implies g_2(D) = 1 + D^2 + D^3 + D^5 + D^6$</li>
+  </ul>
+
+  <p>
+    Here $D$ denotes the unit delay operator (equivalent to $z^{-1}$ in discrete-time DSP).
+  </p>
+
+  <pre><code>                     INPUT BIT b[t]
+                           │
+       ┌───────────────────┼──────────────────────────────────┐
+       │                   ▼                                  │
+       │           ┌──────────────┐                           │
+       │       ┌───┤  Stage 1 (D) │                           │
+       │       │   └───────┬──────┘                           │
+       │       │           ▼                                  │
+       │       │   ┌──────────────┐                           │
+       │       ├───┤ Stage 2 (D^2)├───────────────┐           │
+       │       │   └───────┬──────┘               │           │
+       │       │           ▼                      │           │
+       │       │   ┌──────────────┐               │           │
+       │       ├───┤ Stage 3 (D^3)├───────────────┤           │
+       │       │   └───────┬──────┘               │           │
+       │       │           ▼                      │           │
+       │       │   ┌──────────────┐               │           │
+       │       │   │ Stage 4 (D^4)│               │           │
+       │       │   └───────┬──────┘               │           │
+       │       │           ▼                      │           │
+       │       │   ┌──────────────┐               │           │
+       │       │   │ Stage 5 (D^5)├───────────────┤           │
+       │       │   └───────┬──────┘               │           │
+       │       │           ▼                      │           │
+       │       │   ┌──────────────┐               │           │
+       │       └───┤ Stage 6 (D^6)├───────────────┤           │
+       │           └──────────────┘               │           │
+       ▼                                          ▼           ▼
+     ┌───┐                                      ┌───┐       ┌───┐
+     │XOR│ (171_8: 1 + D + D^2 + D^3 + D^6)     │XOR│ (133_8: 1 + D^2 + D^3 + D^5 + D^6)
+     └───┘                                      └───┘
+       │                                          │
+       ▼                                          ▼
+   Symbol y_0                                 Symbol y_1</code></pre>
+
+  <p>
+    When an incoming bit $b[t]$ enters the encoder, it is shifted into the head of the register, the previous bits shift right, and two channel output symbols $(y_0[t], y_1[t])$ are produced simultaneously via linear parity checks over GF(2):
+  </p>
+
+  $$y_0[t] = b[t] \oplus b[t-1] \oplus b[t-2] \oplus b[t-3] \oplus b[t-6]$$
+  $$y_1[t] = b[t] \oplus b[t-2] \oplus b[t-3] \oplus b[t-5] \oplus b[t-6]$$
+
+  <p>
+    In high-performance C or Rust, this operation compiles down to a single shift, two bitwise ANDs with constant polynomial masks, and hardware parity checks (such as the x86 <code>POPCNT</code> instruction):
+  </p>
+
+  <pre><code>// Fast K=7, R=1/2 Convolutional Encoder in C
+typedef struct {
+    uint8_t state; // 6 bits of memory: b[t-1] .. b[t-6]
+} ConvEncoder;
+
+static inline void conv_encode_bit(ConvEncoder *enc, uint8_t in_bit, 
+                                   uint8_t *out_sym0, uint8_t *out_sym1) {
+    // Construct 7-bit register window: [in_bit | state (6 bits)]
+    uint8_t reg = ((in_bit & 1) << 6) | (enc->state & 0x3F);
+
+    // Apply generator polynomials (171_8 = 0x79, 133_8 = 0x5B)
+    *out_sym0 = (uint8_t)(__builtin_parity(reg & 0x79));
+    *out_sym1 = (uint8_t)(__builtin_parity(reg & 0x5B));
+
+    // Advance shift register: discard oldest bit b[t-6], shift in in_bit
+    enc->state = (uint8_t)((reg >> 1) & 0x3F);
+}</code></pre>
+
+  <h2>3. The Trellis Diagram: Time-Unrolled State Topology</h2>
+
+  <p>
+    Because the convolutional encoder is a sequential state machine, its operation can be viewed as a directed graph. However, static state transition graphs fail to capture the progression of time. If we replicate all $S = 2^{K-1} = 64$ states along a discrete-time axis $t = 0, 1, 2, \dots$, we obtain the <strong>Trellis Diagram</strong>.
+  </p>
+
+  <p>
+    At any time step $t$, the system resides in one of 64 states $s \in [0, 63]$. When the next bit $b \in \{0, 1\}$ arrives:
+  </p>
+  <ul>
+    <li>The new state becomes $s' = ((s \ll 1) \mid b) \pmod{64}$.</li>
+    <li>Each current state has exactly <strong>2 outgoing branches</strong> (corresponding to input $b=0$ or $b=1$).</li>
+    <li>Each destination state has exactly <strong>2 incoming branches</strong> originating from two predecessor states.</li>
+  </ul>
+
+  <h3>The Butterfly Topology</h3>
+
+  <p>
+    Notice the structural pairing of predecessor states. Suppose destination state $s'$ has binary representation $(s'_5, s'_4, s'_3, s'_2, s'_1, s'_0)$. Its two incoming branches must come from predecessors whose lower 5 bits match $(s'_5, \dots, s'_1)$:
+  </p>
+
+  $$s_{\text{pred}, 0} = \frac{s'}{2} = (0, s'_5, s'_4, s'_3, s'_2, s'_1)$$
+  $$s_{\text{pred}, 1} = \frac{s'}{2} + 32 = (1, s'_5, s'_4, s'_3, s'_2, s'_1)$$
+
+  <p>
+    This creates an interconnected pairs structure known in digital communications and FFT theory as a <strong>butterfly unit</strong>. Predecessor pair $(s, s+32)$ connects exclusively to successor pair $(2s, 2s+1)$. As we will see, this butterfly symmetry is the exact mathematical property that unlocks SIMD vectorization!
+  </p>
+
+  <h3>Free Distance ($d_{\text{free}}$) and Coding Gain</h3>
+
+  <p>
+    The error-correcting capability of a convolutional code is not determined by block length, but by its <strong>free distance</strong> ($d_{\text{free}}$). $d_{\text{free}}$ is defined as the minimum Hamming distance between any two distinct code sequences in the trellis, or equivalently, the minimum Hamming weight of any non-zero path that diverges from the all-zeros state $(000000)$ and eventually merges back into $(000000)$.
+  </p>
+
+  <p>
+    For the standard NASA $K=7, R=1/2$ code, the free distance is:
+  </p>
+
+  $$d_{\text{free}} = 10$$
+
+  <p>
+    The asymptotic coding gain over an AWGN channel with soft-decision decoding is given by:
+  </p>
+
+  $$\gamma_{\text{asymptotic}} = 10 \log_{10}(R \cdot d_{\text{free}}) = 10 \log_{10}\left(\frac{1}{2} \times 10\right) = 10 \log_{10}(5) \approx 6.99\text{ dB}$$
+
+  <p>
+    By simply adding one bit of redundancy per information bit and decoding through the trellis, we effectively boost the transmitter's equivalent EIRP (Effective Isotropic Radiated Power) by a factor of 5! A 1-watt CubeSat transmitter performs with the link margin of a 5-watt transmitter.
+  </p>
+
+  <h2>4. The Viterbi Algorithm: Maximum Likelihood Sequence Estimation</h2>
+
+  <p>
+    Suppose an encoder transmits a sequence of code symbols $\mathbf{X} = (\mathbf{x}_1, \mathbf{x}_2, \dots, \mathbf{x}_N)$ across a noisy channel, and the receiver observes the corrupted sequence $\mathbf{Y} = (\mathbf{y}_1, \mathbf{y}_2, \dots, \mathbf{y}_N)$.
+  </p>
+
+  <p>
+    The optimal receiver is the <strong>Maximum Likelihood Sequence Estimator (MLSE)</strong>, which finds the transmitted sequence $\hat{\mathbf{X}}$ that maximizes the a posteriori conditional probability:
+  </p>
+
+  $$\hat{\mathbf{X}} = \arg\max_{\mathbf{X}} P(\mathbf{Y} \mid \mathbf{X})$$
+
+  <p>
+    For a sequence of length $N$, there are $2^N$ possible transmitted paths through the trellis. For an 800-bit packet, $2^{800} \approx 10^{240}$ paths exist—vastly exceeding the number of atoms in the observable universe. Brute-force exhaustive search is physically impossible.
+  </p>
+
+  <p>
+    In 1967, Andrew Viterbi proved that because the convolutional encoder is a Markov state process, <em>any optimal path through state $s$ at time $t$ must contain the optimal path leading into state $s$ at time $t-1$</em>. Suboptimal paths entering state $s$ can never overtake the optimal path at any future time step.
+  </p>
+
+  <p>
+    By pruning all but the single best path entering each state at each time step, the Viterbi algorithm reduces the computational complexity from $O(2^N)$ to strictly linear time $O(N \cdot 2^{K-1})$. For $K=7$, it evaluates exactly $64$ states per received symbol pair, regardless of packet length!
+  </p>
+
+  <h3>The Three Functional Stages of Viterbi</h3>
+
+  <div class="callout">
+    <div class="callout-title">The Viterbi Pipeline Triad</div>
+    <ol>
+      <li><strong>Branch Metric Unit (BMU):</strong> Measures the distance (dissimilarity) between the received channel symbol pair and the ideal expected output for each trellis branch.</li>
+      <li><strong>Add-Compare-Select (ACS) Unit:</strong> The recursive dynamic programming engine. Updates accumulated path metrics and records survivor decisions.</li>
+      <li><strong>Traceback Unit (TBU):</strong> Walks backward through the survivor history table along the minimum-metric path to reconstruct the original information bitstream.</li>
+    </ol>
+  </div>
+
+  <h3>1. Branch Metric Unit (BMU)</h3>
+
+  <p>
+    For each incoming symbol pair $(r_0, r_1)$, the receiver evaluates the branch metric $\lambda(c_0, c_1)$ against all 4 possible code outputs: $(0,0), (0,1), (1,0), (1,1)$.
+  </p>
+  <ul>
+    <li><strong>Hard-Decision (Hamming Distance):</strong> If the receiver quantizes incoming symbols to hard binary bits $r_i \in \{0, 1\}$, the branch metric is the Hamming distance:
+      $$\lambda_{\text{hard}}(c_0, c_1) = (r_0 \oplus c_0) + (r_1 \oplus c_1) \in \{0, 1, 2\}$$
+    </li>
+    <li><strong>Soft-Decision (Euclidean Distance):</strong> If the receiver preserves analog baseband voltages $r_i \in \mathbb{R}$ or multi-bit ADC samples, the branch metric is the squared Euclidean distance:
+      $$\lambda_{\text{soft}}(c_0, c_1) = (r_0 - \mu(c_0))^2 + (r_1 - \mu(c_1))^2$$
+      where $\mu(0) = +A$ and $\mu(1) = -A$ represent the constellation points.
+    </li>
+  </ul>
+
+  <h3>2. Add-Compare-Select (ACS) Unit</h3>
+
+  <p>
+    Let $\Gamma_s[t]$ denote the <strong>Path Metric</strong> (accumulated cost) of the surviving path terminating in state $s$ at time step $t$.
+  </p>
+
+  <p>
+    Each destination state $s$ has two candidate predecessors, $s_1$ and $s_2$, with transition branch metrics $\lambda_1$ and $\lambda_2$. The ACS unit executes three operations:
+  </p>
+
+  $$\Gamma_{\text{cand}, 1} = \Gamma_{s_1}[t-1] + \lambda(s_1 \to s) \quad \text{[ADD]}$$
+  $$\Gamma_{\text{cand}, 2} = \Gamma_{s_2}[t-1] + \lambda(s_2 \to s) \quad \text{[ADD]}$$
+  $$\Gamma_s[t] = \min\left(\Gamma_{\text{cand}, 1}, \; \Gamma_{\text{cand}, 2}\right) \quad \text{[COMPARE \& SELECT]}$$
+
+  <p>
+    The binary outcome of the comparison is recorded in a 64-bit survivor bitmask for time step $t$:
+  </p>
+
+  $$\text{decision}[s][t] = \begin{cases} 0 & \text{if } \Gamma_{\text{cand}, 1} \le \Gamma_{\text{cand}, 2} \\ 1 & \text{if } \Gamma_{\text{cand}, 2} < \Gamma_{\text{cand}, 1} \end{cases}$$
+
+  <div class="callout warning">
+    <div class="callout-title">Path Metric Overflow and Modulo Normalization</div>
+    <p>
+      Because branch metrics are non-negative, $\Gamma_s[t]$ monotonically increases over time. In a continuous streaming receiver, an integer path metric will eventually overflow. Two architectures solve this:
+    </p>
+    <ul>
+      <li><strong>Subtraction of Minimum Metric:</strong> Find $\Gamma_{\min}[t] = \min_s \Gamma_s[t]$ across all 64 states, and subtract $\Gamma_{\min}[t]$ from every state whenever $\Gamma_{\min}[t]$ crosses a threshold. (Requires an extra pass over state memory).</li>
+      <li><strong>Unsigned Modulo Wrap-Around (The Hekstra Bound):</strong> If path metrics are stored as unsigned 8-bit integers (<code>uint8_t</code>), the metric difference between any two valid survivor states is mathematically bounded by $\Delta\Gamma_{\max} \le (K-1) \cdot \lambda_{\max}$. For $K=7$ and $\lambda_{\max} = 14$, $\Delta\Gamma_{\max} \le 84$. Because $84 < 2^{8-1} = 128$, two's-complement signed subtraction `(int8_t)(a - b) < 0` correctly compares metrics even after integer overflow! Zero overhead, zero branch stalls.
+      </li>
+    </ul>
+  </div>
+
+  <h3>3. Traceback Management and Traceback Depth ($L_{tb}$)</h3>
+
+  <p>
+    After running ACS across a block of symbols, which path is the maximum likelihood sequence?
+  </p>
+
+  <p>
+    If we pick any state $s$ at time $t$ and follow its recorded decision bits backward through the trellis, its trajectory rapidly converges with the survivor trajectories originating from all other 63 states!
+  </p>
+
+  <pre><code>State
+  63 ──┐
+       │
+  ...  ├───► Merged Survivor Path ───────► Transmitted Code
+       │
+   0 ──┘
+     t - L_tb                                t</code></pre>
+
+  <p>
+    Information theory dictates the <strong>traceback depth rule of thumb</strong>:
+  </p>
+
+  $$L_{tb} \approx 5 \times K$$
+
+  <p>
+    For the NASA $K=7$ code:
+  </p>
+
+  $$L_{tb} \approx 5 \times 7 = 35\text{ steps (commonly chosen as } 35 \le L_{tb} \le 42\text{)}$$
+
+  <p>
+    Beyond $5K$ steps, the probability that the survivor paths have not merged into the single unique maximum-likelihood sequence decays exponentially:
+  </p>
+
+  $$P_{\text{unmerged}} \propto e^{-\alpha L_{tb}}$$
+
+  <p>
+    At $L_{tb} = 35$, the performance degradation compared to an infinite-length trellis is less than $0.05\text{ dB}$.
+  </p>
+
+  <p>
+    In continuous streaming SDR architectures (e.g. GNU Radio or custom C/Rust SDR blocks), the traceback memory is structured as a circular ring buffer of 64-bit words:
+  </p>
+
+  <pre><code>// Continuous Traceback Buffer Layout:
+// Ring buffer of size L_tb steps. Each step stores 64 bits (1 bit per state).
+#define TB_DEPTH 40
+uint64_t tb_history[TB_DEPTH]; // 40 * 8 = 320 bytes total (fits inside L1 cache!)</code></pre>
+
+  <h2>5. Hard vs. Soft-Decision Slicing: The "Free" +2.2 dB Coding Gain</h2>
+
+  <p>
+    One of the most consequential architectural decisions in SDR engineering is the interface boundary between the baseband demodulator and the forward error correction decoder.
+  </p>
+
+  <h3>Hard-Decision Slicing (Information Loss)</h3>
+
+  <p>
+    In a naive pipeline, the demodulator passes the received BPSK sample through a 1-bit comparator (slicer):
+  </p>
+
+  $$\hat{b} = \begin{cases} 0 & \text{if } y \ge 0 \\ 1 & \text{if } y < 0 \end{cases}$$
+
+  <p>
+    The Viterbi decoder receives discrete binary bits $\{0, 1\}$ and computes Hamming distance branch metrics.
+  </p>
+
+  <p>
+    Notice the catastrophic loss of information: A sample received at $+0.02\text{ V}$ (which has nearly a $50\%$ chance of being noise-corrupted) is treated with the exact same algorithmic certainty as a pristine sample received at $+2.40\text{ V}$! The receiver has thrown away the channel's <strong>confidence metric</strong> (reliability).
+  </p>
+
+  <h3>Soft-Decision Decoding and Log-Likelihood Ratios (LLR)</h3>
+
+  <p>
+    In a soft-decision architecture, the demodulator outputs continuous real values or multi-bit quantized metrics proportional to the <strong>Log-Likelihood Ratio (LLR)</strong>:
+  </p>
+
+  $$\text{LLR}(y) = \ln \left( \frac{P(y \mid x = +1)}{P(y \mid x = -1)} \right)$$
+
+  <p>
+    For an AWGN channel with noise variance $\sigma^2$ and constellation mapping $x \in \{+1, -1\}$:
+  </p>
+
+  $$P(y \mid x = +1) = \frac{1}{\sqrt{2\pi\sigma^2}} \exp\left(-\frac{(y - 1)^2}{2\sigma^2}\right)$$
+  $$P(y \mid x = -1) = \frac{1}{\sqrt{2\pi\sigma^2}} \exp\left(-\frac{(y - (-1))^2}{2\sigma^2}\right)$$
+
+  <p>
+    Taking the natural logarithm of their ratio yields an astonishingly simple linear result:
+  </p>
+
+  $$\text{LLR}(y) = \ln\left( \exp\left( \frac{-(y-1)^2 + (y+1)^2}{2\sigma^2} \right) \right) = \frac{4 y}{2\sigma^2} = \frac{2}{\sigma^2} y$$
+
+  <p>
+    The optimal soft metric for an AWGN channel is <strong>directly proportional to the received voltage sample $y$ itself!</strong> No transcendental exponential or logarithmic calculations are needed in the baseband DSP thread.
+  </p>
+
+  <h3>The +2.0 to +2.5 dB Coding Gain</h3>
+
+  <p>
+    Shannon proved that replacing continuous AWGN channel outputs with a binary hard-decision quantizer destroys channel capacity. The capacity of a hard-decision binary symmetric channel (BSC) vs. an unquantized AWGN channel exhibits an asymptotic performance difference of:
+  </p>
+
+  $$\Delta_{\text{hard}} = 10 \log_{10}\left(\frac{\pi}{2}\right) \approx 1.961\text{ dB}$$
+
+  <p>
+    In practical finite constraint-length convolutional codes ($K=7$), soft-decision decoding consistently delivers a <strong>$+2.0\text{ to }+2.5\text{ dB}$ coding gain</strong> over hard-decision decoding across Rayleigh and Rician fading channels.
+  </p>
+
+  <div class="callout upside">
+    <div class="callout-title">The Engineering Significance of +2.2 dB</div>
+    <p>
+      In RF hardware, an additional $2.2\text{ dB}$ of link margin requires:
+    </p>
+    <ul>
+      <li>Increasing transmitter amplifier power by <strong>$66\%$</strong> (e.g. scaling from $10\text{ W}$ to $16.6\text{ W}$, burning precious satellite battery capacity and requiring heavier heat sinks), OR</li>
+      <li>Increasing the receiving satellite dish diameter by <strong>$29\%$</strong> (e.g. expanding from a $1.2\text{ m}$ parabolic reflector to a $1.55\text{ m}$ dish).</li>
+    </ul>
+    <p>
+      By simply passing 8-bit soft metrics from the matched filter into the Viterbi decoder rather than slicing to 1-bit binary, we gain the equivalent of a $66\%$ power amplifier upgrade with zero RF hardware cost!
+    </p>
+  </div>
+
+  <h3>Quantization Resolution: 3-bit vs. 8-bit</h3>
+
+  <p>
+    Do we need 32-bit floating point numbers to capture this gain? No!
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Quantization Depth</th>
+        <th>Metric Levels</th>
+        <th>Coding Gain Relative to Hard Slicing</th>
+        <th>Implementation Architecture</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>1-bit (Hard)</strong></td>
+        <td>2 levels ($0, 1$)</td>
+        <td>$0.0\text{ dB}$ (Baseline)</td>
+        <td>Bitwise XOR Hamming distance</td>
+      </tr>
+      <tr>
+        <td><strong>3-bit Soft</strong></td>
+        <td>8 levels ($-4 \dots +3$)</td>
+        <td>$+2.0\text{ dB}$ (recovers $\approx 96\%$ of ideal continuous limit)</td>
+        <td>Compact LUTs / space-probe ASICs</td>
+      </tr>
+      <tr>
+        <td><strong>8-bit Soft</strong></td>
+        <td>256 levels ($0 \dots 255$)</td>
+        <td>$+2.2\text{ dB}$ (indistinguishable from 64-bit IEEE float)</td>
+        <td>Native byte SIMD registers (AVX2 / ARM NEON)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    In SDR pipelines, we scale the matched-filter output into an 8-bit unsigned integer `uint8_t` where <code>0</code> represents strongest confidence '0' ($-A$), <code>128</code> represents erasure/uncertainty ($0\text{ V}$), and <code>255</code> represents strongest confidence '1' ($+A$).
+  </p>
+
+  <h2>6. SIMD Vectorization of the ACS Kernel: 256-bit AVX2 Architecture</h2>
+
+  <p>
+    The Add-Compare-Select loop is the primary computational bottleneck of the Viterbi decoder. For every received symbol pair, 64 states must undergo two additions, one comparison, and one selection, followed by survivor bit extraction.
+  </p>
+
+  <p>
+    On modern x86-64 CPUs with AVX2 (Advanced Vector Extensions 2), a single vector register is 256 bits wide. Since each path metric is an 8-bit unsigned integer (<code>uint8_t</code>), a single AVX2 register holds exactly:
+  </p>
+
+  $$\frac{256\text{ bits}}{8\text{ bits/state}} = 32\text{ states!}$$
+
+  <p>
+    The entire 64-state trellis fits into just <strong>two AVX2 vector registers</strong>!
+  </p>
+
+  <h3>The Butterfly Vector Reordering</h3>
+
+  <p>
+    Recall our butterfly topology:
+  </p>
+  <ul>
+    <li>Predecessors $0 \dots 31$ and $32 \dots 63$ feed successors $0, 2, 4, \dots, 62$ and $1, 3, 5, \dots, 63$.</li>
+    <li>Let vector register <code>V_m0</code> hold predecessor path metrics for states $0 \dots 31$.</li>
+    <li>Let vector register <code>V_m1</code> hold predecessor path metrics for states $32 \dots 63$.</li>
+  </ul>
+
+  <p>
+    Using AVX2 butterfly intrinsics, we evaluate 32 states simultaneously per vector operation:
+  </p>
+
+  <pre><code>// Intel AVX2 Vectorized Viterbi ACS Step (Processing 32 states in parallel)
+#include &lt;immintrin.h&gt;
+
+void viterbi_acs_butterfly_avx2(
+    const __m256i *metrics_in0, // States 0..31
+    const __m256i *metrics_in1, // States 32..63
+    __m256i branch_metric0,     // Broadcasted branch metrics for candidate 0
+    __m256i branch_metric1,     // Broadcasted branch metrics for candidate 1
+    __m256i *metrics_out0,      // Even successors: 0, 2, 4.. 62
+    __m256i *metrics_out1,      // Odd successors:  1, 3, 5.. 63
+    uint32_t *decision_mask0,   // Survivor decisions for 32 states
+    uint32_t *decision_mask1
+) {
+    // 1. ADD: Add branch metrics to predecessor path metrics using unsigned saturating add
+    __m256i path_a0 = _mm256_adds_epu8(*metrics_in0, branch_metric0);
+    __m256i path_b0 = _mm256_adds_epu8(*metrics_in1, branch_metric1);
+
+    // 2. COMPARE & SELECT: Take element-wise minimum across all 32 bytes in 1 cycle
+    *metrics_out0 = _mm256_min_epu8(path_a0, path_b0);
+
+    // 3. GENERATE DECISION MASK: Check which candidate was selected (path_b0 < path_a0)
+    // _mm256_cmpeq_epi8 produces 0xFF where path_a0 == min (candidate 0 won), 0x00 otherwise
+    __m256i winner0 = _mm256_cmpeq_epi8(*metrics_out0, path_a0);
+
+    // Extract 32 comparison bits directly into an x86 scalar general-purpose register
+    *decision_mask0 = (uint32_t)_mm256_movemask_epi8(winner0);
+}</code></pre>
+
+  <p>
+    The complete ACS operation across all 64 states requires:
+  </p>
+  <ul>
+    <li>4 vector saturating adds (<code>_mm256_adds_epu8</code>)</li>
+    <li>2 vector minimums (<code>_mm256_min_epu8</code>)</li>
+    <li>2 vector equality comparisons (<code>_mm256_cmpeq_epi8</code>)</li>
+    <li>2 movemask instructions (<code>_mm256_movemask_epi8</code>)</li>
+  </ul>
+
+  <p>
+    On modern Zen 4 or Raptor Lake x86 cores with dual AVX2 vector ALUs, this entire routine executes in <strong>under 6 clock cycles per received symbol pair</strong>! At a $4.0\text{ GHz}$ CPU clock, a single software thread can decode over $600\text{ Megasymbols/sec}$—far exceeding the line rate of any amateur radio digital mode or broadband satellite receiver.
+  </p>
+
+  <h2>7. Complete Systems Architecture: A Continuous Streaming Viterbi Decoder</h2>
+
+  <p>
+    Below is a complete, self-contained C implementation of a rate $R=1/2$, $K=7$ soft-decision Viterbi decoder demonstrating branch metric lookup tables, ACS path recursion with modulo normalization, and circular traceback memory.
+  </p>
+
+  <pre><code>#include &lt;stdint.h&gt;
+#include &lt;string.h&gt;
+#include &lt;stdio.h&gt;
+
+#define K 7
+#define NUM_STATES (1 &lt;&lt; (K - 1)) // 64 states
+#define TRACEBACK_DEPTH 35        // 5 * K rule of thumb
+
+typedef struct {
+    uint8_t path_metrics[NUM_STATES];
+    uint64_t tb_history[TRACEBACK_DEPTH]; // 64 bits per step
+    size_t tb_ptr;                        // Circular buffer index
+    uint8_t branch_lut[NUM_STATES][2];    // Expected symbols: [state][input_bit]
+} ViterbiDecoder;
+
+// Precompute expected (c0, c1) code symbols for all 64 states and inputs 0/1
+void viterbi_init(ViterbiDecoder *dec) {
+    memset(dec-&gt;path_metrics, 0x7F, sizeof(dec-&gt;path_metrics));
+    dec-&gt;path_metrics[0] = 0; // Encoder starts in state 000000 with metric 0
+    dec-&gt;tb_ptr = 0;
+
+    for (int s = 0; s &lt; NUM_STATES; s++) {
+        for (int b = 0; b &lt; 2; b++) {
+            uint8_t reg = ((b &amp; 1) &lt;&lt; 6) | (s &amp; 0x3F);
+            uint8_t c0 = __builtin_parity(reg &amp; 0x79); // G1 = 171_8
+            uint8_t c1 = __builtin_parity(reg &amp; 0x5B); // G2 = 133_8
+            dec-&gt;branch_lut[s][b] = (c0 &lt;&lt; 1) | c1;
+        }
+    }
+}
+
+// Compute soft Euclidean branch metric
+// sym: 8-bit soft sample [0..255], 0 = strong '0', 255 = strong '1'
+static inline uint16_t soft_branch_metric(uint8_t r0, uint8_t r1, uint8_t expected_code) {
+    uint8_t c0 = (expected_code &gt;&gt; 1) &amp; 1;
+    uint8_t c1 = expected_code &amp; 1;
+    
+    // Target constellation: c == 0 -&gt; target 0; c == 1 -&gt; target 255
+    uint16_t d0 = c0 ? (255 - r0) : r0;
+    uint16_t d1 = c1 ? (255 - r1) : r1;
+    return (d0 + d1) &gt;&gt; 3; // Scale to fit comfortably in uint8_t
+}
+
+// Process one received soft-symbol pair (r0, r1)
+void viterbi_update(ViterbiDecoder *dec, uint8_t r0, uint8_t r1) {
+    uint8_t next_metrics[NUM_STATES];
+    uint64_t decision_mask = 0;
+
+    // Process all 32 butterfly pairs
+    for (int s = 0; s &lt; 32; s++) {
+        // Predecessor states: s and (s + 32)
+        int p0 = s;
+        int p1 = s + 32;
+
+        // Successor states: 2*s (even) and 2*s + 1 (odd)
+        int dest_even = 2 * s;
+        int dest_odd  = 2 * s + 1;
+
+        // Branch metrics for transitions originating from p0 and p1
+        uint8_t metric_p0_even = soft_branch_metric(r0, r1, dec-&gt;branch_lut[p0][0]);
+        uint8_t metric_p1_even = soft_branch_metric(r0, r1, dec-&gt;branch_lut[p1][0]);
+        uint8_t metric_p0_odd  = soft_branch_metric(r0, r1, dec-&gt;branch_lut[p0][1]);
+        uint8_t metric_p1_odd  = soft_branch_metric(r0, r1, dec-&gt;branch_lut[p1][1]);
+
+        // ACS for dest_even
+        uint16_t cand0_even = dec-&gt;path_metrics[p0] + metric_p0_even;
+        uint16_t cand1_even = dec-&gt;path_metrics[p1] + metric_p1_even;
+        if (cand0_even &lt;= cand1_even) {
+            next_metrics[dest_even] = (uint8_t)cand0_even;
+            // Decision bit 0: p0 won (dest_even bit in mask remains 0)
+        } else {
+            next_metrics[dest_even] = (uint8_t)cand1_even;
+            decision_mask |= (1ULL &lt;&lt; dest_even); // Decision bit 1: p1 won
+        }
+
+        // ACS for dest_odd
+        uint16_t cand0_odd = dec-&gt;path_metrics[p0] + metric_p0_odd;
+        uint16_t cand1_odd = dec-&gt;path_metrics[p1] + metric_p1_odd;
+        if (cand0_odd &lt;= cand1_odd) {
+            next_metrics[dest_odd] = (uint8_t)cand0_odd;
+        } else {
+            next_metrics[dest_odd] = (uint8_t)cand1_odd;
+            decision_mask |= (1ULL &lt;&lt; dest_odd);
+        }
+    }
+
+    // Baseline normalization: subtract minimum metric to prevent uint8_t overflow
+    uint8_t min_metric = next_metrics[0];
+    for (int i = 1; i &lt; NUM_STATES; i++) {
+        if (next_metrics[i] &lt; min_metric) min_metric = next_metrics[i];
+    }
+    for (int i = 0; i &lt; NUM_STATES; i++) {
+        dec-&gt;path_metrics[i] = next_metrics[i] - min_metric;
+    }
+
+    // Save survivor decisions into circular traceback ring buffer
+    dec-&gt;tb_history[dec-&gt;tb_ptr] = decision_mask;
+    dec-&gt;tb_ptr = (dec-&gt;tb_ptr + 1) % TRACEBACK_DEPTH;
+}
+
+// Reconstruct the decoded bit TRACEBACK_DEPTH steps in the past
+uint8_t viterbi_traceback(const ViterbiDecoder *dec) {
+    // Find best ending state with minimum path metric
+    int best_state = 0;
+    uint8_t min_metric = dec-&gt;path_metrics[0];
+    for (int i = 1; i &lt; NUM_STATES; i++) {
+        if (dec-&gt;path_metrics[i] &lt; min_metric) {
+            min_metric = dec-&gt;path_metrics[i];
+            best_state = i;
+        }
+    }
+
+    // Walk backward TRACEBACK_DEPTH steps through the ring buffer
+    int curr_state = best_state;
+    int ptr = (dec-&gt;tb_ptr - 1 + TRACEBACK_DEPTH) % TRACEBACK_DEPTH;
+    uint8_t decoded_bit = 0;
+
+    for (int step = 0; step &lt; TRACEBACK_DEPTH; step++) {
+        uint64_t mask = dec-&gt;tb_history[ptr];
+        uint8_t decision = (mask &gt;&gt; curr_state) &amp; 1;
+
+        // Most recent step at the end of traceback reveals the decoded info bit
+        decoded_bit = (curr_state &gt;&gt; (K - 2)) &amp; 1;
+
+        // Predecessor state: if decision == 0 -&gt; curr_state / 2
+        //                    if decision == 1 -&gt; curr_state / 2 + 32
+        curr_state = (curr_state &gt;&gt; 1) | (decision &lt;&lt; (K - 2));
+        ptr = (ptr - 1 + TRACEBACK_DEPTH) % TRACEBACK_DEPTH;
+    }
+
+    return decoded_bit;
+}</code></pre>
+
+  <h2>8. Interactive Knowledge Check</h2>
+
+  <div class="quiz-container" id="quiz-28-1">
+    <div class="quiz-question">
+      1. Why does soft-decision decoding using 8-bit quantized symbols provide a ~2.2 dB coding gain over hard 1/0 decisions without any transmitter power change?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Hard slicing forces the Viterbi trellis to expand from 64 internal survivor states to 256 states.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Hard slicing discards analog sample confidence, while soft metrics preserve the continuous Log-Likelihood Ratio.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Soft-decision decoding doubles the effective transmission bandwidth, thereby halving the noise density.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        8-bit quantization synthesizes additional parity bits mathematically inside the Add-Compare-Select loop.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> A 1-bit hard slicer discards the reliability of the received symbol, treating a marginal sample near the zero-threshold identically to a high-confidence peak. Retaining multi-bit soft metrics preserves the Log-Likelihood Ratio $L(y) \propto y$, recovering the theoretical $10\log_{10}(\pi/2) \approx 2.0\text{ dB}$ loss of 1-bit quantization.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-28-2">
+    <div class="quiz-question">
+      2. For the standard NASA $K=7, R=1/2$ convolutional code, what is the theoretical justification for selecting a traceback depth of $L_{tb} \approx 35$ steps?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The circular ring buffer must precisely match the 32-byte cache line size of modern SIMD processors.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The generator polynomials $G_1 = 171_8$ and $G_2 = 133_8$ have a combined cycle period of exactly 35 cycles.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Survivor paths from all 64 states merge to the unique maximum-likelihood path after $5K$ steps with probability $\approx 1$.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The free distance $d_{\text{free}} = 10$ requires $3.5 \times d_{\text{free}}$ steps to prevent catastrophic polynomial divergence.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> In Viterbi decoding, the empirical and theoretical rule of thumb is $L_{tb} \approx 5K$. Because $K=7$, $5 \times 7 = 35$ steps ensures that survivor paths originating from all 64 disparate terminal states converge to the single optimal maximum-likelihood sequence with negligible loss ($< 0.05\text{ dB}$).
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-28-3">
+    <div class="quiz-question">
+      3. How does the butterfly topology of the 64-state convolutional trellis accelerate SIMD vectorization on AVX2 architectures?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        It eliminates the need for branch metric calculation by pre-sorting all received code symbols into octal order.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Predecessor state pairs $(s, s+32)$ feed successor pairs $(2s, 2s+1)$, allowing parallel Add-Compare-Select across vector lanes.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It converts the recursive Viterbi search into a Fast Fourier Transform that executes directly in frequency baseband.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It guarantees that path metric values never exceed 15, allowing 4-bit nibbles to pack 64 states into a single register.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> Predecessors $s$ and $s+32$ connect exclusively to successors $2s$ and $2s+1$. By grouping states $0..31$ into one 256-bit AVX2 register and states $32..63$ into a second, vector instructions like <code>_mm256_adds_epu8</code> and <code>_mm256_min_epu8</code> execute the Add-Compare-Select step across 32 state pairs concurrently with zero inter-lane shuffles.
+    </div>
+  </div>
+
+  <h2>Summary &amp; Architectural Takeaways</h2>
+
+  <p>
+    Convolutional coding coupled with soft-decision Viterbi decoding represents one of the crowning triumphs of digital signal processing:
+  </p>
+
+  <ol>
+    <li><strong>Transforming the Link Budget:</strong> The NASA $K=7, R=1/2$ code possesses a free distance $d_{\text{free}} = 10$, delivering nearly $7.0\text{ dB}$ of asymptotic coding gain and enabling reliable communications below $E_b/N_0 = 3\text{ dB}$ where uncoded links fail completely.</li>
+    <li><strong>Soft Slicing is "Free Power":</strong> Passing 8-bit quantized Euclidean metrics into the decoder recovers the $2.0 - 2.5\text{ dB}$ penalty imposed by 1-bit hard slicing, matching the performance of a $66\%$ transmitter power increase.</li>
+    <li><strong>Linear Dynamic Programming:</strong> The Viterbi algorithm prunes suboptimal trajectories at every time step, reducing the search space from $O(2^N)$ to $O(N \cdot 2^{K-1})$.</li>
+    <li><strong>SIMD-Tuned Memory Layout:</strong> The 64-state trellis butterfly symmetry aligns with 256-bit AVX2 vector registers, allowing an entire state machine update to complete in under 6 CPU clock cycles.</li>
+  </ol>
+
+  <div class="footer">
+    <span>Have questions on butterfly reordering, Hekstra modulo bounds, or AVX-512 Viterbi kernels? Ask your tutor agent!</span>
+    <span><a href="0023-fsk-afsk-demodulation-and-quadrature-discriminators.html">&larr; Lesson 0023</a> | Lesson 0028</span>
+  </div>
+</body>
+</html>

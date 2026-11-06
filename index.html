@@ -133,6 +133,56 @@
       <br>
       <em>Bell 202 1200-baud packet radio on 2m VHF: extracting instantaneous frequency via delay-line conjugate multiplication ($z[n] \cdot z^*[n-1]$), fast SIMD rational arctan without trigonometric calls, parabolic noise filtering, and NRZI / HDLC bit unstuffing.</em>
     </li>
+    <li>
+      <strong><a href="lessons/0024-direct-digital-synthesis-and-numerically-controlled-oscillators.html">Lesson 0024: Direct Digital Synthesis (DDS) &amp; Numerically Controlled Oscillators (NCO)</a></strong>
+      <br>
+      <em>Micro-Hertz frequency resolution ($\Delta f = f_{\text{clk}} / 2^N$), phase accumulator dynamics, phase truncation spur mechanisms ($6.02 W\text{ dBc}$), LFSR phase dithering, Taylor series interpolation, and CORDIC rotation in SIMD/FPGAs without look-up tables.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0025-fft-butterfly-mechanics-and-spectral-windowing-physics.html">Lesson 0025: FFT Butterfly Mechanics &amp; Spectral Windowing Physics</a></strong>
+      <br>
+      <em>From $O(N^2)$ DFT to $O(N \log N)$ Cooley-Tukey Radix-2 butterflies: twiddle factor symmetries, bit-reversal indexing, cache locality and AVX2 complex FMA vectorization, the physics of spectral leakage convolved with sinc kernels, and window trade-offs (Hann vs. Blackman-Harris $-92\text{ dB}$ vs. Flat-Top).</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0026-timing-error-detectors-gardner-mueller-and-farrow-interpolators.html">Lesson 0026: Timing Error Detectors (TED) &amp; Symbol Clock Synchronization</a></strong>
+      <br>
+      <em>Asynchronous ADC crystals vs. transmitter symbol clocks: the Gardner Non-Data-Aided TED ($e[k] = I[k-1/2](I[k] - I[k-1]) + \dots$) and mathematical proof of complete carrier-phase independence, Mueller &amp; Müller decision-directed TED, S-curve tracking gains, and the Farrow polynomial interpolator structure in SIMD.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0027-digital-agc-loops-and-receiver-dynamic-range-budgeting.html">Lesson 0027: Digital Automatic Gain Control (AGC) Loops &amp; Receiver Dynamic Range Budgeting</a></strong>
+      <br>
+      <em>Taming the $140\text{ dB}$ RF ether: cascaded Friis noise figure, IP3, and the LNA gain paradox. Why linear AGC loops trigger signal-dependent instability while log-domain loops maintain invariant time constants, dual-time attack/decay dynamics, and Hang AGC state machines preventing noise pumping during speech/CW pauses.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0028-convolutional-coding-viterbi-algorithm-and-soft-decision-decoding.html">Lesson 0028: Forward Error Correction (FEC) — Convolutional Codes, Viterbi Trellis Decoding, and Soft-Decision Slicing</a></strong>
+      <br>
+      <em>Weak-signal satellite comms at $E_b/N_0 = 1\text{ dB}$: $K=7, R=1/2$ NASA polynomials ($171_8, 133_8$), 64-state unrolled trellis topology, Maximum Likelihood Sequence Estimation (MLSE), Add-Compare-Select (ACS) recursion, and why 8-bit soft-decision Euclidean slicing delivers $+2.2\text{ dB}$ coding gain over hard decisions.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0029-direct-sequence-spread-spectrum-gold-codes-and-rake-receivers.html">Lesson 0029: Direct-Sequence Spread Spectrum (DSSS) — Gold Codes, Processing Gain, and Rake Receivers</a></strong>
+      <br>
+      <em>Diluting spectral PSD below the thermal noise floor: LFSR maximal-length sequences, Gold codes with bounded three-valued cross-correlation, processing gain derivation ($G_p = 10 \log_{10} L_{\text{code}}$) enabling recovery at $-15\text{ dB}$ SNR, fast circular FFT correlation, and Rake receiver Maximal Ratio Combining (MRC) turning multipath into diversity gain.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0030-qam-constellations-and-adaptive-channel-equalization.html">Lesson 0030: Quadrature Amplitude Modulation (QAM) &amp; Adaptive Channel Equalization (LMS / CMA)</a></strong>
+      <br>
+      <em>16-QAM and 64-QAM constellation geometry: Gray mapping, PAPR amplifier back-off requirements, discrete tapped-delay line channel models, linear MMSE equalizers, complex decision-directed LMS adaptation, and the Constant Modulus Algorithm (CMA / Godard radius $R_2 = 1.32$) for blind channel de-smearing without training preambles.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0031-ofdm-subcarrier-orthogonality-cyclic-prefix-and-equalization.html">Lesson 0031: Orthogonal Frequency Division Multiplexing (OFDM) — Subcarrier Orthogonality, Cyclic Prefix, and Equalization</a></strong>
+      <br>
+      <em>Taming frequency-selective fading: mathematical proof of subcarrier orthogonality ($\Delta f = 1/T_{\text{sym}}$), $N$-point IFFT/FFT modulation engines, the Cyclic Prefix trick transforming linear multipath convolution into circular convolution without ISI/ICI, and single-tap frequency-domain equalization (FEQ).</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0032-sdr-rf-front-ends-direct-conversion-iq-imbalance-and-phase-noise.html">Lesson 0032: SDR RF Front-End Physics — Direct Conversion, I/Q Imbalance, and Phase Noise</a></strong>
+      <br>
+      <em>Superheterodyne vs Direct-Conversion / Zero-IF: DC offset self-mixing, $1/f$ CMOS flicker noise, and IP2 distortion. Mathematical derivation of Image Rejection Ratio ($\text{IRR} \approx 4 / (\Delta\alpha^2 + \Delta\phi^2)$) showing why $1^\circ$ phase error caps image rejection at $41\text{ dB}$, Gram-Schmidt blind circularity correction, and LO phase noise reciprocal mixing.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0033-usb-kernel-streaming-dma-buffers-and-isochronous-transports.html">Lesson 0033: High-Throughput USB &amp; Kernel Streaming Architectures — libusb, Isochronous Transports, and DMA Ring Buffers</a></strong>
+      <br>
+      <em>USB 2.0 High-Speed ($480\text{ Mbps}$) vs USB 3.0 SuperSpeed ($5\text{ Gbps}$): Bulk transfers with CRC16 retransmissions vs Isochronous lossy streams, asynchronous `libusb` in-flight URB pools preventing RTL2832U $16\text{ KB}$ FIFO overflow, Linux `io_uring` and `mmap` zero-copy DMA, and passing 64 KB off-heap refc binaries across the BEAM/Zigler boundary.</em>
+    </li>
   </ul>
 
   <h2>Reference Documents &amp; Glossaries</h2>

@@ -1,0 +1,881 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 29: Direct-Sequence Spread Spectrum (DSSS) — Gold Codes, Processing Gain, and Rake Receivers</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0029</span>
+    <span class="badge badge-arch">Spread Spectrum &amp; Rake Receivers</span>
+    <span>Reading time: 18 minutes</span>
+  </div>
+
+  <h1>Direct-Sequence Spread Spectrum (DSSS): Gold Codes, Processing Gain, and Rake Receivers</h1>
+
+  <p>
+    In classical narrowband communications, spectrum efficiency is defined by packing maximum information into minimum RF bandwidth ($\text{bits/s/Hz}$). Pulse-shaping filters like Root-Raised Cosine (RRC) are carefully tuned to compress sidebands, and adjacent channels are packed tightly into discrete frequency slots.
+  </p>
+
+  <p>
+    <strong>Direct-Sequence Spread Spectrum (DSSS)</strong> turns this doctrine on its head. Instead of confining transmission energy to the minimum Nyquist bandwidth, DSSS deliberately multiplies low-rate information symbols by a high-rate pseudo-random sequence, expanding the transmitted signal bandwidth by several orders of magnitude ($B_{ss} \gg B_{\text{info}}$).
+  </p>
+
+  <p>
+    While counterintuitive at first glance, this intentional spectral expansion unlocks three transformative communication capabilities:
+  </p>
+
+  <ol>
+    <li><strong>Sub-Noise Operation &amp; Low Probability of Intercept (LPI):</strong> Signal power is dispersed across tens of megahertz, dropping the Power Spectral Density (PSD) well below the thermal noise floor. To an unauthorized interceptor, the transmission is indistinguishable from thermal noise.</li>
+    <li><strong>Jammer &amp; Interference Suppression:</strong> Uncorrelated narrowband jammers and co-channel interferers are mathematically attenuated by the receiver's <em>processing gain</em> ($G_p$).</li>
+    <li><strong>Code-Division Multiple Access (CDMA):</strong> Multiple non-synchronized transmitters share the exact same frequency band simultaneously, isolated solely by quasi-orthogonal pseudo-random code sequences.</li>
+  </ol>
+
+  <p>
+    In this lesson, we will deconstruct DSSS from Galois field mathematics to high-performance receiver software architectures:
+  </p>
+
+  <ul>
+    <li>The physics and information theory of bandwidth spreading and spectral dilution.</li>
+    <li>Linear Feedback Shift Registers (LFSR), maximal-length sequences (m-sequences), and autocorrelation properties.</li>
+    <li>Preferred polynomial pairs, Robert Gold's theorem, and bounded cross-correlation in GPS L1 C/A.</li>
+    <li>Formal mathematical derivation of Processing Gain ($G_p$) and demodulation at $-15\text{ dB}$ SNR.</li>
+    <li>High-throughput despreading: bitwise XOR-popcount sliding correlation in C/Rust versus parallel FFT circular convolution.</li>
+    <li>Multipath propagation resolution and the <strong>Rake Receiver</strong>: tracking delay spread and harvesting diversity via Maximal Ratio Combining (MRC).</li>
+  </ul>
+
+  <h2>1. The Physics of Spread Spectrum: Expanding Bandwidth Far Beyond Information Rate</h2>
+
+  <p>
+    Consider an information bitstream with symbol period $T_{\text{symbol}}$ and information bit rate $R_{\text{info}} = 1 / T_{\text{symbol}}$. Under standard binary phase-shift keying (BPSK), the baseband information signal is:
+  </p>
+
+  $$d(t) = \sum_{k=-\infty}^{\infty} d_k \, p_T(t - k T_{\text{symbol}}), \quad d_k \in \{-1, +1\}$$
+
+  <p>
+    where $p_T(t)$ is a rectangular pulse of duration $T_{\text{symbol}}$. The null-to-null bandwidth of this information signal is $B_{\text{info}} \approx R_{\text{info}} = \frac{1}{T_{\text{symbol}}}$.
+  </p>
+
+  <p>
+    In Direct-Sequence Spread Spectrum, each data bit $d_k$ is multiplied by a high-rate, periodic pseudo-random binary sequence $c(t)$, called the <strong>spreading code</strong> or <strong>chip sequence</strong>:
+  </p>
+
+  $$s(t) = d(t) \cdot c(t) = d(t) \sum_{n=-\infty}^{\infty} c_n \, p_c(t - n T_{\text{chip}}), \quad c_n \in \{-1, +1\}$$
+
+  <p>
+    Here, $T_{\text{chip}}$ is the duration of an individual code pulse (called a <strong>chip</strong> to distinguish it from an information bit). The chip rate is $R_{\text{chip}} = 1 / T_{\text{chip}}$, and the spread RF bandwidth is:
+  </p>
+
+  $$B_{ss} \approx \frac{1}{T_{\text{chip}}} \gg B_{\text{info}}$$
+
+  <p>
+    The ratio of the symbol period to the chip period is the integer code length $L_{\text{code}}$, also known as the <strong>spreading factor</strong> (or processing factor) $N$:
+  </p>
+
+  $$N = L_{\text{code}} = \frac{T_{\text{symbol}}}{T_{\text{chip}}} = \frac{B_{ss}}{B_{\text{info}}} \gg 1$$
+
+  <center>
+    <svg viewBox="0 0 760 260" width="100%" height="260" style="background:#1e1e2e; border-radius:8px; font-family:monospace; margin:20px 0;">
+      <!-- Title -->
+      <text x="25" y="30" fill="#cdd6f4" font-size="14" font-weight="bold">Spectral Dilution: Narrowband vs. Direct-Sequence Spread Spectrum</text>
+
+      <!-- Grid lines -->
+      <line x1="60" y1="210" x2="720" y2="210" stroke="#45475a" stroke-width="1.5"/>
+      <line x1="60" y1="50" x2="60" y2="210" stroke="#45475a" stroke-width="1.5"/>
+      <text x="700" y="230" fill="#a6adc8" font-size="11">Frequency (f)</text>
+      <text x="25" y="55" fill="#a6adc8" font-size="11" transform="rotate(-90 25,55)">PSD (W/Hz)</text>
+
+      <!-- Thermal noise floor -->
+      <line x1="60" y1="170" x2="720" y2="170" stroke="#f38ba8" stroke-dasharray="4,4" stroke-width="1.5"/>
+      <text x="610" y="165" fill="#f38ba8" font-size="11" font-weight="bold">Thermal Noise Floor N₀</text>
+
+      <!-- Narrowband Signal Curve -->
+      <path d="M 160,210 Q 200,60 240,210" fill="rgba(249, 226, 175, 0.35)" stroke="#f9e2af" stroke-width="2"/>
+      <text x="145" y="80" fill="#f9e2af" font-size="11" font-weight="bold">Narrowband Signal</text>
+      <text x="160" y="98" fill="#cdd6f4" font-size="10">High PSD &gt; N₀</text>
+      <text x="160" y="112" fill="#cdd6f4" font-size="10">B_info ≈ 1/T_sym</text>
+
+      <!-- Spread Spectrum Signal Curve -->
+      <path d="M 80,210 Q 390,185 700,210" fill="rgba(137, 180, 250, 0.35)" stroke="#89b4fa" stroke-width="2"/>
+      <text x="410" y="195" fill="#89b4fa" font-size="12" font-weight="bold">DSSS Spread Signal: PSD ≪ N₀</text>
+      <text x="410" y="210" fill="#a6adc8" font-size="10">Expanded Bandwidth B_ss = N · B_info</text>
+
+      <!-- Jammer Spike -->
+      <line x1="520" y1="210" x2="520" y2="70" stroke="#f38ba8" stroke-width="2.5"/>
+      <polygon points="520,65 515,75 525,75" fill="#f38ba8"/>
+      <text x="530" y="80" fill="#f38ba8" font-size="11" font-weight="bold">CW Jammer</text>
+    </svg>
+  </center>
+
+  <h3>A. Low Probability of Intercept (LPI) and Detection (LPD)</h3>
+  <p>
+    Suppose an SDR transmitter radiates total average power $P_{\text{tx}}$ Watts. For a narrowband modulation, this power is concentrated into bandwidth $B_{\text{info}}$, yielding an average spectral power density:
+  </p>
+
+  $$S_{\text{narrow}}(f) \approx \frac{P_{\text{tx}}}{B_{\text{info}}}$$
+
+  <p>
+    When spread with factor $N$, the identical transmitter power $P_{\text{tx}}$ is distributed across $B_{ss} = N \cdot B_{\text{info}}$:
+  </p>
+
+  $$S_{\text{spread}}(f) \approx \frac{P_{\text{tx}}}{B_{ss}} = \frac{S_{\text{narrow}}(f)}{N}$$
+
+  <p>
+    If $N = 1024$ (roughly $30\text{ dB}$ of spreading factor), the power spectral density drops by a factor of 1000. In military communications, GPS navigation, and covert amateur telemetry, $S_{\text{spread}}(f)$ is set $10\text{ dB}$ to $20\text{ dB}$ <em>below</em> the ambient Johnson-Nyquist thermal noise density ($N_0 = k_B T$). An eavesdropper monitoring an FFT waterfall or scanning receiver sees no spectral peaks—only flat, Gaussian-like noise.
+  </p>
+
+  <h3>B. Anti-Jamming (AJ) and Jamming Margin</h3>
+  <p>
+    Consider an adversary transmitting high-power Continuous Wave (CW) or narrowband interference $j(t) = \sqrt{2 P_J} \cos(2\pi f_c t)$ directly inside the transmission band.
+  </p>
+  <p>
+    In a conventional receiver, a jammer with power $P_J > P_{\text{tx}}$ instantly drives the demodulator into saturation or catastrophic bit error rates. In a DSSS receiver, the incoming sum $r(t) = s(t) + j(t) + n(t)$ is multiplied by the local synchronized spreading code $c(t)$:
+  </p>
+
+  $$r(t) \cdot c(t) = d(t) \cdot c^2(t) + j(t) \cdot c(t) + n(t) \cdot c(t)$$
+
+  <p>
+    Because $c_n \in \{-1, +1\}$, the squared sequence is deterministic unity: $c^2(t) = 1$. The desired data $d(t)$ is <strong>despread</strong> (collapsed) back to its original narrow bandwidth $B_{\text{info}}$. Simultaneously, the narrow CW jammer $j(t)$ is multiplied by $c(t)$, <strong>spreading the jammer across $B_{ss}$</strong>!
+  </p>
+
+  <p>
+    A subsequent low-pass or matched filter with bandwidth $B_{\text{info}}$ discards the jammer's power outside $B_{\text{info}}$, capturing only a $1/N$ fraction of $P_J$. The <strong>Jamming Margin</strong> ($M_J$) represents the jammer-to-signal power ratio the receiver can tolerate before synchronization is lost:
+  </p>
+
+  $$M_J\text{ [dB]} = G_p\text{ [dB]} - \left(\frac{E_b}{N_0}\right)_{\text{req}}\text{ [dB]} - L_{\text{sys}}\text{ [dB]}$$
+
+  <p>
+    where $(E_b / N_0)_{\text{req}}$ is the minimum required energy per bit for the target bit error rate, and $L_{\text{sys}}$ is implementation loss.
+  </p>
+
+  <h2>2. Pseudo-Noise (PN) Sequences &amp; Maximal-Length Sequences (m-sequences)</h2>
+
+  <p>
+    To achieve the statistical properties of Gaussian white noise while remaining perfectly deterministic and reproducible at both transmitter and receiver, DSSS utilizes <strong>Linear Feedback Shift Registers (LFSR)</strong>.
+  </p>
+
+  <h3>A. Galois Field Mathematics of LFSR Generators</h3>
+  <p>
+    An LFSR of length $m$ consists of $m$ cascade flip-flops (registers) holding binary states $s_0[n], s_1[n], \dots, s_{m-1}[n] \in \mathbb{F}_2$. At each clock tick $n \to n+1$, the register state shifts, and a new feedback bit is computed as a linear combination (modulo-2 addition, or XOR) of specific taps:
+  </p>
+
+  $$s_0[n+1] = \bigoplus_{i=1}^{m} c_i \, s_{m-i}[n], \quad c_i \in \{0, 1\}$$
+
+  <p>
+    The register's behavior is uniquely governed by its <strong>characteristic polynomial</strong> $P(x)$ defined over the Galois field $\text{GF}(2)$:
+  </p>
+
+  $$P(x) = x^m + \sum_{i=1}^{m-1} c_i x^i + 1 = x^m + c_{m-1} x^{m-1} + \dots + c_1 x + 1$$
+
+  <center>
+    <svg viewBox="0 0 760 170" width="100%" height="170" style="background:#1e1e2e; border-radius:8px; font-family:monospace; margin:20px 0;">
+      <!-- Title -->
+      <text x="25" y="25" fill="#cdd6f4" font-size="13" font-weight="bold">Fibonacci LFSR Architecture (Degree m = 4, Primitive Polynomial x⁴ + x³ + 1)</text>
+
+      <!-- Flip-Flop Registers -->
+      <!-- S3 -->
+      <rect x="80" y="50" width="70" height="50" fill="#313244" stroke="#89b4fa" stroke-width="2" rx="4"/>
+      <text x="100" y="80" fill="#cdd6f4" font-size="13" font-weight="bold">S₃ [n]</text>
+      <!-- S2 -->
+      <rect x="220" y="50" width="70" height="50" fill="#313244" stroke="#89b4fa" stroke-width="2" rx="4"/>
+      <text x="240" y="80" fill="#cdd6f4" font-size="13" font-weight="bold">S₂ [n]</text>
+      <!-- S1 -->
+      <rect x="360" y="50" width="70" height="50" fill="#313244" stroke="#89b4fa" stroke-width="2" rx="4"/>
+      <text x="380" y="80" fill="#cdd6f4" font-size="13" font-weight="bold">S₁ [n]</text>
+      <!-- S0 -->
+      <rect x="500" y="50" width="70" height="50" fill="#313244" stroke="#89b4fa" stroke-width="2" rx="4"/>
+      <text x="520" y="80" fill="#cdd6f4" font-size="13" font-weight="bold">S₀ [n]</text>
+
+      <!-- Connecting shift arrows -->
+      <line x1="150" y1="75" x2="220" y2="75" stroke="#a6adc8" stroke-width="2"/>
+      <polygon points="220,75 210,70 210,80" fill="#a6adc8"/>
+
+      <line x1="290" y1="75" x2="360" y2="75" stroke="#a6adc8" stroke-width="2"/>
+      <polygon points="360,75 350,70 350,80" fill="#a6adc8"/>
+
+      <line x1="430" y1="75" x2="500" y2="75" stroke="#a6adc8" stroke-width="2"/>
+      <polygon points="500,75 490,70 490,80" fill="#a6adc8"/>
+
+      <!-- Output chip arrow -->
+      <line x1="570" y1="75" x2="680" y2="75" stroke="#a6e3a1" stroke-width="2.5"/>
+      <polygon points="680,75 670,70 670,80" fill="#a6e3a1"/>
+      <text x="600" y="65" fill="#a6e3a1" font-size="12" font-weight="bold">Chip c[n]</text>
+
+      <!-- Feedback XOR Gate -->
+      <circle cx="325" cy="135" r="16" fill="#45475a" stroke="#f9e2af" stroke-width="2"/>
+      <text x="318" y="141" fill="#f9e2af" font-size="18" font-weight="bold">⊕</text>
+
+      <!-- Tap lines from S3 and S0 to XOR -->
+      <line x1="115" y1="100" x2="115" y2="135" stroke="#f9e2af" stroke-width="2"/>
+      <line x1="115" y1="135" x2="309" y2="135" stroke="#f9e2af" stroke-width="2"/>
+
+      <line x1="535" y1="100" x2="535" y2="135" stroke="#f9e2af" stroke-width="2"/>
+      <line x1="535" y1="135" x2="341" y2="135" stroke="#f9e2af" stroke-width="2"/>
+
+      <!-- Feedback loop to S3 -->
+      <line x1="325" y1="151" x2="325" y2="160" stroke="#f9e2af" stroke-width="2"/>
+      <line x1="325" y1="160" x2="40" y2="160" stroke="#f9e2af" stroke-width="2"/>
+      <line x1="40" y1="160" x2="40" y2="75" stroke="#f9e2af" stroke-width="2"/>
+      <line x1="40" y1="75" x2="80" y2="75" stroke="#f9e2af" stroke-width="2"/>
+      <polygon points="80,75 70,70 70,80" fill="#f9e2af"/>
+    </svg>
+  </center>
+
+  <p>
+    An LFSR with $m$ binary stages can assume at most $2^m$ states. Since the all-zero state $[0, 0, \dots, 0]$ produces feedback $0 \oplus 0 = 0$ (trapping the register permanently), the maximum non-repeating cycle length is:
+  </p>
+
+  $$N = 2^m - 1$$
+
+  <p>
+    A sequence that achieves this maximum period is called an <strong>m-sequence</strong> (maximal-length sequence). An m-sequence is generated if and only if the generator polynomial $P(x)$ is a <strong>primitive polynomial</strong> over $\text{GF}(2)$ (irreducible over $\mathbb{F}_2$ and having order $2^m - 1$).
+  </p>
+
+  <h3>B. The Three Golomb Postulates of m-sequences</h3>
+  <p>
+    Solomon Golomb formulated three mathematical randomness postulates that any periodic binary sequence must satisfy to mimic physical noise. Maximal-length sequences satisfy all three perfectly:
+  </p>
+
+  <ol>
+    <li>
+      <strong>Balance Property:</strong> In every complete period of length $N = 2^m - 1$, the number of binary ones is $2^{m-1}$ and the number of zeros is $2^{m-1} - 1$. The difference between ones and zeros is strictly $1$.
+    </li>
+    <li>
+      <strong>Run Distribution Property:</strong> A "run" is a contiguous run of identical symbols. In an m-sequence, one-half of all runs have length 1, one-quarter have length 2, one-eighth have length 3, and so on. Furthermore, for each run length, positive and negative runs occur in equal numbers.
+    </li>
+    <li>
+      <strong>Ideal Autocorrelation Property:</strong> Mapping binary bits $s_k \in \{0, 1\}$ to bipolar chips $a_k \in \{+1, -1\}$ via $a_k = 1 - 2 s_k$, the discrete periodic circular autocorrelation at chip offset $\tau$ is:
+    </li>
+  </ol>
+
+  $$R_a(\tau) = \sum_{k=0}^{N-1} a_k \, a_{(k+\tau) \pmod N} = \begin{cases} N, & \tau \equiv 0 \pmod N \\ -1, & \tau \not\equiv 0 \pmod N \end{cases}$$
+
+  <p>
+    Normalized by the zero-lag peak $R_a(0) = N$, the autocorrelation is:
+  </p>
+
+  $$\rho_a(\tau) = \frac{R_a(\tau)}{N} = \begin{cases} 1.0, & \tau = 0 \\ -\frac{1}{N} \approx 0, & \tau \neq 0 \end{cases}$$
+
+  <p>
+    This Kronecker $\delta$-like autocorrelation property is the holy grail for ranging, radar, and symbol clock recovery. A receiver sliding a local m-sequence replica across an incoming signal observes near-zero correlation until the local code aligns with the transmitter's code phase down to within $\pm 1$ chip. At alignment, the correlation metric abruptly surges to $N$.
+  </p>
+
+  <h2>3. Preferred Pairs and Gold Codes: Overcoming Multi-Access Interference</h2>
+
+  <p>
+    If m-sequences possess optimal autocorrelation, why can't we simply assign different m-sequences of degree $m$ to different users in a Code-Division Multiple Access (CDMA) or satellite network?
+  </p>
+
+  <h3>The Fatal Flaw of Raw m-sequences: Unregulated Cross-Correlation</h3>
+  <p>
+    While individual m-sequences exhibit near-zero out-of-phase autocorrelation, the <strong>cross-correlation</strong> between two distinct arbitrary m-sequences $u$ and $v$:
+  </p>
+
+  $$R_{uv}(\tau) = \sum_{k=0}^{N-1} u_k \, v_{(k+\tau) \pmod N}$$
+
+  <p>
+    is completely uncontrolled. Even for moderate sequence lengths (e.g., $m = 10, N = 1023$), cross-correlation sidelobes between two random m-sequences can spike to peak values exceeding $0.3 N$ or $0.5 N$ ($-6\text{ dB}$ to $-3\text{ dB}$ relative to the peak).
+  </p>
+
+  <div class="callout warning">
+    <div class="callout-title">The Multi-Access Interference (MAI) Disaster</div>
+    <p>
+      In CDMA systems like GPS or cellular IS-95, all users transmit on the same carrier frequency simultaneously. If satellite A has a cross-correlation sidelobe of $-6\text{ dB}$ against satellite B's spreading code, a receiver trying to track satellite B will suffer massive <strong>Multi-Access Interference (MAI)</strong>. Worse, due to the <em>near-far effect</em>, a strong nearby transmitter will completely drown out a weak distant transmitter even if their nominal codes are distinct.
+    </p>
+  </div>
+
+  <h3>Robert Gold's Theorem (1967)</h3>
+  <p>
+    In 1967, Robert Gold proved that specific pairs of m-sequences—termed <strong>preferred pairs</strong>—have a cross-correlation spectrum strictly confined to exactly <strong>three discrete values</strong>.
+  </p>
+
+  <p>
+    Let $m$ be the register degree, such that $m \not\equiv 0 \pmod 4$ (i.e., $m$ is odd, or $m \equiv 2 \pmod 4$). Define the correlation boundary function $t(m)$:
+  </p>
+
+  $$t(m) = \begin{cases} 1 + 2^{(m+1)/2}, & m \text{ odd} \\ 1 + 2^{(m+2)/2}, & m \text{ even, } m \equiv 2 \pmod 4 \end{cases}$$
+
+  <p>
+    Two primitive polynomials $u$ and $v$ of degree $m$ form a <strong>preferred pair</strong> if their periodic cross-correlation $R_{uv}(\tau)$ takes values <em>strictly restricted to the three-valued set</em>:
+  </p>
+
+  $$R_{uv}(\tau) \in \left\{ -t(m), \; -1, \; t(m) - 2 \right\} \quad \forall \; \tau$$
+
+  <h3>Constructing the Gold Code Family</h3>
+  <p>
+    Given a preferred pair of m-sequences $\mathbf{u} = (u_0, u_1, \dots, u_{N-1})$ and $\mathbf{v} = (v_0, v_1, \dots, v_{N-1})$, the complete family of Gold codes $G(\mathbf{u}, \mathbf{v})$ is generated by taking the bitwise modulo-2 sum (XOR) of $\mathbf{u}$ with every cyclic shift $T^k \mathbf{v}$ of $\mathbf{v}$:
+  </p>
+
+  $$G(\mathbf{u}, \mathbf{v}) = \left\{ \mathbf{u}, \; \mathbf{v} \right\} \cup \left\{ \mathbf{u} \oplus T^k \mathbf{v} \;\middle|\; 0 \le k < N \right\}$$
+
+  <p>
+    This construction generates exactly $N + 2 = 2^m + 1$ distinct pseudo-random sequences, each of length $N$.
+  </p>
+
+  <div class="callout upside">
+    <div class="callout-title">The Invariant Bounded Property of Gold Codes</div>
+    <p>
+      Gold's breakthrough theorem guarantees that for <em>any two distinct sequences</em> $\mathbf{g}_i, \mathbf{g}_j \in G(\mathbf{u}, \mathbf{v})$ in the family:
+    </p>
+    $$R_{ij}(\tau) \in \left\{ -t(m), \; -1, \; t(m) - 2 \right\} \quad \forall \; \tau$$
+    <p>
+      Furthermore, the <em>out-of-phase autocorrelation</em> ($\tau \neq 0$) of any individual Gold sequence in the family is also strictly bounded by the exact same three values:
+    </p>
+    $$R_{ii}(\tau) \in \left\{ -t(m), \; -1, \; t(m) - 2 \right\} \quad \forall \; \tau \neq 0 \pmod N$$
+  </div>
+
+  <h3>Concrete Case Study: GPS L1 C/A (Coarse/Acquisition) Code</h3>
+  <p>
+    The civil GPS navigation signal on $1575.42\text{ MHz}$ is the world's most famous deployment of Gold codes:
+  </p>
+
+  <ul>
+    <li>Register degree: $m = 10 \implies m \equiv 2 \pmod 4$.</li>
+    <li>Code length: $N = 2^{10} - 1 = 1023\text{ chips}$.</li>
+    <li>Chipping rate: $R_{\text{chip}} = 1.023\text{ Mchip/s} \implies T_{\text{code}} = \frac{1023}{1.023\times 10^6} = 1.000\text{ ms}$.</li>
+    <li>GPS G1 Polynomial: $P_1(x) = x^{10} + x^3 + 1$.</li>
+    <li>GPS G2 Polynomial: $P_2(x) = x^{10} + x^9 + x^8 + x^6 + x^3 + x^2 + 1$.</li>
+  </ul>
+
+  <p>
+    Calculating the theoretical Gold cross-correlation bound for $m = 10$:
+  </p>
+
+  $$t(10) = 1 + 2^{(10+2)/2} = 1 + 2^6 = 1 + 64 = 65$$
+
+  <p>
+    The possible cross-correlation values across all GPS satellite codes are:
+  </p>
+
+  $$R_{ij}(\tau) \in \{-65, -1, 63\}$$
+
+  <p>
+    Expressed as a normalized correlation coefficient relative to the auto-correlation peak $R(0) = 1023$:
+  </p>
+
+  $$\rho_{\max} = \frac{65}{1023} \approx 0.06354 \implies 20 \log_{10}(0.06354) \approx \mathbf{-23.94\text{ dB}}$$
+
+  <p>
+    Every satellite's code is guaranteed to suppress any other satellite's transmission by at least $23.94\text{ dB}$! In GPS satellites, each vehicle (PRN 1 through 32) generates its unique Gold code simply by tapping two specific stages of the G2 register to produce the required phase delay $T^k \mathbf{v}$ before summing with G1.
+  </p>
+
+  <h2>4. Processing Gain Derivation: Operating at -15 dB SNR</h2>
+
+  <p>
+    The definitive performance metric of any spread spectrum system is its <strong>Processing Gain ($G_p$)</strong>. Let us derive how coherent despreading allows error-free data demodulation when the received signal is buried $15\text{ dB}$ below the noise floor.
+  </p>
+
+  <h3>A. Coherent Integration and Noise Scaling</h3>
+  <p>
+    Let the received complex baseband discrete-time signal sampled at the chip rate $f_s = R_{\text{chip}}$ be:
+  </p>
+
+  $$r[n] = \sqrt{P_{\text{sig}}} \cdot d_{\lfloor n / L \rfloor} \cdot c[n] + w[n]$$
+
+  <p>
+    where:
+  </p>
+  <ul>
+    <li>$P_{\text{sig}}$ is received signal power.</li>
+    <li>$d_k \in \{-1, +1\}$ is the information symbol constant over $L = L_{\text{code}}$ chips.</li>
+    <li>$c[n] \in \{-1, +1\}$ is the periodic spreading code.</li>
+    <li>$w[n] \sim \mathcal{CN}(0, \sigma_w^2)$ is circularly-symmetric complex additive white Gaussian noise with variance $\sigma_w^2 = N_0 B_{ss}$.</li>
+  </ul>
+
+  <p>
+    The input Signal-to-Noise Ratio measured at the RF receiver input across the full spread bandwidth $B_{ss}$ is:
+  </p>
+
+  $$\text{SNR}_{\text{RF}} = \frac{P_{\text{sig}}}{\sigma_w^2} = \frac{P_{\text{sig}}}{N_0 B_{ss}}$$
+
+  <p>
+    To despread the $k$-th symbol, the receiver multiplies $r[n]$ by the perfectly synchronized local code replica $c[n]$ and accumulates (integrates) over the symbol window of $L$ chips:
+  </p>
+
+  $$y[k] = \sum_{n=k L}^{(k+1)L - 1} r[n] \cdot c[n] = \sum_{n=k L}^{(k+1)L - 1} \left( \sqrt{P_{\text{sig}}} \, d_k \, c[n] + w[n] \right) c[n]$$
+
+  <p>
+    Distributing the terms:
+  </p>
+
+  $$y[k] = \sqrt{P_{\text{sig}}} \, d_k \sum_{n=k L}^{(k+1)L - 1} c^2[n] + \sum_{n=k L}^{(k+1)L - 1} w[n] \, c[n]$$
+
+  <p>
+    Because $c[n] \in \{-1, +1\}$, each term $c^2[n] = 1$. The signal samples add <strong>coherently</strong> (in-phase):
+  </p>
+
+  $$S_{\text{accum}} = \sqrt{P_{\text{sig}}} \, d_k \cdot L \implies P_{\text{sig, out}} = |S_{\text{accum}}|^2 = L^2 \cdot P_{\text{sig}}$$
+
+  <p>
+    Now analyze the noise term $w_{\text{out}} = \sum_{n=0}^{L-1} w[n] c[n]$. Since $c[n] = \pm 1$, the variance of each term $w[n] c[n]$ remains $\sigma_w^2$. Because white noise samples at distinct chip times are mutually independent, their variances add <strong>incoherently</strong>:
+  </p>
+
+  $$\sigma_{\text{out}}^2 = \text{Var}\left( \sum_{n=0}^{L-1} w[n] c[n] \right) = \sum_{n=0}^{L-1} c^2[n] \cdot \text{Var}(w[n]) = L \cdot \sigma_w^2$$
+
+  <p>
+    The output Signal-to-Noise Ratio after despreading is the ratio of output signal power to output noise variance:
+  </p>
+
+  $$\text{SNR}_{\text{out}} = \frac{P_{\text{sig, out}}}{\sigma_{\text{out}}^2} = \frac{L^2 \cdot P_{\text{sig}}}{L \cdot \sigma_w^2} = L \cdot \frac{P_{\text{sig}}}{\sigma_w^2} = L \cdot \text{SNR}_{\text{RF}}$$
+
+  <p>
+    Converting to decibels yields the classic Processing Gain formula:
+  </p>
+
+  $$G_p = 10 \log_{10}(L) = 10 \log_{10}\left(\frac{T_{\text{symbol}}}{T_{\text{chip}}}\right) = 10 \log_{10}\left(\frac{B_{ss}}{B_{\text{info}}}\right)$$
+
+  $$\text{SNR}_{\text{out}}\text{ [dB]} = \text{SNR}_{\text{RF}}\text{ [dB]} + G_p\text{ [dB]}$$
+
+  <h3>B. Quantitative Proof: Reception at -15 dB SNR</h3>
+  <p>
+    Suppose an amateur DSSS telemetry station or GPS receiver operates with a spreading sequence of length $L = 1023$ chips per data bit.
+  </p>
+
+  <ul>
+    <li>Input RF SNR: $\text{SNR}_{\text{RF}} = -15.0\text{ dB}$. The signal is $15\text{ dB}$ below the noise floor!</li>
+    <li>Processing Gain: $G_p = 10 \log_{10}(1023) \approx 30.10\text{ dB}$.</li>
+    <li>Output Despread SNR:
+      $$\text{SNR}_{\text{out}} = -15.0\text{ dB} + 30.10\text{ dB} = \mathbf{+15.10\text{ dB}}$$
+    </li>
+  </ul>
+
+  <p>
+    For coherent BPSK demodulation, the theoretical Bit Error Rate (BER) in AWGN is:
+  </p>
+
+  $$P_b = Q\left( \sqrt{2 \cdot \frac{E_b}{N_0}} \right) = Q\left( \sqrt{2 \cdot 10^{\frac{15.10}{10}}} \right) = Q\left( \sqrt{2 \cdot 32.36} \right) = Q(8.04) \approx 4.4 \times 10^{-16}$$
+
+  <p>
+    The probability of a bit error is less than one in two quadrillion! Processing gain converts an undetectable signal submerged deep inside thermal hiss into an essentially error-free digital link.
+  </p>
+
+  <h2>5. High-Throughput Despreading: Fast FFT vs. Bitwise XOR-Popcount</h2>
+
+  <p>
+    In a software-defined radio architecture (C, Rust, or Zig NIFs), correlation is computationally expensive. The receiver operates in two distinct phases: <strong>Code Acquisition</strong> (searching 2D code-phase and Doppler space) and <strong>Code Tracking</strong> (fine sub-chip delay alignment).
+  </p>
+
+  <h3>A. Code Acquisition: Parallel Frequency Domain Convolution via FFT</h3>
+  <p>
+    During initial acquisition, the arrival time $\tau \in [0, N-1]$ of the code is unknown. Testing all $N$ potential chip shifts serially in the time domain requires $O(N^2)$ multiply-accumulate operations per Doppler search bin.
+  </p>
+
+  <p>
+    By the <strong>Circular Convolution Theorem</strong>, the circular cross-correlation of received block $\mathbf{r}$ and code replica $\mathbf{c}$ can be computed across all $N$ phase shifts simultaneously using two Fast Fourier Transforms:
+  </p>
+
+  $$R_{rc}[n] = \mathcal{F}^{-1} \left\{ \mathcal{F}\{\mathbf{r}\} \odot \left( \mathcal{F}\{\mathbf{c}\} \right)^* \right\}$$
+
+  <center>
+    <svg viewBox="0 0 760 170" width="100%" height="170" style="background:#1e1e2e; border-radius:8px; font-family:monospace; margin:20px 0;">
+      <!-- Title -->
+      <text x="25" y="24" fill="#cdd6f4" font-size="13" font-weight="bold">Parallel Code Phase Search: Frequency-Domain FFT Correlator</text>
+
+      <!-- Input r[n] -->
+      <rect x="30" y="50" width="90" height="40" fill="#313244" stroke="#89b4fa" stroke-width="2" rx="4"/>
+      <text x="42" y="75" fill="#cdd6f4" font-size="12">r[n] (I/Q)</text>
+
+      <!-- FFT 1 -->
+      <line x1="120" y1="70" x2="160" y2="70" stroke="#a6adc8" stroke-width="2"/>
+      <polygon points="160,70 150,65 150,75" fill="#a6adc8"/>
+      <rect x="160" y="45" width="80" height="50" fill="#45475a" stroke="#f9e2af" stroke-width="2" rx="4"/>
+      <text x="180" y="75" fill="#f9e2af" font-size="14" font-weight="bold">FFT</text>
+      <text x="175" y="115" fill="#a6adc8" font-size="10">R[k]</text>
+
+      <!-- Multiplier -->
+      <line x1="240" y1="70" x2="330" y2="70" stroke="#a6adc8" stroke-width="2"/>
+      <polygon points="330,70 320,65 320,75" fill="#a6adc8"/>
+      <circle cx="345" cy="70" r="15" fill="#313244" stroke="#a6e3a1" stroke-width="2"/>
+      <text x="339" y="76" fill="#a6e3a1" font-size="16" font-weight="bold">⊙</text>
+
+      <!-- Precomputed Code Conjugate FFT -->
+      <rect x="290" y="115" width="110" height="40" fill="#313244" stroke="#cba6f7" stroke-width="2" rx="4"/>
+      <text x="305" y="140" fill="#cba6f7" font-size="11">C*[k] (Precomputed)</text>
+      <line x1="345" y1="115" x2="345" y2="85" stroke="#cba6f7" stroke-width="2"/>
+      <polygon points="345,85 340,95 350,95" fill="#cba6f7"/>
+
+      <!-- IFFT -->
+      <line x1="360" y1="70" x2="440" y2="70" stroke="#a6adc8" stroke-width="2"/>
+      <polygon points="440,70 430,65 430,75" fill="#a6adc8"/>
+      <rect x="440" y="45" width="80" height="50" fill="#45475a" stroke="#f9e2af" stroke-width="2" rx="4"/>
+      <text x="455" y="75" fill="#f9e2af" font-size="14" font-weight="bold">IFFT</text>
+
+      <!-- Magnitude Squared -->
+      <line x1="520" y1="70" x2="570" y2="70" stroke="#a6adc8" stroke-width="2"/>
+      <polygon points="570,70 560,65 560,75" fill="#a6adc8"/>
+      <rect x="570" y="50" width="60" height="40" fill="#313244" stroke="#89b4fa" stroke-width="2" rx="4"/>
+      <text x="583" y="75" fill="#cdd6f4" font-size="12">|·|²</text>
+
+      <!-- Output Peak Detection -->
+      <line x1="630" y1="70" x2="680" y2="70" stroke="#a6e3a1" stroke-width="2"/>
+      <polygon points="680,70 670,65 670,75" fill="#a6e3a1"/>
+      <text x="690" y="65" fill="#a6e3a1" font-size="11" font-weight="bold">Peak τ*</text>
+      <text x="690" y="85" fill="#a6adc8" font-size="10">Code Phase</text>
+    </svg>
+  </center>
+
+  <p>
+    Because the code's spectrum $\mathcal{F}\{\mathbf{c}\}^*$ is static, it is precomputed once at boot. For each Doppler frequency bin, the SDR performs one forward FFT of the incoming samples, a vector complex conjugate element-wise multiply ($O(N)$), and one inverse FFT ($O(N \log_2 N)$). This reduces initial acquisition time by a factor of $\frac{N}{\log_2 N}$ (over $100\times$ faster for $N = 1023$).
+  </p>
+
+  <h3>B. Code Tracking: Bitwise XOR-Popcount Sliding Correlator in C/Rust</h3>
+  <p>
+    Once the code phase is acquired to within 1 chip, continuous tracking (or 1-bit / hard-sliced sign-bit receivers) can be executed in CPU integer registers at blistering line rate without floating-point math.
+  </p>
+
+  <p>
+    Map the bipolar chips $\{+1, -1\}$ to binary bits $\{0, 1\}$ where $+1 \mapsto 0$ and $-1 \mapsto 1$. Consider two bipolar chips $a, b \in \{+1, -1\}$ and their mapped bits $u, v \in \{0, 1\}$:
+  </p>
+
+  <ul>
+    <li>If $a = +1, b = +1 \implies u = 0, v = 0 \implies u \oplus v = 0 \implies a \cdot b = +1$.</li>
+    <li>If $a = -1, b = -1 \implies u = 1, v = 1 \implies u \oplus v = 0 \implies a \cdot b = +1$.</li>
+    <li>If $a = +1, b = -1 \implies u = 0, v = 1 \implies u \oplus v = 1 \implies a \cdot b = -1$.</li>
+    <li>If $a = -1, b = +1 \implies u = 1, v = 0 \implies u \oplus v = 1 \implies a \cdot b = -1$.</li>
+  </ul>
+
+  <p>
+    Notice that the arithmetic product $a \cdot b$ equals $+1$ whenever $u \oplus v = 0$, and equals $-1$ whenever $u \oplus v = 1$.
+  </p>
+
+  <p>
+    For a register word containing $K = 64$ chips packed as bits, the number of bit mismatches (where the product is $-1$) is the Hamming distance, computed via bitwise XOR followed by population count:
+  </p>
+
+  $$H = \text{popcount}(u \oplus v)$$
+
+  <p>
+    The number of matching chips (where the product is $+1$) is $K - H$. Therefore, the exact inner product of 64 chips is evaluated in two CPU instructions:
+  </p>
+
+  $$\sum_{i=0}^{K-1} a_i b_i = (K - H) \cdot (+1) + H \cdot (-1) = K - 2 H = K - 2 \cdot \text{popcount}(u \oplus v)$$
+
+  <pre><code>// High-Throughput Bitwise 64-Chip Correlator (C / Rust)
+#include &lt;stdint.h&gt;
+
+static inline int32_t correlate_64_chips(uint64_t signal_bits, uint64_t code_bits) {
+    // 1 instruction: XOR identifies bit differences
+    uint64_t diff = signal_bits ^ code_bits;
+    // 1 instruction: hardware POPCNT (x86-64 / ARMv8 neon)
+    int mismatches = __builtin_popcountll(diff);
+    // Correlation sum in range [-64, +64]
+    return 64 - 2 * mismatches;
+}</code></pre>
+
+  <p>
+    With AVX-512 VPOPCNTDQ (<code>_mm512_popcnt_epi64</code>), modern CPUs evaluate eight 64-bit words (512 chips) in a single clock cycle, enabling multi-gigachip-per-second despreading directly inside an SDR ingest worker.
+  </p>
+
+  <h2>6. Multipath Fading and the Rake Receiver Architecture</h2>
+
+  <p>
+    In high-frequency HF or urban UHF channels, radio signals reflect off the ionosphere, terrain, buildings, and ground planes, arriving at the receiver antenna via multiple propagation paths with different delays and attenuations.
+  </p>
+
+  <h3>A. Why Narrowband Systems Suffer Deep Fades</h3>
+  <p>
+    In a narrowband system (such as APRS or voice FM), the signal bandwidth is narrow, so the symbol duration $T_{\text{symbol}}$ is much greater than the channel's <strong>multipath delay spread</strong> $\tau_{\text{spread}}$:
+  </p>
+
+  $$B_{\text{info}} \ll \frac{1}{\tau_{\text{spread}}} \iff T_{\text{symbol}} \gg \tau_{\text{spread}}$$
+
+  <p>
+    Because all delayed reflections arrive within a small fraction of a symbol period, they cannot be separated in time. The arriving RF phases $\theta_i = 2\pi f_c \tau_i$ rotate independently. When two rays arrive $180^\circ$ out of phase, they cancel destructively. This is <strong>flat Rayleigh fading</strong>, creating localized signal nulls exceeding $-30\text{ dB}$.
+  </p>
+
+  <h3>B. Wideband Spread Spectrum Resolves Multipath</h3>
+  <p>
+    In DSSS, the chip period $T_{\text{chip}} = 1 / B_{ss}$ is exceptionally short. For instance, a $10.23\text{ MHz}$ spreading bandwidth yields:
+  </p>
+
+  $$T_{\text{chip}} = \frac{1}{10.23 \times 10^6\text{ Hz}} \approx 97.75\text{ ns} \iff d_{\text{path}} = c \cdot T_{\text{chip}} \approx 29.3\text{ meters}$$
+
+  <p>
+    Two multipath rays arriving with a differential path delay exceeding $T_{\text{chip}}$:
+  </p>
+
+  $$|\tau_i - \tau_j| > T_{\text{chip}}$$
+
+  <p>
+    <strong>are completely resolvable in time</strong>! Because the Gold code's autocorrelation is near-zero for all delays $|\tau| \ge T_{\text{chip}}$, a correlator synchronized to Path 1 treats the delayed echo from Path 2 as uncorrelated pseudo-noise, suppressing it by the processing gain $G_p$. Multipath does not create destructive fading!
+  </p>
+
+  <p>
+    The multipath channel behaves as a discrete tapped delay line:
+  </p>
+
+  $$h(t) = \sum_{l=1}^{L_p} \alpha_l e^{-j \theta_l} \delta(t - \tau_l)$$
+
+  <p>
+    where $L_p$ is the number of resolvable paths, $\alpha_l$ is path attenuation, $\theta_l$ is carrier phase shift, and $\tau_l$ is arrival delay.
+  </p>
+
+  <center>
+    <svg viewBox="0 0 760 210" width="100%" height="210" style="background:#1e1e2e; border-radius:8px; font-family:monospace; margin:20px 0;">
+      <!-- Title -->
+      <text x="25" y="25" fill="#cdd6f4" font-size="13" font-weight="bold">Multipath Delay Profile: Resolvable Rays Separated by &gt; T_chip</text>
+
+      <!-- Axes -->
+      <line x1="60" y1="170" x2="720" y2="170" stroke="#45475a" stroke-width="1.5"/>
+      <line x1="60" y1="40" x2="60" y2="170" stroke="#45475a" stroke-width="1.5"/>
+      <text x="690" y="190" fill="#a6adc8" font-size="11">Delay (τ)</text>
+      <text x="25" y="45" fill="#a6adc8" font-size="11" transform="rotate(-90 25,45)">Power</text>
+
+      <!-- Autocorrelation Rayleigh resolution -->
+      <!-- Ray 1: Direct Path -->
+      <path d="M 80,170 L 140,55 L 200,170" fill="rgba(166, 227, 161, 0.25)" stroke="#a6e3a1" stroke-width="2"/>
+      <line x1="140" y1="170" x2="140" y2="55" stroke="#a6e3a1" stroke-dasharray="3,3"/>
+      <text x="120" y="45" fill="#a6e3a1" font-size="12" font-weight="bold">Ray 1: τ₁</text>
+      <text x="110" y="185" fill="#a6adc8" font-size="10">Direct LOS</text>
+
+      <!-- Ray 2: Building Reflection -->
+      <path d="M 270,170 L 330,85 L 390,170" fill="rgba(137, 180, 250, 0.25)" stroke="#89b4fa" stroke-width="2"/>
+      <line x1="330" y1="170" x2="330" y2="85" stroke="#89b4fa" stroke-dasharray="3,3"/>
+      <text x="310" y="75" fill="#89b4fa" font-size="12" font-weight="bold">Ray 2: τ₂</text>
+      <text x="295" y="185" fill="#a6adc8" font-size="10">Building Echo</text>
+
+      <!-- Delta tau marker -->
+      <line x1="140" y1="120" x2="330" y2="120" stroke="#f9e2af" stroke-width="1.5"/>
+      <polygon points="140,120 148,116 148,124" fill="#f9e2af"/>
+      <polygon points="330,120 322,116 322,124" fill="#f9e2af"/>
+      <text x="200" y="112" fill="#f9e2af" font-size="11" font-weight="bold">|τ₂ - τ₁| &gt; T_chip</text>
+
+      <!-- Ray 3: Hill Reflection -->
+      <path d="M 470,170 L 530,125 L 590,170" fill="rgba(203, 166, 247, 0.25)" stroke="#cba6f7" stroke-width="2"/>
+      <line x1="530" y1="170" x2="530" y2="125" stroke="#cba6f7" stroke-dasharray="3,3"/>
+      <text x="510" y="115" fill="#cba6f7" font-size="12" font-weight="bold">Ray 3: τ₃</text>
+      <text x="500" y="185" fill="#a6adc8" font-size="10">Terrain Scatter</text>
+    </svg>
+  </center>
+
+  <h3>C. The Rake Receiver Architecture</h3>
+  <p>
+    Invented by Robert Price and Paul Green in 1958, the <strong>Rake Receiver</strong> gathers multipath energy instead of rejecting it. Resembling the tines of a garden rake gathering leaves, a Rake receiver assigns independent correlation units—called <strong>fingers</strong>—to each resolvable multipath ray.
+  </p>
+
+  <center>
+    <svg viewBox="0 0 760 300" width="100%" height="300" style="background:#1e1e2e; border-radius:8px; font-family:monospace; margin:20px 0;">
+      <!-- Title -->
+      <text x="25" y="24" fill="#cdd6f4" font-size="13" font-weight="bold">Rake Receiver Architecture: Tracking Fingers &amp; Maximal Ratio Combiner</text>
+
+      <!-- RF Input -->
+      <rect x="20" y="125" width="80" height="40" fill="#313244" stroke="#89b4fa" stroke-width="2" rx="4"/>
+      <text x="32" y="150" fill="#cdd6f4" font-size="12">r(t) I/Q</text>
+
+      <!-- Bus line -->
+      <line x1="100" y1="145" x2="150" y2="145" stroke="#a6adc8" stroke-width="2"/>
+      <line x1="150" y1="55" x2="150" y2="235" stroke="#a6adc8" stroke-width="2"/>
+
+      <!-- Finger 1 -->
+      <line x1="150" y1="55" x2="200" y2="55" stroke="#a6adc8" stroke-width="2"/>
+      <polygon points="200,55 190,50 190,60" fill="#a6adc8"/>
+      <rect x="200" y="35" width="150" height="40" fill="#313244" stroke="#a6e3a1" stroke-width="2" rx="4"/>
+      <text x="212" y="60" fill="#a6e3a1" font-size="11" font-weight="bold">Finger 1: Correlate c(t-τ₁)</text>
+
+      <!-- Finger 1 Weight -->
+      <line x1="350" y1="55" x2="410" y2="55" stroke="#a6adc8" stroke-width="2"/>
+      <polygon points="410,55 400,50 400,60" fill="#a6adc8"/>
+      <rect x="410" y="35" width="110" height="40" fill="#45475a" stroke="#f9e2af" stroke-width="2" rx="4"/>
+      <text x="425" y="60" fill="#f9e2af" font-size="11" font-weight="bold">Weight: w₁ = α₁e⁻ʲᶿ¹</text>
+
+      <!-- Finger 2 -->
+      <line x1="150" y1="145" x2="200" y2="145" stroke="#a6adc8" stroke-width="2"/>
+      <polygon points="200,145 190,140 190,150" fill="#a6adc8"/>
+      <rect x="200" y="125" width="150" height="40" fill="#313244" stroke="#89b4fa" stroke-width="2" rx="4"/>
+      <text x="212" y="150" fill="#89b4fa" font-size="11" font-weight="bold">Finger 2: Correlate c(t-τ₂)</text>
+
+      <!-- Finger 2 Weight -->
+      <line x1="350" y1="145" x2="410" y2="145" stroke="#a6adc8" stroke-width="2"/>
+      <polygon points="410,145 400,140 400,150" fill="#a6adc8"/>
+      <rect x="410" y="125" width="110" height="40" fill="#45475a" stroke="#f9e2af" stroke-width="2" rx="4"/>
+      <text x="425" y="150" fill="#f9e2af" font-size="11" font-weight="bold">Weight: w₂ = α₂e⁻ʲᶿ²</text>
+
+      <!-- Finger 3 -->
+      <line x1="150" y1="235" x2="200" y2="235" stroke="#a6adc8" stroke-width="2"/>
+      <polygon points="200,235 190,230 190,240" fill="#a6adc8"/>
+      <rect x="200" y="215" width="150" height="40" fill="#313244" stroke="#cba6f7" stroke-width="2" rx="4"/>
+      <text x="212" y="240" fill="#cba6f7" font-size="11" font-weight="bold">Finger 3: Correlate c(t-τ₃)</text>
+
+      <!-- Finger 3 Weight -->
+      <line x1="350" y1="235" x2="410" y2="235" stroke="#a6adc8" stroke-width="2"/>
+      <polygon points="410,235 400,230 400,240" fill="#a6adc8"/>
+      <rect x="410" y="215" width="110" height="40" fill="#45475a" stroke="#f9e2af" stroke-width="2" rx="4"/>
+      <text x="425" y="240" fill="#f9e2af" font-size="11" font-weight="bold">Weight: w₃ = α₃e⁻ʲᶿ³</text>
+
+      <!-- MRC Summer -->
+      <line x1="520" y1="55" x2="600" y2="135" stroke="#f9e2af" stroke-width="2"/>
+      <line x1="520" y1="145" x2="590" y2="145" stroke="#f9e2af" stroke-width="2"/>
+      <line x1="520" y1="235" x2="600" y2="155" stroke="#f9e2af" stroke-width="2"/>
+
+      <circle cx="610" cy="145" r="20" fill="#313244" stroke="#f38ba8" stroke-width="2"/>
+      <text x="602" y="152" fill="#f38ba8" font-size="20" font-weight="bold">∑</text>
+
+      <!-- Decision Output -->
+      <line x1="630" y1="145" x2="710" y2="145" stroke="#a6e3a1" stroke-width="2.5"/>
+      <polygon points="710,145 700,140 700,150" fill="#a6e3a1"/>
+      <text x="645" y="135" fill="#a6e3a1" font-size="12" font-weight="bold">Decision y</text>
+      <text x="645" y="175" fill="#a6adc8" font-size="10">Maximal SNR</text>
+    </svg>
+  </center>
+
+  <p>
+    A Rake receiver consists of:
+  </p>
+  <ol>
+    <li><strong>Searcher Engine:</strong> Continuously computes the circular cross-correlation (often via parallel FFT) across the delay profile to identify new arriving paths and allocate fingers to the strongest delays $\tau_l$.</li>
+    <li><strong>Tracking Fingers ($l = 1 \dots L$):</strong> Each finger contains a local code generator delayed by $\tau_l$, fine-tuned via an early-prompt-late Delay-Locked Loop (DLL), and a channel estimator tracking the complex channel gain $h_l = \alpha_l e^{j \theta_l}$.</li>
+    <li><strong>Maximal Ratio Combiner (MRC):</strong> Combines the finger outputs with optimal complex weighting.</li>
+  </ol>
+
+  <h3>D. Derivation of Maximal Ratio Combining (MRC) Optimality</h3>
+  <p>
+    Let the despread output of finger $l$ for transmitted symbol $s$ be:
+  </p>
+
+  $$r_l = h_l s + n_l = \alpha_l e^{j \theta_l} s + n_l$$
+
+  <p>
+    where $n_l \sim \mathcal{CN}(0, \sigma_n^2)$ are mutually independent noise terms (because delays $|\tau_l - \tau_k| > T_{\text{chip}}$ decorrelate the noise). The combiner forms a linear combination of all finger outputs with complex weights $w_l$:
+  </p>
+
+  $$y = \sum_{l=1}^{L} w_l^* \, r_l = s \left( \sum_{l=1}^{L} w_l^* h_l \right) + \sum_{l=1}^{L} w_l^* n_l$$
+
+  <p>
+    The output signal power is $P_s = |s|^2 \left| \sum_{l=1}^{L} w_l^* h_l \right|^2$, and the total output noise variance is $\sigma_{\text{comb}}^2 = \sigma_n^2 \sum_{l=1}^{L} |w_l|^2$. The combined SNR is:
+  </p>
+
+  $$\text{SNR}_{\text{MRC}} = \frac{|s|^2}{\sigma_n^2} \frac{\left| \sum_{l=1}^{L} w_l^* h_l \right|^2}{\sum_{l=1}^{L} |w_l|^2}$$
+
+  <p>
+    By the <strong>Cauchy-Schwarz Inequality</strong>:
+  </p>
+
+  $$\left| \sum_{l=1}^{L} w_l^* h_l \right|^2 \le \left( \sum_{l=1}^{L} |w_l|^2 \right) \left( \sum_{l=1}^{L} |h_l|^2 \right)$$
+
+  <p>
+    with equality holding if and only if the weight vector is strictly proportional to the channel vector:
+  </p>
+
+  $$w_l = h_l = \alpha_l e^{j \theta_l} \implies w_l^* = \alpha_l e^{-j \theta_l}$$
+
+  <p>
+    Substituting this optimal MRC weight into the SNR expression:
+  </p>
+
+  $$\text{SNR}_{\text{MRC}} = \frac{|s|^2}{\sigma_n^2} \frac{\left( \sum_{l=1}^{L} |h_l|^2 \right)^2}{\sum_{l=1}^{L} |h_l|^2} = \frac{|s|^2}{\sigma_n^2} \sum_{l=1}^{L} |h_l|^2 = \sum_{l=1}^{L} \left( \frac{|s|^2 \alpha_l^2}{\sigma_n^2} \right) = \sum_{l=1}^{L} \text{SNR}_l$$
+
+  <div class="callout upside">
+    <div class="callout-title">Multipath as a Cooperative Asset</div>
+    <p>
+      In a narrowband receiver, multipath is a destructive hazard that induces severe Rayleigh fading nulls. In a DSSS Rake receiver with Maximal Ratio Combining, <strong>multipath is transformed into path diversity</strong>! The total combined SNR is literally the sum of the individual SNRs of each arriving ray. If the direct line-of-sight path is momentarily obstructed, reflection rays tracked by other fingers maintain the communications link without dropping a single bit.
+    </p>
+  </div>
+
+  <!-- Interactive Quizzes -->
+  <h2>Check Your Understanding</h2>
+
+  <div class="quiz-container" id="quiz-29-1">
+    <div class="quiz-question">
+      1. Why are Gold codes preferred over arbitrary maximal-length sequences (m-sequences) in multi-user CDMA systems such as GPS?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Gold codes double the chipping rate and halve the required RF bandwidth for equivalent processing gain.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Gold codes guarantee strictly bounded three-valued cross-correlation, preventing multi-access interference.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Raw m-sequences cannot be generated using simple linear feedback shift registers with XOR feedback logic.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Gold codes eliminate the need for carrier frequency synchronization and Doppler shift compensation in SDRs.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> While individual m-sequences have optimal delta-like autocorrelation, arbitrary pairs of m-sequences exhibit large, uncontrolled cross-correlation sidelobes (often peaking above $0.3N$). Gold codes, constructed by XOR-combining preferred polynomial pairs, bound all cross-correlation and out-of-phase autocorrelation values to strictly three discrete numbers $\{-t(m), -1, t(m)-2\}$, suppressing multi-access interference.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-29-2">
+    <div class="quiz-question">
+      2. An SDR receives a DSSS BPSK signal with code length $L = 1023$ chips per bit at an RF input SNR of $-12\text{ dB}$. What is the post-despreading SNR at the detector?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        $-12.0\text{ dB}$, because linear despreading preserves the physical signal-to-noise ratio of the incoming channel.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        $+6.05\text{ dB}$, because processing gain scales with the square root of code length: $10 \log_{10}(\sqrt{1023})$.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        $+18.1\text{ dB}$, because coherent accumulation boosts signal power by $L^2$ while noise variance sums by $L$.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        $+48.2\text{ dB}$, because both signal amplitude and noise suppression scale quadratically with register stages.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> Processing gain is $G_p = 10 \log_{10}(L) = 10 \log_{10}(1023) \approx 30.1\text{ dB}$. In the despreading accumulator, the signal chips add coherently ($L^2$ power gain), whereas uncorrelated noise samples add incoherently ($L$ power gain), providing a net SNR improvement of factor $L$. Thus, $\text{SNR}_{\text{out}} = -12\text{ dB} + 30.1\text{ dB} = +18.1\text{ dB}$.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-29-3">
+    <div class="quiz-question">
+      3. Under what physical condition does a DSSS Rake receiver successfully resolve two distinct multipath propagation rays into independent fingers?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The carrier Doppler frequency shifts of the two rays must differ by at least the chip rate $R_{\text{chip}}$.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The difference in arrival times between the rays must exceed the duration of a single chip ($|\Delta\tau| > T_{\text{chip}}$).
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The total delay spread across all paths must remain strictly less than one-tenth of an RF carrier wave period.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The secondary reflected echo must arrive with higher power than the direct line-of-sight path propagation.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> Because spreading codes exhibit near-zero autocorrelation for time offsets $|\tau| \ge T_{\text{chip}}$, any multipath ray delayed by more than one chip falls outside the main correlation peak. The delayed echo appears as uncorrelated noise to a finger aligned with the first path, allowing separate fingers to track and coherently combine them via Maximal Ratio Combining.
+    </div>
+  </div>
+
+  <h2>Summary &amp; Architecture Implications</h2>
+
+  <p>
+    Direct-Sequence Spread Spectrum embodies a profound architectural principle: <strong>expanding bandwidth buys robustness, security, and multi-user scaling</strong>.
+  </p>
+
+  <ol>
+    <li>
+      <strong>Information Theory Frontier:</strong> Spreading dilutes power spectral density below the noise floor ($S_{ss} \ll N_0$), providing Low Probability of Intercept while preserving Shannon capacity in power-limited regimes.
+    </li>
+    <li>
+      <strong>Algebraic Code Construction:</strong> Primitive polynomials over $\text{GF}(2)$ yield maximal-length m-sequences with delta-like autocorrelation. Modulo-2 addition of preferred pairs generates Gold codes with bounded three-valued cross-correlation, enabling dense CDMA networks like GPS.
+    </li>
+    <li>
+      <strong>Coherent Processing Gain:</strong> Integrating over $L$ chips provides $G_p = 10 \log_{10}(L)\text{ dB}$ of SNR improvement, converting sub-zero RF reception (e.g., $-15\text{ dB}$) into error-free bit detection.
+    </li>
+    <li>
+      <strong>Computational Architecture:</strong> Acquisition searches are accelerated using parallel FFT circular convolution ($O(N \log N)$), while tracking and hard-quantized correlations run at line rate using SIMD bitwise XOR and hardware popcount instructions.
+    </li>
+    <li>
+      <strong>Multipath Exploitation:</strong> When chip duration $T_{\text{chip}}$ is shorter than channel delay spread, multipath shifts from destructive Rayleigh fading into constructive path diversity, gathered by Rake receiver fingers and summed via Maximal Ratio Combining.
+    </li>
+  </ol>
+
+  <div class="footer">
+    <span>SDR Scout Architecture Course</span>
+    <span>Lesson 0029</span>
+  </div>
+</body>
+</html>

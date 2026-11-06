@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 27: Digital Automatic Gain Control (AGC) Loops &amp; Receiver Dynamic Range Budgeting</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = {
+      tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] }
+    };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0027</span>
+    <span class="badge badge-arch">RF Front-End &amp; Control Loops</span>
+    <span>Reading time: 16 minutes</span>
+  </div>
+
+  <h1>Digital Automatic Gain Control (AGC) Loops &amp; Receiver Dynamic Range Budgeting</h1>
+
+  <p>
+    In software-defined radio design, dynamic range is the unforgiving frontier. In computational environments, engineers take 32-bit floating-point numbers for granted: IEEE 754 <code>f32</code> offers over $1500\text{ dB}$ of dynamic range, rendering mathematical overflow virtually impossible during routine arithmetic. However, the physical electromagnetic ether and the analog front-end components that digitize it possess no such luxury.
+  </p>
+
+  <p>
+    On crowded amateur radio bands, an antenna simultaneously captures whisper-quiet deep-space telemetry or DX stations arriving at $-130\text{ dBm}$ (a few tens of nanovolts into $50\,\Omega$) alongside a local kilowatt "blowtorch" transmitter down the street driving $+10\text{ dBm}$ into the receiver's front end. This spans an astonishing <strong>$140\text{ dB}$ of power differential</strong> ($10^{14}:1$).
+  </p>
+
+  <p>
+    If you apply fixed, high front-end gain, the strong blocker drives the analog amplifiers and ADC into hard saturation, generating destructive intermodulation products that obliterate the spectrum. If you attenuate the front end to prevent clipping, weak signals drop beneath the ADC quantization floor and disappear into numerical noise. Managing this reality requires a dual-pronged approach: <strong>RF Gain Budgeting</strong> (cascading noise figure, $P_{1\text{dB}}$, and IIP3 across analog stages) and <strong>Digital Automatic Gain Control (AGC) Loops</strong> (closed-loop feedback systems stabilizing baseband power for demodulation).
+  </p>
+
+  <h2>1. The Dynamic Range Dilemma: $-130\text{ dBm}$ to $+10\text{ dBm}$</h2>
+
+  <p>
+    To understand why static receiver gain fails, consider the fundamental physics of the RF noise floor. The thermal noise power available in a given receiver bandwidth $B$ at ambient temperature $T = 290\text{ K}$ is dictated by Johnson-Nyquist physics:
+  </p>
+
+  $$P_{\text{thermal}} = k_B T B$$
+
+  <p>
+    Expressed in decibels relative to one milliwatt ($\text{dBm}$), the thermal noise spectral density is:
+  </p>
+
+  $$P_{0} = 10 \log_{10}\left(\frac{k_B T \cdot 1\text{ Hz}}{10^{-3}\text{ W}}\right) \approx -174\text{ dBm/Hz}$$
+
+  <p>
+    For typical amateur radio signal allocations, the receiver's pre-detection noise floor (Minimum Discernible Signal, or $\text{MDS}$) depends on channel bandwidth $B$ and receiver Noise Figure ($\text{NF}$):
+  </p>
+
+  $$\text{MDS} = -174\text{ dBm/Hz} + 10 \log_{10}(B) + \text{NF}$$
+
+  <ul>
+    <li><strong>CW (Morse Code) Channel ($B = 500\text{ Hz}$, $\text{NF} = 6\text{ dB}$):</strong>
+      $$\text{MDS}_{\text{CW}} = -174 + 10\log_{10}(500) + 6 = -174 + 27 + 6 = -141\text{ dBm}$$
+    </li>
+    <li><strong>SSB Voice Channel ($B = 2.4\text{ kHz}$, $\text{NF} = 8\text{ dB}$):</strong>
+      $$\text{MDS}_{\text{SSB}} = -174 + 10\log_{10}(2400) + 8 = -174 + 33.8 + 8 \approx -132.2\text{ dBm}$$
+    </li>
+    <li><strong>Wideband FM / Telemetry ($B = 15\text{ kHz}$, $\text{NF} = 4\text{ dB}$):</strong>
+      $$\text{MDS}_{\text{WFM}} = -174 + 10\log_{10}(15000) + 4 = -174 + 41.8 + 4 \approx -128.2\text{ dBm}$$
+    </li>
+  </ul>
+
+  <p>
+    At the opposite extreme, suppose an amateur station transmits 100 watts ($+50\text{ dBm}$) on 7.100 MHz from an antenna 500 meters away. Line-of-sight path loss and antenna cross-coupling might yield $-45\text{ dB}$ of spatial isolation, delivering an input power of $+5\text{ dBm}$ to your antenna terminals.
+  </p>
+
+  <div class="callout warning">
+    <div class="callout-title">The Fixed Gain Failure Mode</div>
+    <p>
+      An SDR with a 12-bit ADC provides approximately $74\text{ dB}$ of full-scale Signal-to-Quantization-Noise Ratio ($\text{SQNR} \approx 6.02 B + 1.76$). Even a high-end 16-bit direct-sampling transceiver provides at most $98\text{ dB}$ of instantaneous dynamic range. With a $140\text{ dB}$ signal spread:
+    </p>
+    <ul>
+      <li><strong>If gain is set high ($+40\text{ dB}$):</strong> The $+5\text{ dBm}$ blocker hits $+45\text{ dBm}$ internally, instantly blowing past the ADC full-scale threshold ($\approx +10\text{ dBm}$). Hard clipping generates intense odd-order harmonic and intermodulation distortion (IMD) across the entire spectrum.</li>
+      <li><strong>If gain is set low ($-10\text{ dB}$):</strong> The blocker does not clip, arriving at $-5\text{ dBm}$. However, the weak DX signal at $-135\text{ dBm}$ drops to $-145\text{ dBm}$ at the converter, falling dozens of decibels below the ADC quantization noise floor ($V_{\text{LSB}}$ toggles zero bits). The signal is lost forever to truncation.</li>
+    </ul>
+  </div>
+
+  <h2>2. RF Gain Budgeting: Friis' Formula, $P_{1\text{dB}}$, and IIP3</h2>
+
+  <p>
+    A receiver front end is a cascade of analog components: bandpass preselector filters, low-noise amplifiers (LNAs), RF attenuators, downconversion mixers, IF amplifiers, and anti-aliasing filters leading into the ADC. Designing this chain requires <strong>gain budgeting</strong>—balancing noise sensitivity against non-linear dynamic range.
+  </p>
+
+  <h3>Cascaded Noise Factor: Friis' Formula</h3>
+
+  <p>
+    The total noise factor $F_{\text{total}}$ of an $N$-stage cascade is given by Friis' formula:
+  </p>
+
+  $$F_{\text{total}} = F_1 + \frac{F_2 - 1}{G_1} + \frac{F_3 - 1}{G_1 G_2} + \frac{F_4 - 1}{G_1 G_2 G_3} + \dots + \frac{F_N - 1}{\prod_{k=1}^{N-1} G_k}$$
+
+  <p>
+    Where $F_k$ is the linear noise factor ($F = 10^{\text{NF}/10}$) and $G_k$ is the linear power gain ($G = 10^{\text{Gain}/10}$) of stage $k$.
+  </p>
+
+  <p>
+    Friis' formula reveals that the noise figure of the entire receiver is overwhelmingly dominated by the first stage ($F_1$), provided that the first stage has sufficient gain ($G_1 \gg 1$) to suppress the noise factors of subsequent stages. In an SDR, the ADC itself has an appalling noise figure—typically between $25\text{ dB}$ and $35\text{ dB}$ due to internal thermal resistor noise and quantization floor limits. High front-end LNA gain is essential to prevent the ADC's noise from blinding the receiver.
+  </p>
+
+  <h3>The Linearity Penalty: Gain Compression and Intermodulation</h3>
+
+  <p>
+    However, gain cannot be increased arbitrarily. Every active device possesses non-linear transfer characteristics. We can express the output voltage of a weakly non-linear amplifier using a Taylor series expansion:
+  </p>
+
+  $$v_{\text{out}}(t) = a_1 v_{\text{in}}(t) + a_2 v_{\text{in}}^2(t) + a_3 v_{\text{in}}^3(t) + \dots$$
+
+  <p>
+    The linear gain is $a_1$. For differential or symmetric circuits, second-order terms ($a_2$) create baseband rectifications and second harmonics ($2f$), which typically fall far out of band. The cubic term ($a_3$, where $a_3 &lt; 0$ for compressive non-linearities) is dangerous because it generates <strong>third-order intermodulation distortion (IMD3)</strong>.
+  </p>
+
+  <p>
+    When two strong signals at frequencies $f_1$ and $f_2$ enter the amplifier:
+  </p>
+
+  $$v_{\text{in}}(t) = A_1 \cos(2\pi f_1 t) + A_2 \cos(2\pi f_2 t)$$
+
+  <p>
+    Expanding the cubic term $[v_{\text{in}}(t)]^3$ yields cross-products at frequencies:
+  </p>
+
+  $$f_{\text{IMD3}} = 2f_1 - f_2 \quad \text{and} \quad 2f_2 - f_1$$
+
+  <p>
+    If $f_1$ and $f_2$ are two adjacent amateur transmitters at $14.200\text{ MHz}$ and $14.220\text{ MHz}$, their IMD3 products fall at $14.180\text{ MHz}$ and $14.240\text{ MHz}$—<strong>directly inside the amateur band</strong>, landing right on top of legitimate weak signals!
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Metric</th>
+        <th>Physical Definition</th>
+        <th>Mathematical Scaling</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>$1\text{ dB}$ Compression ($P_{1\text{dB}}$)</strong></td>
+        <td>The input power at which actual amplifier gain drops $1\text{ dB}$ below ideal linear gain.</td>
+        <td>$P_{1\text{dB}} \approx \text{IIP3} - 9.6\text{ dB}$ (for typical cubic non-linearity).</td>
+      </tr>
+      <tr>
+        <td><strong>Third-Order Intercept Point ($\text{IIP3}$)</strong></td>
+        <td>Theoretical input power where the extrapolated power of the IMD3 product equals the fundamental linear output.</td>
+        <td>Fundamental power grows $1\text{ dB/dB}$; IMD3 product power grows $3\text{ dB/dB}$.</td>
+      </tr>
+      <tr>
+        <td><strong>Spurious-Free Dynamic Range ($\text{SFDR}$)</strong></td>
+        <td>The power range between the receiver noise floor ($\text{MDS}$) and the point where IMD3 products rise above the noise floor.</td>
+        <td>$$\text{SFDR} = \frac{2}{3} \left( \text{IIP3} - \text{MDS} \right)$$</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Cascaded IIP3 Formula: The LNA Paradox</h3>
+
+  <p>
+    While noise factor divides by stage gain in Friis' formula, cascaded input third-order intercept point <strong>multiplies by stage gain</strong>:
+  </p>
+
+  $$\frac{1}{\text{IIP3}_{\text{total}}} \approx \frac{1}{\text{IIP3}_1} + \frac{G_1}{\text{IIP3}_2} + \frac{G_1 G_2}{\text{IIP3}_3} + \dots$$
+
+  <p>
+    Where all quantities are in linear milliwatts ($P_{\text{mW}} = 10^{P_{\text{dBm}}/10}$).
+  </p>
+
+  <div class="callout upside">
+    <div class="callout-title">The Fundamental Front-End Trade-off</div>
+    <p>
+      Notice the profound tension between Friis' formula and cascaded IIP3:
+    </p>
+    <ul>
+      <li>Increasing LNA gain $G_1$ suppresses downstream noise ($F_2 / G_1 \to 0$), lowering total receiver Noise Figure and improving sensitivity for weak signals.</li>
+      <li>However, increasing $G_1$ scales up the second-stage non-linearity by $G_1 / \text{IIP3}_2$, drastically <em>degrading</em> the system's input intercept point ($\text{IIP3}_{\text{total}}$).</li>
+    </ul>
+    <p>
+      If you place a $+20\text{ dB}$ gain preamplifier ahead of an SDR with an IIP3 of $+5\text{ dBm}$, the effective system IIP3 degrades from $+5\text{ dBm}$ down to approximately $-15\text{ dBm}$. Your receiver becomes $100\times$ more sensitive to strong-signal intermodulation distortion!
+    </p>
+  </div>
+
+  <h2>3. Closed-Loop Feedback AGC Architecture</h2>
+
+  <p>
+    Because analog RF gain must be actively trimmed to prevent front-end overload, modern SDRs divide gain control into two tiers:
+  </p>
+
+  <ol>
+    <li><strong>Coarse RF / IF AGC:</strong> Hardware-switched attenuators (e.g. $0\text{ dB}$, $-10\text{ dB}$, $-20\text{ dB}$) or continuous Variable Gain Amplifiers (VGAs) ahead of the ADC to ensure the analog signal peak remains within the ADC's linear dynamic window (e.g., peak at $-6\text{ dBFS}$).</li>
+    <li><strong>Fine Digital Baseband AGC:</strong> A numerical feedback loop operating directly on complex baseband $I/Q$ samples $z[n] = I[n] + j Q[n]$ to hold average signal power constant before symbol demodulation, carrier tracking, or audio synthesis.</li>
+  </ol>
+
+  <p>
+    The classic closed-loop feedback AGC architecture is organized as follows:
+  </p>
+
+  <!-- Clean SVG Diagram of Closed-Loop Feedback AGC -->
+  <div style="text-align: center; margin: 2rem 0;">
+    <svg width="780" height="240" viewBox="0 0 780 240" style="max-width: 100%; height: auto; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+      <!-- Background box -->
+      <rect x="10" y="10" width="760" height="220" rx="8" fill="#fdfdf9" stroke="#dcdcd0" stroke-width="1.5"/>
+      
+      <!-- Nodes -->
+      <!-- Input x[n] -->
+      <text x="35" y="75" font-size="14" font-weight="600" fill="#111">x[n] (I/Q)</text>
+      <line x1="85" y1="70" x2="140" y2="70" stroke="#111" stroke-width="2" marker-end="url(#arrow)"/>
+
+      <!-- Multiplier (VGA) -->
+      <rect x="140" y="45" width="80" height="50" rx="6" fill="#e0f2fe" stroke="#0369a1" stroke-width="2"/>
+      <text x="180" y="70" font-size="13" font-weight="600" fill="#0369a1" text-anchor="middle">Multiplier</text>
+      <text x="180" y="86" font-size="11" fill="#0369a1" text-anchor="middle">y[n] = g[n]·x[n]</text>
+
+      <!-- Output y[n] -->
+      <line x1="220" y1="70" x2="310" y2="70" stroke="#111" stroke-width="2"/>
+      <circle x="270" y="70" r="4" fill="#8b0000"/>
+      <line x1="270" y1="70" x2="270" y2="150" stroke="#8b0000" stroke-width="2"/>
+      
+      <line x1="310" y1="70" x2="350" y2="70" stroke="#111" stroke-width="2" marker-end="url(#arrow)"/>
+      <text x="360" y="75" font-size="14" font-weight="600" fill="#111">y[n] (Out)</text>
+
+      <!-- Envelope / Power Detector -->
+      <line x1="270" y1="150" x2="310" y2="150" stroke="#8b0000" stroke-width="2" marker-end="url(#arrow)"/>
+      <rect x="310" y="125" width="110" height="50" rx="6" fill="#fef3c7" stroke="#92400e" stroke-width="2"/>
+      <text x="365" y="148" font-size="12" font-weight="600" fill="#92400e" text-anchor="middle">Power Detector</text>
+      <text x="365" y="164" font-size="10" fill="#92400e" text-anchor="middle">P[n] = |y[n]|²</text>
+
+      <!-- Log Conversion -->
+      <line x1="420" y1="150" x2="455" y2="150" stroke="#111" stroke-width="2" marker-end="url(#arrow)"/>
+      <rect x="455" y="125" width="85" height="50" rx="6" fill="#fef3c7" stroke="#92400e" stroke-width="2"/>
+      <text x="497" y="148" font-size="12" font-weight="600" fill="#92400e" text-anchor="middle">Log (dB)</text>
+      <text x="497" y="164" font-size="10" fill="#92400e" text-anchor="middle">10 log₁₀(P)</text>
+
+      <!-- Error Summer -->
+      <line x1="540" y1="150" x2="575" y2="150" stroke="#111" stroke-width="2" marker-end="url(#arrow)"/>
+      <circle x="590" y="150" r="15" fill="#fff" stroke="#111" stroke-width="2"/>
+      <text x="590" y="154" font-size="16" font-weight="bold" fill="#111" text-anchor="middle">∑</text>
+      <text x="572" y="142" font-size="12" font-weight="bold" fill="#c62828">−</text>
+      <text x="590" y="124" font-size="12" font-weight="bold" fill="#2e7d32">+</text>
+
+      <!-- Reference Setpoint -->
+      <line x1="590" y1="75" x2="590" y2="135" stroke="#111" stroke-width="2" marker-end="url(#arrow)"/>
+      <text x="590" y="65" font-size="12" font-weight="600" fill="#2e7d32" text-anchor="middle">V_ref (dBFS)</text>
+
+      <!-- Loop Filter / Hang Engine -->
+      <line x1="605" y1="150" x2="640" y2="150" stroke="#111" stroke-width="2" marker-end="url(#arrow)"/>
+      <rect x="640" y="125" width="115" height="50" rx="6" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/>
+      <text x="697" y="146" font-size="12" font-weight="600" fill="#1b5e20" text-anchor="middle">Loop Filter</text>
+      <text x="697" y="162" font-size="10" fill="#1b5e20" text-anchor="middle">Attack/Hang/Decay</text>
+
+      <!-- Feedback Path back to Multiplier -->
+      <line x1="697" y1="175" x2="697" y2="205" stroke="#111" stroke-width="2"/>
+      <line x1="697" y1="205" x2="180" y2="205" stroke="#111" stroke-width="2"/>
+      <line x1="180" y1="205" x2="180" y2="95" stroke="#111" stroke-width="2" marker-end="url(#arrow)"/>
+      <text x="440" y="200" font-size="12" font-weight="600" fill="#8b0000" text-anchor="middle">g[n] = 10^(g_dB[n] / 20)</text>
+
+      <!-- Arrow marker definition -->
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#111"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+
+  <p>The feedback loop contains four critical subsystems:</p>
+
+  <ol>
+    <li><strong>Multiplier / Variable Gain Stage:</strong> Scales the incoming digital baseband vector $x[n]$ by scalar gain $g[n]$:
+      $$y[n] = g[n] \cdot x[n]$$
+    </li>
+    <li><strong>Power / Envelope Detector:</strong> Measures the instantaneous magnitude or energy of the output:
+      $$P[n] = |y[n]|^2 = I_y^2[n] + Q_y^2[n]$$
+    </li>
+    <li><strong>Comparator against Reference Setpoint:</strong> Subtracts output power from the target operating setpoint $V_{\text{ref}}$ (typically chosen at $-12\text{ dBFS}$ to provide $12\text{ dB}$ of headroom for peak-to-average power ratio in modulated signals).</li>
+    <li><strong>Loop Filter &amp; Integrator:</strong> Low-pass filters the error signal and integrates gain adjustments, enforcing stability, bandwidth constraints, and dual time-constant dynamics.</li>
+  </ol>
+
+  <h2>4. Logarithmic (dB-Domain) vs. Linear AGC Loops</h2>
+
+  <p>
+    Why do experienced DSP engineers insist on formulating AGC loops in the logarithmic (decibel) domain rather than the linear voltage domain? The reason lies in the mathematics of non-linear control loop stability.
+  </p>
+
+  <h3>The Failure of the Linear Feedback AGC</h3>
+
+  <p>
+    Consider a naive linear feedback AGC that updates gain proportional to linear amplitude error:
+  </p>
+
+  $$y[n] = g[n] x[n]$$
+  $$e_{\text{lin}}[n] = V_{\text{ref}} - |y[n]| = V_{\text{ref}} - g[n] |x[n]|$$
+  $$g[n+1] = g[n] + \mu \, e_{\text{lin}}[n]$$
+
+  <p>
+    Substituting the error expression into the gain update equation:
+  </p>
+
+  $$g[n+1] = g[n] + \mu \left(V_{\text{ref}} - g[n] |x[n]|\right) = g[n] \left(1 - \mu |x[n]|\right) + \mu V_{\text{ref}}$$
+
+  <p>
+    This is a first-order discrete-time recurrence relation with an effective $z$-domain pole located at:
+  </p>
+
+  $$z_{\text{pole}} = 1 - \mu |x[n]|$$
+
+  <div class="callout warning">
+    <div class="callout-title">The Instability of Linear AGC</div>
+    <p>
+      Look closely at $z_{\text{pole}}$: <strong>the loop dynamics and stability depend directly on the input signal amplitude $|x[n]|$!</strong>
+    </p>
+    <ul>
+      <li><strong>Small Input Signal ($|x[n]| \to 0$):</strong> $z_{\text{pole}} \to 1$. The pole hugs the unit circle boundary. The loop bandwidth collapses toward zero, and the AGC becomes agonizingly sluggish, taking hundreds of thousands of samples to adjust to weak signals.</li>
+      <li><strong>Large Input Signal ($|x[n]| &gt; 2/\mu$):</strong> $z_{\text{pole}} &lt; -1$. The pole <strong>exits the unit circle</strong>! The feedback loop becomes violently unstable, producing explosive alternating sign oscillations, gain ringing, and numeric overflow.</li>
+    </ul>
+    <p>
+      In a linear AGC, a loop gain $\mu$ calibrated to track a $-60\text{ dBm}$ signal will instantly diverge when a $-10\text{ dBm}$ signal strikes the antenna.
+    </p>
+  </div>
+
+  <h3>The Logarithmic (dB-Domain) Solution</h3>
+
+  <p>
+    Now, transform the loop equations into the logarithmic domain:
+  </p>
+
+  $$x_{\text{dB}}[n] = 20 \log_{10}|x[n]|, \quad g_{\text{dB}}[n] = 20 \log_{10} g[n], \quad y_{\text{dB}}[n] = x_{\text{dB}}[n] + g_{\text{dB}}[n]$$
+
+  <p>
+    In decibels, multiplication becomes addition! The error signal relative to our setpoint $V_{\text{ref, dB}}$ is:
+  </p>
+
+  $$e_{\text{dB}}[n] = V_{\text{ref, dB}} - y_{\text{dB}}[n] = V_{\text{ref, dB}} - \left(x_{\text{dB}}[n] + g_{\text{dB}}[n]\right)$$
+
+  <p>
+    The first-order integrator loop filter updates gain according to:
+  </p>
+
+  $$g_{\text{dB}}[n+1] = g_{\text{dB}}[n] + \alpha \, e_{\text{dB}}[n] = g_{\text{dB}}[n] + \alpha \left(V_{\text{ref, dB}} - x_{\text{dB}}[n] - g_{\text{dB}}[n]\right)$$
+
+  $$g_{\text{dB}}[n+1] = (1 - \alpha) g_{\text{dB}}[n] + \alpha \left(V_{\text{ref, dB}} - x_{\text{dB}}[n]\right)$$
+
+  <p>
+    Examine the closed-loop pole of this system:
+  </p>
+
+  $$z_{\text{pole}} = 1 - \alpha$$
+
+  <p>
+    The loop pole is <strong>strictly constant</strong>. It depends purely on the designer's choice of loop coefficient $\alpha$, completely decoupled from whether the incoming RF signal is $-130\text{ dBm}$ or $+10\text{ dBm}$. The loop time constant $\tau$ is invariant across all input powers:
+  </p>
+
+  $$\tau = -\frac{T_s}{\ln(1 - \alpha)} \approx \frac{T_s}{\alpha} \quad (\text{for } \alpha \ll 1)$$
+
+  <p>
+    The logarithmic AGC guarantees identical tracking bandwidth, settling time, and stability across the entire $140\text{ dB}$ dynamic range of the receiver!
+  </p>
+
+  <h2>5. Dual-Time Constant (Attack vs. Decay) Dynamics &amp; Hang AGC</h2>
+
+  <p>
+    In digital communications and voice modes (such as Single Sideband SSB and Continuous Wave CW Morse code), natural signal envelopes fluctuate continuously. Human speech contains unvoiced pauses between words, while Morse code alternates between carrier key-down (Mark) and key-up (Space).
+  </p>
+
+  <p>
+    A symmetric AGC loop (where gain increases and decreases at identical rates) creates fatal operational artifacts:
+  </p>
+
+  <ul>
+    <li><strong>If symmetric time constant is slow ($\tau = 500\text{ ms}$):</strong> A sudden high-power burst or speech syllable hits the receiver. The AGC takes 500 ms to respond. During that time, the receiver output clips heavily, generating ear-splitting audio distortion and blowing past digital bit-depth limits.</li>
+    <li><strong>If symmetric time constant is fast ($\tau = 2\text{ ms}$):</strong> The AGC rapidly clamps the loud syllable. However, during the $50\text{ ms}$ pause between words, the fast loop immediately ramps gain back to maximum. The receiver amplifies background atmospheric hiss up to full volume during every speech pause. This hideous surging audio artifact is known as <strong>noise pumping</strong> (or "AGC breathing").</li>
+  </ul>
+
+  <h3>Dual Time Constants: Fast Attack, Slow Decay</h3>
+
+  <p>
+    The standard solution employs asymmetric, dual time constants:
+  </p>
+
+  <ul>
+    <li><strong>Attack Time Constant ($\tau_{\text{attack}} \approx 1 - 5\text{ ms}$):</strong> Applied when output exceeds setpoint ($e_{\text{dB}}[n] &lt; 0$). Gain drops almost instantaneously to protect the ADC and downstream stages from saturation distortion.</li>
+    <li><strong>Decay Time Constant ($\tau_{\text{decay}} \approx 500 - 2000\text{ ms}$):</strong> Applied when output is below setpoint ($e_{\text{dB}}[n] &gt; 0$). Gain recovers very slowly, holding the noise floor steady during momentary modulation dips.</li>
+  </ul>
+
+  <p>
+    The discrete smoothing coefficients for a sample rate $f_s = 1/T_s$ are:
+  </p>
+
+  $$\alpha_{\text{attack}} = 1 - \exp\left(-\frac{T_s}{\tau_{\text{attack}}}\right) \approx \frac{T_s}{\tau_{\text{attack}}}$$
+
+  $$\alpha_{\text{decay}} = 1 - \exp\left(-\frac{T_s}{\tau_{\text{decay}}}\right) \approx \frac{T_s}{\tau_{\text{decay}}}$$
+
+  <h3>Hang AGC Architecture</h3>
+
+  <p>
+    For high-performance amateur transceivers (such as the Elecraft K3/K4 or Icom IC-7610), even a slow exponential decay can introduce subtle noise pumping during speech pauses. The gold standard in communications receivers is <strong>Hang AGC</strong>.
+  </p>
+
+  <p>
+    Hang AGC introduces a finite-state machine with three distinct phases:
+  </p>
+
+  <ol>
+    <li><strong>Attack Phase:</strong> When incoming power increases ($P_{\text{dB}} &gt; V_{\text{ref}}$), gain drops rapidly using $\alpha_{\text{attack}}$. Simultaneously, an internal <strong>Hang Counter</strong> is reloaded with a hold duration (typically $200 - 600\text{ ms}$, or $N_{\text{hang}} = f_s \times t_{\text{hang}}$ samples).</li>
+    <li><strong>Hang Phase:</strong> When signal power drops (e.g. between words or during Morse code key-up), the gain does not decay immediately. Gain is <strong>completely frozen</strong> ($g_{\text{dB}}[n+1] = g_{\text{dB}}[n]$), and the hang counter decrements by one on each sample:
+      $$k_{\text{hang}} \leftarrow k_{\text{hang}} - 1$$
+      If another voice syllable or Morse dit arrives before the counter reaches zero, the counter is refreshed and gain remains rock-solid. The background noise floor remains dead silent!
+    </li>
+    <li><strong>Decay Phase:</strong> Only if the transmission ceases entirely and the hang counter expires ($k_{\text{hang}} = 0$) does the AGC smoothly ramp gain back to maximum sensitivity using the slow decay coefficient $\alpha_{\text{decay}}$.</li>
+  </ol>
+
+  <h2>6. High-Performance C/Rust Implementation</h2>
+
+  <p>
+    In high-throughput SDR pipelines processing millions of complex samples per second, calling transcendental <code>log10f()</code> and <code>powf()</code> per sample on a single CPU core stalls SIMD vector pipelines.
+  </p>
+
+  <p>
+    To maintain line rate, engineers use:
+  </p>
+
+  <ul>
+    <li><strong>Fast Logarithm Approximation:</strong> Exploiting the IEEE 754 floating-point exponent representation to compute $\log_2(x)$ in 1–2 integer arithmetic cycles, followed by multiplication by $3.0103\text{ dB}$ ($10 \log_{10}(2)$).</li>
+    <li><strong>Hysteresis Deadband ($[-\epsilon, +\epsilon]$):</strong> Inhibiting gain updates when error is within $\pm 0.5\text{ dB}$ of the setpoint, preventing limit cycles and cache-line write thrashing.</li>
+    <li><strong>Vectorized Block Power Detection:</strong> Processing samples in chunks (e.g. 64 or 128 samples), applying scalar gain uniformly across the SIMD vector, and updating loop state once per block.</li>
+  </ul>
+
+  <p>
+    Here is a production-grade, allocation-free Rust implementation of a log-domain Dual-Time Constant Hang AGC:
+  </p>
+
+  <pre><code>/// Production Log-Domain Hang AGC for Complex Baseband Streams
+pub struct LogHangAgc {
+    // Target setpoint in dBFS (e.g. -12.0 dBFS)
+    target_db: f32,
+    // Maximum allowable gain in dB
+    max_gain_db: f32,
+    // Minimum allowable gain in dB
+    min_gain_db: f32,
+    // Current loop gain state in dB
+    gain_db: f32,
+    // Linear gain multiplier cache
+    applied_gain: f32,
+    
+    // Smoothing coefficients
+    alpha_attack: f32,
+    alpha_decay: f32,
+    
+    // Hang timer configuration
+    hang_samples_total: usize,
+    hang_counter: usize,
+    
+    // Hysteresis deadband threshold (dB)
+    deadband_db: f32,
+}
+
+impl LogHangAgc {
+    pub fn new(
+        sample_rate: f32,
+        target_db: f32,
+        tau_attack_sec: f32,
+        tau_decay_sec: f32,
+        hang_time_sec: f32,
+    ) -> Self {
+        let alpha_attack = 1.0 - (-1.0 / (sample_rate * tau_attack_sec)).exp();
+        let alpha_decay  = 1.0 - (-1.0 / (sample_rate * tau_decay_sec)).exp();
+        let hang_samples_total = (sample_rate * hang_time_sec) as usize;
+        let initial_gain_db = 0.0;
+
+        Self {
+            target_db,
+            max_gain_db: 60.0,
+            min_gain_db: -20.0,
+            gain_db: initial_gain_db,
+            applied_gain: 10.0f32.powf(initial_gain_db / 20.0),
+            alpha_attack,
+            alpha_decay,
+            hang_samples_total,
+            hang_counter: 0,
+            deadband_db: 0.5,
+        }
+    }
+
+    /// Process a contiguous slice of interleaved [I, Q] samples in-place
+    #[inline]
+    pub fn process_interleaved_iq(&mut self, iq_buffer: &mut [f32]) {
+        let num_complex = iq_buffer.len() / 2;
+
+        for n in 0..num_complex {
+            let i = iq_buffer[2 * n];
+            let q = iq_buffer[2 * n + 1];
+
+            // Apply current cached gain
+            let out_i = i * self.applied_gain;
+            let out_q = q * self.applied_gain;
+
+            iq_buffer[2 * n]     = out_i;
+            iq_buffer[2 * n + 1] = out_q;
+
+            // Power detection: P = I^2 + Q^2
+            let power = out_i * out_i + out_q * out_q + 1e-18; // Prevent log(0)
+            let out_db = 10.0 * power.log10();
+
+            // Error relative to target setpoint
+            let error_db = self.target_db - out_db;
+
+            // Update loop state
+            if error_db < -self.deadband_db {
+                // Signal is too loud -> Fast Attack!
+                self.gain_db += self.alpha_attack * error_db;
+                // Reset hang counter on sudden signal peaks
+                self.hang_counter = self.hang_samples_total;
+            } else if error_db > self.deadband_db {
+                // Signal is quieter than setpoint
+                if self.hang_counter > 0 {
+                    // Hold gain fixed during hang interval
+                    self.hang_counter -= 1;
+                } else {
+                    // Hang expired -> Slow Decay!
+                    self.gain_db += self.alpha_decay * error_db;
+                }
+            }
+
+            // Clamp gain limits to prevent numerical runaway
+            self.gain_db = self.gain_db.clamp(self.min_gain_db, self.max_gain_db);
+
+            // Update linear gain scalar
+            self.applied_gain = 10.0f32.powf(self.gain_db / 20.0);
+        }
+    }
+}</code></pre>
+
+  <h2>Checking Your Understanding</h2>
+
+  <div class="quiz-container" id="quiz-27-1">
+    <div class="quiz-question">
+      1. Why does a linear feedback AGC loop exhibit signal-dependent instability, whereas a logarithmic (dB-domain) AGC loop maintains a strictly constant loop bandwidth?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Linear loops evaluate envelope magnitude via square root operations that introduce non-linear branch mispredictions in SIMD execution units.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Linear loop pole location $z_p = 1 - \mu |x[n]|$ shifts with input amplitude, whereas logarithmic transformation decouples signal amplitude from the loop pole.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Logarithmic AGC loops eliminate steady-state phase jitter by locking onto carrier quadrature zero-crossings rather than sample envelope magnitude.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Linear feedback loops fail to apply symmetric time constants, allowing floating-point mantissa underflow during weak-signal reception intervals.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> In a linear feedback AGC, the gain update equation is $g[n+1] = g[n](1 - \mu |x[n]|) + \mu V_{\text{ref}}$, placing the loop pole at $z_p = 1 - \mu |x[n]|$. When input signal amplitude $|x[n]|$ is large ($|x[n]| &gt; 2/\mu$), the pole leaves the unit circle and the loop oscillates unstably. In a log-domain AGC, multiplication becomes addition, resulting in a strictly constant pole $z_p = 1 - \alpha$ that is completely independent of signal amplitude.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-27-2">
+    <div class="quiz-question">
+      2. An RF engineer cascades a 20 dB gain LNA with a 2 dB noise figure ahead of a receiver with a 12 dB noise figure and an IIP3 of +5 dBm. What is the primary system-level trade-off resulting from this modification?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="true">
+        The cascaded noise figure improves from 12 dB down to ~2.4 dB, but system IIP3 drops from +5 dBm to -15 dBm, shrinking the receiver's SFDR.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The system noise figure degrades due to thermal noise amplification, while the 1 dB compression point increases proportionally with gain.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The receiver spurious-free dynamic range expands by 20 dB, but the ADC quantization step size must be halved to avoid bit overflow.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The second-order intercept point drops below the thermal noise floor, causing severe local oscillator phase modulation on adjacent bands.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> According to Friis' formula, the first-stage gain of $20\text{ dB}$ ($G_1 = 100$) suppresses the second stage's noise contribution, bringing total noise figure down from $12\text{ dB}$ to $\approx 2.4\text{ dB}$. However, cascaded IIP3 divides by stage gain ($1/\text{IIP3}_{\text{total}} \approx G_1 / \text{IIP3}_2$), degrading overall IIP3 from $+5\text{ dBm}$ down to $-15\text{ dBm}$. This significantly reduces the receiver's Spurious-Free Dynamic Range ($\text{SFDR}$) against strong out-of-channel contest signals.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-27-3">
+    <div class="quiz-question">
+      3. In an HF receiver monitoring single-sideband (SSB) voice or CW Morse transmissions, what operational defect occurs if the AGC decay time constant is set too fast (e.g., 20 ms instead of 1000 ms) without a hang timer?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Carrier phase synchronizers lose quadrature lock during symbol transitions, introducing catastrophic constellation quadrant rotation.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The loop rapidly drives gain to maximum during inter-syllable pauses, creating an intolerable rushing hiss known as noise pumping.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The loop filter enters limit-cycle oscillation at the Nyquist frequency, clipping the audio DAC stage through numerical underflow.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Adjacent channel signals are folded into the audio passband by high-frequency intermodulation products generated in the loop mixer.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> In speech or Morse code, natural pauses occur between syllables and keying elements. If decay is fast ($20\text{ ms}$), the AGC interprets the silence as a weak signal and quickly ramps gain up to maximum ($+60\text{ dB}$), amplifying the background thermal and atmospheric noise into an aggressive burst of hiss ("noise pumping" or "AGC breathing"). A slow decay or Hang AGC freezes gain across pauses, keeping the background quiet.
+    </div>
+  </div>
+
+  <h2>Summary &amp; Architecture Implications</h2>
+
+  <p>
+    Mastering dynamic range budgeting and AGC loops is the hallmark of serious SDR and RF systems engineering:
+  </p>
+
+  <ol>
+    <li><strong>Amateur Radio Ether Spans $> 100\text{ dB}$:</strong> Thermal noise floors ($\sim -130\text{ dBm}$) and local transmitters ($\sim +10\text{ dBm}$) cannot fit into a static gain window without either ADC clipping or quantization drowning.</li>
+    <li><strong>Friis vs. Cascaded IIP3:</strong> LNA gain suppresses downstream noise figure but multiplies downstream non-linear distortion into the receiver's passband, degrading IIP3 and SFDR. Front-end gain must be cautiously budgeted.</li>
+    <li><strong>Logarithmic Loops Guarantee Invariant Bandwidth:</strong> Formulating closed-loop AGC in decibels keeps the loop pole $z_p = 1 - \alpha$ constant, eliminating the amplitude-dependent instability that plagues linear loops.</li>
+    <li><strong>Dual Time Constants &amp; Hang Control:</strong> Fast attack ($1 - 5\text{ ms}$) protects against clipping transients, while slow decay ($500 - 2000\text{ ms}$) and Hang timers eliminate noise pumping during voice and CW pauses.</li>
+  </ol>
+
+  <div class="footer">
+    <span>Have questions on Friis cascaded noise, dB loop filters, or Hang AGC? Ask your tutor agent!</span>
+    <span><a href="0021-adc-dynamic-range-quantization-and-agc.html">&larr; Lesson 0021</a> | Lesson 0027</span>
+  </div>
+</body>
+</html>

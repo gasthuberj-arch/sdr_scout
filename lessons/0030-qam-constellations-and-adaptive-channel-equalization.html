@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 30: Quadrature Amplitude Modulation (QAM) &amp; Adaptive Channel Equalization (LMS / CMA)</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0030</span>
+    <span class="badge badge-arch">Modulation &amp; Equalization</span>
+    <span>Reading time: 18 minutes</span>
+  </div>
+
+  <h1>Quadrature Amplitude Modulation (QAM) &amp; Adaptive Channel Equalization: LMS, CMA, and Decision Feedback</h1>
+
+  <p>
+    In preceding lessons, we explored phase-shift modulations such as BPSK and QPSK, where information is mapped exclusively to the phase angle of a complex baseband carrier: $s(t) = A e^{j \theta(t)}$. Phase-only keying possesses a key engineering property: <strong>constant envelope magnitude</strong> $|s(t)| = A$. Constant-envelope signals can be amplified by highly non-linear, power-efficient Radio Frequency (RF) Power Amplifiers (PAs)—such as Class C, Class D, or Class E stages—without suffering spectral splatter or constellation distortion.
+  </p>
+
+  <p>
+    However, constant-envelope modulations are severely limited by the Shannon-Hartley channel capacity theorem:
+  </p>
+
+  $$C = B \log_2\left(1 + \frac{S}{N}\right) \quad [\text{bits/s}]$$
+
+  <p>
+    When available RF spectrum $B$ is strictly constrained—whether in 2.4 GHz / 5.8 GHz amateur microwave broadband networks (AREDN), satellite downlinks, digital video broadcasting (DVB-C/S2), or cellular physical layers—expanding throughput requires transmitting more bits per symbol clock period.
+  </p>
+
+  <p>
+    To break through the spectral efficiency limit of QPSK ($\eta = 2\text{ bits/s/Hz}$), digital communication systems leverage both the <strong>amplitude</strong> and the <strong>phase</strong> dimensions simultaneously: <strong>Quadrature Amplitude Modulation (QAM)</strong>. 
+  </p>
+
+  <p>
+    Yet this throughput expansion extracts a heavy physical toll:
+  </p>
+  <ul>
+    <li>The signal envelope is no longer constant, introducing high <strong>Peak-to-Average Power Ratio (PAPR)</strong> that mandates significant RF amplifier back-off into inefficient linear regimes (Class A/AB).</li>
+    <li>Constellation points are densely packed across a 2D Euclidean lattice, making the modulation catastrophically vulnerable to multipath propagation, dispersion, and <strong>Intersymbol Interference (ISI)</strong>.</li>
+  </ul>
+
+  <p>
+    In this lesson, we analyze the physical mathematics of higher-order QAM constellations, examine channel dispersion models, derive linear FIR equalizers (Zero-Forcing vs. MMSE), synthesize the <strong>Decision-Directed Least Mean Squares (DD-LMS)</strong> algorithm, dissect blind equalization via the <strong>Constant Modulus Algorithm (CMA / Godard)</strong>, and eliminate noise enhancement via <strong>Decision Feedback Equalization (DFE)</strong>.
+  </p>
+
+  <h2>1. Higher-Order Modulation Physics: Beyond BPSK and QPSK</h2>
+
+  <p>
+    In an $M$-ary digital modulation scheme, each transmitted symbol represents $m = \log_2(M)$ bits of binary information. Assuming ideal Nyquist pulse shaping with symbol rate $R_s = 1/T_s$ symbols per second, the theoretical spectral efficiency $\eta$ is:
+  </p>
+
+  $$\eta = \frac{R_b}{B_{\text{ideal}}} = \log_2(M) \quad [\text{bits/s/Hz}]$$
+
+  <p>
+    When pulse shaping uses a Root-Raised Cosine (RRC) filter with roll-off factor $\beta \in (0, 1]$, the occupied RF bandwidth expands to $B = R_s (1 + \beta)$, yielding the practical spectral efficiency:
+  </p>
+
+  $$\eta = \frac{\log_2(M)}{1 + \beta} \quad [\text{bits/s/Hz}]$$
+
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Modulation</th>
+        <th>Bits / Symbol ($m$)</th>
+        <th>Ideal Efficiency ($\beta = 0$)</th>
+        <th>Practical Efficiency ($\beta = 0.25$)</th>
+        <th>Required $E_b/N_0$ ($P_b = 10^{-5}$)</th>
+        <th>Relative SNR Penalty vs. QPSK</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>BPSK</strong></td>
+        <td>1</td>
+        <td>$1\text{ bit/s/Hz}$</td>
+        <td>$0.80\text{ bit/s/Hz}$</td>
+        <td>$9.6\text{ dB}$</td>
+        <td>$0.0\text{ dB}$</td>
+      </tr>
+      <tr>
+        <td><strong>QPSK</strong></td>
+        <td>2</td>
+        <td>$2\text{ bits/s/Hz}$</td>
+        <td>$1.60\text{ bits/s/Hz}$</td>
+        <td>$9.6\text{ dB}$</td>
+        <td>$0.0\text{ dB}$</td>
+      </tr>
+      <tr>
+        <td><strong>16-QAM</strong></td>
+        <td>4</td>
+        <td>$4\text{ bits/s/Hz}$</td>
+        <td>$3.20\text{ bits/s/Hz}$</td>
+        <td>$13.4\text{ dB}$</td>
+        <td><strong>$+3.8\text{ dB}$</strong></td>
+      </tr>
+      <tr>
+        <td><strong>64-QAM</strong></td>
+        <td>6</td>
+        <td>$6\text{ bits/s/Hz}$</td>
+        <td>$4.80\text{ bits/s/Hz}$</td>
+        <td>$17.8\text{ dB}$</td>
+        <td><strong>$+8.2\text{ dB}$</strong></td>
+      </tr>
+      <tr>
+        <td><strong>256-QAM</strong></td>
+        <td>8</td>
+        <td>$8\text{ bits/s/Hz}$</td>
+        <td>$6.40\text{ bits/s/Hz}$</td>
+        <td>$22.0\text{ dB}$</td>
+        <td><strong>$+12.4\text{ dB}$</strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout warning">
+    <div class="callout-title">The Fundamental Trade-Off: Throughput vs. SNR Penalty</div>
+    <p>
+      Notice the steep price of spectral efficiency. Moving from QPSK to 16-QAM doubles the data throughput within the identical RF bandwidth, but demands almost <strong>$4\text{ dB}$ higher energy per bit ($E_b/N_0$)</strong> to maintain the same bit error rate. Moving to 64-QAM triples throughput but imposes an <strong>$8.2\text{ dB}$ SNR penalty</strong> (requiring over $6.6\times$ transmitter power).
+    </p>
+  </div>
+
+  <h2>2. Constellation Geometry, Gray Coding, and PAPR</h2>
+
+  <h3>Square Lattice Geometry</h3>
+  <p>
+    Standard $M$-QAM constellations (where $M = 2^{2k}$, such as $M=16, 64, 256$) are arranged as a Cartesian product of two orthogonal pulse-amplitude modulations ($\sqrt{M}\text{-PAM}$) along the In-Phase ($I$) and Quadrature ($Q$) axes:
+  </p>
+
+  $$s[n] = I[n] + j Q[n], \quad I[n], Q[n] \in \{-(2L-1)d, \dots, -3d, -d, +d, +3d, \dots, +(2L-1)d\}$$
+
+  <p>
+    where $L = \sqrt{M}/2$ and $2d$ is the minimum Euclidean distance between adjacent constellation points: $d_{\min} = 2d$.
+  </p>
+
+  <p>
+    For <strong>16-QAM</strong>, coordinates take values in $\{\pm 1, \pm 3\} d$. The 16 points partition into three concentric rings based on energy $|s|^2 = I^2 + Q^2$:
+  </p>
+
+  <ol>
+    <li><strong>Inner 4 points:</strong> $(\pm 1, \pm 1)d \implies |s|^2 = 2d^2$ (Probability $4/16 = 0.25$)</li>
+    <li><strong>Middle 8 points:</strong> $(\pm 1, \pm 3)d$ and $(\pm 3, \pm 1)d \implies |s|^2 = 10d^2$ (Probability $8/16 = 0.50$)</li>
+    <li><strong>Outer 4 points:</strong> $(\pm 3, \pm 3)d \implies |s|^2 = 18d^2$ (Probability $4/16 = 0.25$)</li>
+  </ol>
+
+  <p>
+    The average symbol energy $E_s$ is calculated by taking the expectation across all 16 equiprobable states:
+  </p>
+
+  $$E_s = \mathbb{E}[|s|^2] = \frac{1}{16}\left[ 4(2d^2) + 8(10d^2) + 4(18d^2) \right] = \frac{8 + 80 + 72}{16} d^2 = 10 d^2$$
+
+  <p>
+    The peak symbol energy is $E_{\text{peak}} = (\pm 3d)^2 + (\pm 3d)^2 = 18 d^2$.
+  </p>
+
+  <pre><code>        16-QAM Square Constellation Lattice with Gray Coding
+                    Q (Quadrature)
+                          ^
+              1011        | 1001        0001        0011
+               *          |  *           *          *      (+3d)
+                          |
+              1010        | 1000        0000        0010
+               *          |  *           *          *      (+1d)
+       -------------------+---------------------------------> I (In-Phase)
+              1110        | 1100        0100        0110
+               *          |  *           *          *      (-1d)
+                          |
+              1111        | 1101        0101        0111
+               *          |  *           *          *      (-3d)
+                          |
+             (-3d)      (-1d)          (+1d)       (+3d)</code></pre>
+
+  <h3>Gray Coding</h3>
+  <p>
+    In high-order modulations, an additive noise perturbation $\mathbf{w}[n]$ that pushes a received symbol across a decision threshold will almost always displace it to its <strong>nearest neighbor</strong> (at distance $d_{\min} = 2d$). Displacements to diagonal or distant points require exponentially higher noise power ($Q(\sqrt{\text{SNR}})$ drops off steeply).
+  </p>
+
+  <p>
+    By enforcing <strong>Gray coding</strong>—wherein adjacent constellation points differ by <strong>exactly one bit</strong>—any single nearest-neighbor symbol decision error produces exactly <strong>one bit error</strong> out of the $\log_2(M)$ bits in the symbol.
+  </p>
+
+  <p>
+    Because $I$ and $Q$ components are orthogonal, a 2D Gray mapping is formed by independently Gray-coding the $I$ axis ($2$ bits) and the $Q$ axis ($2$ bits):
+  </p>
+
+  $$\mathbf{b} = [b_{I,1}, b_{I,0}, b_{Q,1}, b_{Q,0}]$$
+
+  <p>
+    The resulting Bit Error Rate (BER) relates directly to Symbol Error Rate (SER) at moderate-to-high SNR:
+  </p>
+
+  $$P_b \approx \frac{P_s}{\log_2(M)}$$
+
+  <p>
+    Using the Gaussian $Q$-function, the union bound for square $M$-QAM bit error rate is:
+  </p>
+
+  $$P_b \approx \frac{4}{\log_2(M)} \left(1 - \frac{1}{\sqrt{M}}\right) Q\left(\sqrt{\frac{3 \log_2(M)}{M-1} \cdot \frac{E_b}{N_0}}\right)$$
+
+  <h3>Peak-to-Average Power Ratio (PAPR) and Amplifier Back-off</h3>
+  <p>
+    Unlike constant-modulus BPSK or QPSK (where $|s[n]|^2 \equiv E_s$), QAM exhibits a non-zero dynamic amplitude range. The <strong>constellation PAPR</strong> is:
+  </p>
+
+  $$\text{PAPR}_{\text{const}} = \frac{E_{\text{peak}}}{E_s} = \frac{18 d^2}{10 d^2} = 1.8 \implies 10 \log_{10}(1.8) \approx 2.55\text{ dB}$$
+
+  <p>
+    For 64-QAM ($E_s = 42d^2$, $E_{\text{peak}} = 98d^2$):
+  </p>
+
+  $$\text{PAPR}_{\text{const, 64}} = \frac{98 d^2}{42 d^2} = 2.333 \implies 10 \log_{10}(2.333) \approx 3.68\text{ dB}$$
+
+  <div class="callout upside">
+    <div class="callout-title">Continuous-Time PAPR with Pulse Shaping</div>
+    <p>
+      The numbers above represent discrete symbol states. When the symbol impulses pass through an analog Root-Raised Cosine (RRC) interpolation filter, constructive interference among successive sinc tails increases the peak envelope excursion significantly. The continuous-time crest factor for 16-QAM and 64-QAM frequently reaches <strong>$6.5\text{ dB}$ to $9.0\text{ dB}$</strong>!
+    </p>
+  </div>
+
+  <p>
+    This creates an immediate hardware constraint for SDR engineers:
+  </p>
+  <ul>
+    <li><strong>Nonlinear Distortion:</strong> If the signal peaks exceed the Power Amplifier's 1 dB compression point ($P_{1\text{dB}}$), the outer constellation points compress inward (AM-to-AM conversion) and rotate (AM-to-PM conversion).</li>
+    <li><strong>Spectral Regrowth (Splatter):</strong> Gain compression generates odd-order intermodulation products ($2f_1 - f_2$, $2f_2 - f_1$), spilling RF power into adjacent channels and violating FCC / amateur band emissions masks.</li>
+    <li><strong>Input / Output Back-Off (IBO / OBO):</strong> The transmitter must operate backed off by at least the PAPR ($6$ to $10\text{ dB}$) below saturation. An amplifier capable of $100\text{ W}$ peak saturated power can only transmit $10\text{ W}$ to $15\text{ W}$ of average QAM power.</li>
+  </ul>
+
+  <h2>3. Channel Dispersion &amp; Intersymbol Interference (ISI)</h2>
+
+  <p>
+    In an ideal AWGN channel, the matched-filter output at the symbol sampling instant is $y[n] = s[n] + w[n]$. Because the Euclidean distance between points is large relative to noise, threshold slicing partitions the $I/Q$ plane into clean decision boxes.
+  </p>
+
+  <p>
+    In reality, terrestrial and ionospheric RF channels are <strong>multipath dispersive</strong>. Transmitted radio waves reflect off terrain, buildings, vehicles, and ionospheric layers, arriving at the receive antenna via multiple propagation paths with different propagation delays $\tau_k$ and complex attenuations $\alpha_k$:
+  </p>
+
+  $$r(t) = \sum_{k=0}^{P-1} \alpha_k s(t - \tau_k) + w(t)$$
+
+  <p>
+    After downconversion, matched filtering, and symbol-rate sampling, the equivalent discrete-time channel is modeled as a tapped-delay line finite impulse response (FIR) filter:
+  </p>
+
+  $$y[n] = (h * x)[n] + w[n] = \sum_{k=0}^{L-1} h[k] x[n-k] + w[n]$$
+
+  <p>
+    We isolate the current symbol of interest ($k = 0$, or the cursor tap $k = \Delta$):
+  </p>
+
+  $$y[n] = \underbrace{h[0] x[n]}_{\text{Desired Symbol}} + \underbrace{\sum_{k=1}^{L-1} h[k] x[n-k]}_{\text{Intersymbol Interference (ISI)}} + \underbrace{w[n]}_{\text{AWGN}}$$
+
+  <p>
+    The second summation is <strong>Intersymbol Interference (ISI)</strong>: energy from preceding and subsequent symbols spilling into the current decision window.
+  </p>
+
+  <div class="callout warning">
+    <div class="callout-title">Why Simple Slicing Fails Completely</div>
+    <p>
+      In frequency domain, the channel transfer function is $H(e^{j\omega}) = \sum_{k=0}^{L-1} h[k] e^{-j\omega k}$. Multipath interference causes <strong>frequency-selective fading</strong>, creating deep spectral notches (nulls) within the signal bandwidth.
+    </p>
+    <p>
+      In 16-QAM or 64-QAM, decision boundaries are narrow ($d = \sqrt{E_s/10}$). If multipath reflections introduce even a modest reflection (e.g., $h[1] = 0.4 h[0]$), the ISI term $\sum h[k] x[n-k]$ easily exceeds $d$, smearing the constellation points across neighboring decision boundaries. The eye diagram closes completely. <strong>Increasing transmitter power does not help</strong>: because ISI scales proportionally with signal power, the Signal-to-Distortion Ratio remains completely frozen. The receiver suffers an irreducible Bit Error Rate floor near $50\%$.
+    </p>
+  </div>
+
+  <h2>4. Linear Equalizers: Tapped-Delay Lines and the Noise Trap</h2>
+
+  <p>
+    To undo channel dispersion, the receiver passes the digitized baseband stream through an <strong>equalizing filter</strong> $W(z)$. The equalizer is structured as an $N$-tap complex FIR tapped-delay line:
+  </p>
+
+  <pre><code>             Linear Tapped-Delay Line FIR Equalizer Architecture
+  x[n] ----+----[ z^-1 ]----+----[ z^-1 ]----+ ... ----[ z^-1 ]----+
+           |                |                |                     |
+           v                v                v                     v
+         [ w0* ]          [ w1* ]          [ w2* ]              [ w_{N-1}* ]
+           |                |                |                     |
+           +------->( + )<--+------->( + )<--+ ... ------->( + )<--+
+                      |
+                      v
+                    y[n] (Equalized Output)
+                      |
+                      v
+                   [ Slicer ] ----> d_hat[n] (Decided Symbol)</code></pre>
+
+  <p>
+    The equalizer output $y[n]$ is the inner product of the weight vector $\mathbf{w}$ and the received sample vector $\mathbf{x}[n]$:
+  </p>
+
+  $$\mathbf{x}[n] = \begin{bmatrix} x[n] \\ x[n-1] \\ \vdots \\ x[n-N+1] \end{bmatrix}, \quad \mathbf{w} = \begin{bmatrix} w_0 \\ w_1 \\ \vdots \\ w_{N-1} \end{bmatrix}$$
+
+  $$y[n] = \mathbf{w}^H \mathbf{x}[n] = \sum_{k=0}^{N-1} w_k^* x[n-k]$$
+
+  <h3>Zero-Forcing (ZF) vs. Minimum Mean Square Error (MMSE)</h3>
+  <p>
+    Historically, two criteria govern the calculation of filter taps $\mathbf{w}$:
+  </p>
+
+  <ol>
+    <li>
+      <strong>Zero-Forcing (ZF):</strong> Forces all ISI to zero by directly inverting the channel response:
+      $$W_{\text{ZF}}(z) \cdot H(z) = z^{-\Delta} \implies W_{\text{ZF}}(e^{j\omega}) = \frac{e^{-j\omega \Delta}}{H(e^{j\omega})}$$
+      <p>
+        <strong>The Noise Enhancement Catastrophe:</strong> If the channel exhibits a deep spectral notch ($H(e^{j\omega}) \to 0$ at some frequency $\omega_0$), the Zero-Forcing equalizer must apply massive gain ($W_{\text{ZF}} \to \infty$) at that frequency. While this perfectly cancels ISI, it amplifies the additive thermal noise at $\omega_0$ by orders of magnitude:
+      </p>
+      $$\sigma_{\text{noise, out}}^2 = \frac{\sigma_w^2}{2\pi} \int_{-\pi}^{\pi} \frac{1}{|H(e^{j\omega})|^2} d\omega \longrightarrow \infty$$
+    </li>
+    <li>
+      <strong>Minimum Mean Square Error (MMSE):</strong> Minimizes total distortion (the sum of residual ISI plus output noise power):
+      $$J_{\text{MMSE}}(\mathbf{w}) = \mathbb{E}\left[ |d[n-\Delta] - y[n]|^2 \right]$$
+      The optimal Wiener-Hopf solution is:
+      $$\mathbf{w}_{\text{MMSE}} = \left( \mathbf{R}_{xx} + \sigma_w^2 \mathbf{I} \right)^{-1} \mathbf{p}_{xd}$$
+      where $\mathbf{R}_{xx} = \mathbb{E}[\mathbf{x}[n]\mathbf{x}^H[n]]$ is the channel covariance matrix and $\mathbf{p}_{xd} = \mathbb{E}[\mathbf{x}[n] d^*[n-\Delta]]$ is the cross-correlation vector. At high SNR ($\sigma_w^2 \to 0$), MMSE approaches ZF; at low SNR, it backs off to prevent noise amplification.
+    </li>
+  </ol>
+
+  <h2>5. Decision-Directed Least Mean Squares (DD-LMS)</h2>
+
+  <p>
+    In a physical SDR receiver, the channel impulse response $h[k]$ is unknown a priori and changes dynamically due to antenna motion, atmospheric shifts, and multipath flutter. The equalizer must adapt its tap weights on the fly.
+  </p>
+
+  <p>
+    When a known pilot preamble is transmitted, the receiver knows the true symbol $d[n]$. However, during payload data transmission, the receiver must operate in <strong>Decision-Directed</strong> mode: it substitutes the hard-sliced decision $\hat{d}[n]$ as the reference truth.
+  </p>
+
+  <p>
+    The instantaneous error signal is:
+  </p>
+
+  $$e[n] = \hat{d}[n] - y[n]$$
+
+  <p>
+    We define the cost function as the instantaneous squared error:
+  </p>
+
+  $$J(\mathbf{w}) = |e[n]|^2 = e[n] e^*[n] = (\hat{d}[n] - \mathbf{w}^H \mathbf{x}[n])(\hat{d}[n] - \mathbf{w}^H \mathbf{x}[n])^*$$
+
+  <p>
+    To update $\mathbf{w}$ via stochastic gradient descent:
+  </p>
+
+  $$\nabla_{\mathbf{w}^*} J = -e[n] \mathbf{x}[n]$$
+
+  <p>
+    Yielding the canonical <strong>Complex LMS Weight Update Rule</strong>:
+  </p>
+
+  $$\mathbf{w}[n+1] = \mathbf{w}[n] - \frac{1}{2} \mu \left( -2 e[n] \mathbf{x}^*[n] \right) = \mathbf{w}[n] + \mu e^*[n] \mathbf{x}[n]$$
+
+  <div class="callout warning">
+    <div class="callout-title">The DD-LMS Catch-22: Decision Runaway</div>
+    <p>
+      DD-LMS relies on the critical assumption that the slicer decisions are mostly correct ($\hat{d}[n] = d[n]$). If the channel introduces severe multipath where the eye diagram is closed at power-up, or if there is an uncorrected Carrier Frequency Offset (CFO) spinning the constellation, the slicer error rate exceeds $\sim 15\%$.
+    </p>
+    <p>
+      Under these conditions, the equalizer updates in completely random directions. The feedback loop enters <strong>decision runaway</strong>, destabilizing the filter taps into numerical saturation or divergence. DD-LMS <em>cannot</em> cold-start over an unknown dispersive channel.
+    </p>
+  </div>
+
+  <h2>6. Blind Equalization via Constant Modulus Algorithm (CMA / Godard)</h2>
+
+  <p>
+    How do high-performance SDR modems equalize dispersive channels without a training sequence and before carrier phase synchronization is achieved?
+  </p>
+
+  <p>
+    In 1980, Dominique Godard introduced a profound solution: <strong>blind equalization</strong> based on the statistics of the signal envelope. Treichler and Agee independently derived the same concept as the <strong>Constant Modulus Algorithm (CMA 2-2)</strong>.
+  </p>
+
+  <h3>The CMA Cost Function</h3>
+  <p>
+    CMA penalizes deviations of the equalizer output magnitude squared $|y[n]|^2$ from a fixed target dispersion radius $R_2$:
+  </p>
+
+  $$J_{\text{CMA}}(\mathbf{w}) = \frac{1}{4} \mathbb{E}\left[ \left( |y[n]|^2 - R_2 \right)^2 \right]$$
+
+  <p>
+    The Godard radius $R_2$ is a constellation-specific scalar defined by the fourth and second statistical moments of the transmitted constellation symbols $a[n]$:
+  </p>
+
+  $$R_2 = \frac{\mathbb{E}[|a[n]|^4]}{\mathbb{E}[|a[n]|^2]}$$
+
+  <h3>Computing $R_2$ for 16-QAM</h3>
+  <p>
+    Earlier, we established that a 16-QAM constellation with coordinate spacing $d$ has $\mathbb{E}[|a[n]|^2] = 10 d^2$. Let us compute $\mathbb{E}[|a[n]|^4]$ across its 16 points:
+  </p>
+  <ul>
+    <li>Inner 4 points: $|a|^2 = 2d^2 \implies |a|^4 = 4 d^4$ (4 points)</li>
+    <li>Middle 8 points: $|a|^2 = 10d^2 \implies |a|^4 = 100 d^4$ (8 points)</li>
+    <li>Outer 4 points: $|a|^2 = 18d^2 \implies |a|^4 = 324 d^4$ (4 points)</li>
+  </ul>
+
+  $$\mathbb{E}[|a[n]|^4] = \frac{4(4) + 8(100) + 4(324)}{16} d^4 = \frac{16 + 800 + 1296}{16} d^4 = \frac{2112}{16} d^4 = 132 d^4$$
+
+  <p>
+    Plugging both moments into the Godard radius formula:
+  </p>
+
+  $$R_2 = \frac{132 d^4}{10 d^2} = 13.2 d^2 = 1.32 E_s$$
+
+  <p>
+    If the received signal is normalized such that average power $E_s = 1.0$, then <strong>$R_2 = 1.32$</strong>. (For constant-modulus signals like QPSK, $R_2 = 1.0$).
+  </p>
+
+  <h3>CMA Gradient Derivation and Weight Update</h3>
+  <p>
+    To find the gradient with respect to $\mathbf{w}^*$, let $y[n] = \mathbf{w}^H \mathbf{x}[n]$:
+  </p>
+
+  $$\nabla_{\mathbf{w}^*} J_{\text{CMA}} = \frac{1}{2} \left( |y[n]|^2 - R_2 \right) \cdot \frac{\partial |y[n]|^2}{\partial \mathbf{w}^*}$$
+
+  <p>
+    Since $|y[n]|^2 = y[n] y^*[n]$ and $y[n] = \mathbf{w}^H \mathbf{x}[n] \implies y^*[n] = \mathbf{x}^H[n] \mathbf{w}$:
+  </p>
+
+  $$\frac{\partial |y[n]|^2}{\partial \mathbf{w}^*} = y[n] \frac{\partial y^*[n]}{\partial \mathbf{w}^*} = y[n] \mathbf{x}[n]$$
+
+  <p>
+    Therefore:
+  </p>
+
+  $$\nabla_{\mathbf{w}^*} J_{\text{CMA}} = \left( |y[n]|^2 - R_2 \right) y[n] \mathbf{x}[n] = -e_{\text{CMA}}[n] \mathbf{x}[n]$$
+
+  <p>
+    where we define the <strong>CMA Error Signal</strong> as:
+  </p>
+
+  $$e_{\text{CMA}}[n] = y[n] \left( R_2 - |y[n]|^2 \right)$$
+
+  <p>
+    The stochastic gradient descent update rule is:
+  </p>
+
+  $$\mathbf{w}[n+1] = \mathbf{w}[n] + \mu_{\text{CMA}} \, e_{\text{CMA}}[n] \, \mathbf{x}^*[n]$$
+
+  <div class="callout upside">
+    <div class="callout-title">The Mathematical Magic of CMA: Carrier Phase Invariance</div>
+    <p>
+      Look closely at the CMA cost function: $J_{\text{CMA}} = \frac{1}{4} \mathbb{E}\left[(|y[n]|^2 - R_2)^2\right]$. The cost depends <strong>strictly on magnitude $|y[n]|$</strong>; the carrier phase angle $\arg(y[n])$ does not appear anywhere!
+    </p>
+    <p>
+      If the incoming signal suffers from a massive Carrier Frequency Offset (CFO) and the constellation is spinning wildly at $50\text{ kHz}$, <strong>$|y[n]|$ is completely invariant to that rotation</strong> ($|y e^{j \Delta \omega n}| = |y|$).
+    </p>
+    <p>
+      CMA blind equalization decouples channel equalization from carrier synchronization. It suppresses multipath ISI and pulls the blurry, smeared cloud into clean concentric rings <em>without needing carrier lock or a training sequence</em>. Once the eye diagram is opened, a Costas loop locks carrier phase, and the receiver seamlessly hands off to DD-LMS for final tracking!
+    </p>
+  </div>
+
+  <h2>7. Decision Feedback Equalization (DFE): Eliminating Noise Enhancement</h2>
+
+  <p>
+    While linear equalizers (ZF, MMSE, CMA) can mitigate mild dispersion, they struggle when a multipath reflection creates a <strong>spectral null ($\ge 20\text{ dB}$ attenuation)</strong> within the band. Inverting that null linearly injects unacceptable noise.
+  </p>
+
+  <p>
+    The <strong>Decision Feedback Equalizer (DFE)</strong> overcomes this limitation using a nonlinear feedback loop:
+  </p>
+
+  <pre><code>                    Decision Feedback Equalizer (DFE) Architecture
+  x[n] --->[ Feedforward Filter (FFF) ]---+
+               (Length N_ff taps)          |
+                                           v
+                                         ( + ) <--- [ - ] <---[ Feedback Filter (FBF) ] <--+
+                                           |                      (Length N_fb taps)       |
+                                           v                                               |
+                                         y[n]                                              |
+                                           |                                               |
+                                           +--------->[ Slicer ]---------------------------+
+                                                           |
+                                                           v
+                                                       d_hat[n] (Decided Symbols)</code></pre>
+
+  <h3>DFE Mathematical Formulation</h3>
+  <p>
+    The equalized symbol $y[n]$ is formed by combining the output of a <strong>Feedforward Filter (FFF)</strong> operating on raw received samples $x[n]$ with the output of a <strong>Feedback Filter (FBF)</strong> operating on <em>previously decided noiseless symbols</em> $\hat{d}[n-1], \dots, \hat{d}[n-N_{fb}]$:
+  </p>
+
+  $$y[n] = \sum_{k=0}^{N_{ff}-1} w_f^*[k] x[n-k] - \sum_{m=1}^{N_{fb}} w_b^*[m] \hat{d}[n-m]$$
+
+  <p>
+    The slicer then makes a decision on $y[n]$:
+  </p>
+
+  $$\hat{d}[n] = \text{slice}(y[n])$$
+
+  <p>
+    The error signal is $e[n] = \hat{d}[n] - y[n]$, and both filter tap vectors are updated concurrently:
+  </p>
+
+  $$\mathbf{w}_f[n+1] = \mathbf{w}_f[n] + \mu_f e^*[n] \mathbf{x}[n]$$
+  $$\mathbf{w}_b[n+1] = \mathbf{w}_b[n] - \mu_b e^*[n] \hat{\mathbf{d}}[n]$$
+
+  <h3>Why DFE Defeats Noise Enhancement</h3>
+  <ol>
+    <li>The <strong>Feedforward Filter</strong> cancels precursor ISI (multipath arriving before the main correlation peak) and shapes the channel to be minimum-phase.</li>
+    <li>The <strong>Feedback Filter</strong> cancels post-cursor ISI (echoes arriving after the main peak).</li>
+    <li>Crucially, the input to the feedback filter is <strong>$\hat{d}[n-m]$</strong>: quantized, discrete constellation points that contain <strong>zero channel thermal noise</strong>.</li>
+    <li>Because the feedback filter subtracts post-cursor echoes without processing raw noise samples, <strong>it cancels deep channel nulls with zero noise enhancement</strong>.</li>
+  </ol>
+
+  <div class="callout warning">
+    <div class="callout-title">The DFE Vulnerability: Error Propagation</div>
+    <p>
+      The feedback loop introduces a potential vulnerability: <strong>error propagation</strong>. If an exceptionally large noise spike causes the slicer to make an erroneous decision ($\hat{d}[n] \neq d[n]$), that corrupt symbol enters the feedback tapped-delay line. Over the next $N_{fb}$ symbol periods, the feedback filter subtracts the <em>wrong</em> post-cursor values, biasing subsequent slicing decisions and frequently triggering a short burst of consecutive bit errors. Modern protocols mitigate this using outer Forward Error Correction (FEC) with interleaving (e.g., Reed-Solomon or LDPC).
+    </p>
+  </div>
+
+  <h2>8. Production-Grade C Implementation: Dual-Mode CMA / DD-LMS Equalizer</h2>
+
+  <p>
+    In high-throughput SDR pipelines (such as our Elixir/C NIF architecture), the adaptive equalizer must process complex baseband samples at line rate. To achieve maximum SIMD cache locality and avoid dynamic allocations in the inner loop, we implement an FIR tapped-delay line using a fixed circular buffer.
+  </p>
+
+  <pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;math.h&gt;
+#include &lt;complex.h&gt;
+#include &lt;stdbool.h&gt;
+
+#define EQUALIZER_TAPS 15
+#define GODARD_R2_16QAM 1.32f  /* E[|a|^4] / E[|a|^2] for normalized 16-QAM */
+
+typedef enum {
+    EQ_MODE_CMA,   /* Blind acquisition: phase-invariant ISI removal */
+    EQ_MODE_DDLMS  /* Tracking mode: fine decision-directed MSE minimization */
+} eq_mode_t;
+
+typedef struct {
+    float complex w[EQUALIZER_TAPS];     /* Filter weights */
+    float complex delay[EQUALIZER_TAPS]; /* Circular delay line buffer */
+    size_t head;                         /* Current circular buffer pointer */
+    float mu_cma;                        /* CMA adaptation step size */
+    float mu_lms;                        /* LMS adaptation step size */
+    eq_mode_t mode;                      /* Current operating mode */
+} adaptive_eq_t;
+
+/* Initialize equalizer: center tap = 1.0, all other taps = 0.0 */
+void adaptive_eq_init(adaptive_eq_t *eq, float mu_cma, float mu_lms) {
+    for (size_t i = 0; i &lt; EQUALIZER_TAPS; i++) {
+        eq-&gt;w[i] = 0.0f + 0.0f * I;
+        eq-&gt;delay[i] = 0.0f + 0.0f * I;
+    }
+    /* Initialize center tap to 1.0 for identity pass-through */
+    eq-&gt;w[EQUALIZER_TAPS / 2] = 1.0f + 0.0f * I;
+    eq-&gt;head = 0;
+    eq-&gt;mu_cma = mu_cma;
+    eq-&gt;mu_lms = mu_lms;
+    eq-&gt;mode = EQ_MODE_CMA;
+}
+
+/* Branchless nearest-neighbor slicer for normalized 16-QAM */
+/* Symbols map to: {-3, -1, +1, +3} * d, where d = 1.0 / sqrt(10) ~= 0.3162277f */
+static inline float slice_1d(float val, float d) {
+    if (val &gt; 2.0f * d)  return 3.0f * d;
+    if (val &gt; 0.0f)       return 1.0f * d;
+    if (val &gt; -2.0f * d) return -1.0f * d;
+    return -3.0f * d;
+}
+
+static inline float complex slice_16qam(float complex y) {
+    const float d = 0.316227766f; /* Normalized so E[|s|^2] = 1.0 */
+    float re = slice_1d(crealf(y), d);
+    float im = slice_1d(cimagf(y), d);
+    return re + im * I;
+}
+
+/* Process a single complex baseband sample through the adaptive equalizer */
+float complex adaptive_eq_process(adaptive_eq_t *eq, float complex x) {
+    /* 1. Insert sample into circular delay line */
+    eq-&gt;delay[eq-&gt;head] = x;
+
+    /* 2. Compute FIR filter inner product: y = w^H * x_vec */
+    float complex y = 0.0f + 0.0f * I;
+    for (size_t k = 0; k &lt; EQUALIZER_TAPS; k++) {
+        /* Read backwards through circular delay line */
+        size_t idx = (eq-&gt;head + EQUALIZER_TAPS - k) % EQUALIZER_TAPS;
+        y += conjf(eq-&gt;w[k]) * eq-&gt;delay[idx];
+    }
+
+    /* 3. Weight Adaptation Step */
+    if (eq-&gt;mode == EQ_MODE_CMA) {
+        /* CMA Blind Error: e = y * (R2 - |y|^2) */
+        float mag_sq = crealf(y) * crealf(y) + cimagf(y) * cimagf(y);
+        float complex e_cma = y * (GODARD_R2_16QAM - mag_sq);
+
+        /* Update taps: w[k] = w[k] + mu * e_cma * conj(x[n-k]) */
+        for (size_t k = 0; k &lt; EQUALIZER_TAPS; k++) {
+            size_t idx = (eq-&gt;head + EQUALIZER_TAPS - k) % EQUALIZER_TAPS;
+            eq-&gt;w[k] += eq-&gt;mu_cma * e_cma * conjf(eq-&gt;delay[idx]);
+        }
+    } else {
+        /* DD-LMS Error: e = d_hat - y */
+        float complex d_hat = slice_16qam(y);
+        float complex e_lms = d_hat - y;
+
+        /* Update taps: w[k] = w[k] + mu * conj(e_lms) * x[n-k] */
+        for (size_t k = 0; k &lt; EQUALIZER_TAPS; k++) {
+            size_t idx = (eq-&gt;head + EQUALIZER_TAPS - k) % EQUALIZER_TAPS;
+            eq-&gt;w[k] += eq-&gt;mu_lms * conjf(e_lms) * eq-&gt;delay[idx];
+        }
+    }
+
+    /* Advance circular buffer pointer */
+    eq-&gt;head = (eq-&gt;head + 1) % EQUALIZER_TAPS;
+
+    return y;
+}</code></pre>
+
+  <h2>Interactive Knowledge Check</h2>
+
+  <div class="quiz-container" id="quiz-30-1">
+    <div class="quiz-question">
+      1. Why does moving from QPSK to 64-QAM mandate significant RF Power Amplifier (PA) power back-off?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        64-QAM requires doubling the analog intermediate frequency bandwidth, increasing the noise figure of the mixer.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        64-QAM has high Peak-to-Average Power Ratio; operating near amplifier saturation causes AM-to-AM compression and spectral splatter.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Higher-order QAM modulations emit DC magnetic flux that drives the ferrite transformer core into magnetic hysteresis.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The Costas loop in the receiver cannot resolve 90-degree phase ambiguities unless the PA operates in Class C saturation.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> QPSK is a constant-envelope modulation that can tolerate non-linear power amplifier compression. In contrast, 64-QAM has non-constant amplitude ($E_{\text{peak}}/E_s \approx 2.33$, expanding to $7\text{--}9\text{ dB}$ with RRC pulse shaping). Driving an amplifier near its 1 dB compression point compresses outer constellation points inward and introduces severe intermodulation distortion (spectral regrowth into adjacent channels).
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-30-2">
+    <div class="quiz-question">
+      2. When an RF channel contains a deep multipath spectral notch ($\ge 25\text{ dB}$ attenuation), why does a Decision Feedback Equalizer (DFE) dramatically outperform a linear Zero-Forcing (ZF) equalizer?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The DFE uses Hilbert transform filters that reflect negative frequencies into positive space to bypass channel nulls.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The linear equalizer operates in the time domain, whereas the DFE completely bypasses Nyquist sampling constraints.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The ZF equalizer inverts the channel notch and amplifies noise toward infinity; the DFE subtracts post-cursor ISI using noiseless sliced decisions.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The DFE continuously recalibrates the local oscillator phase using atomic pulse-per-second timing references.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> A linear Zero-Forcing equalizer synthesizes $W(e^{j\omega}) = 1/H(e^{j\omega})$. When $H(e^{j\omega}) \to 0$, $W$ applies massive linear gain, catastrophically enhancing additive channel noise. In contrast, the DFE's feedback filter processes discrete, quantized symbol decisions $\hat{d}[n]$ which contain zero thermal noise, canceling post-cursor multipath echoes without noise enhancement.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-30-3">
+    <div class="quiz-question">
+      3. Why is the Constant Modulus Algorithm (CMA / Godard) capable of equalizing a severe multipath channel before carrier frequency synchronization is established?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="true">
+        The CMA cost function depends strictly on output envelope magnitude $|y[n]|^2$, making tap adaptation completely invariant to carrier phase rotation.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        CMA automatically transmits high-power pilot tones in the guard band that override uncorrected carrier frequency offsets.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        CMA operates exclusively on real-valued signals, eliminating the imaginary quadrature dimension from the gradient update.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The algorithm forces the local oscillator to lock phase by applying inverse voltage feedback to the receiver frontend varicap diode.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> Decision-Directed LMS requires valid slicer decisions, which fail completely when a Carrier Frequency Offset (CFO) causes the constellation to spin. In contrast, the CMA cost function $J = \frac{1}{4}\mathbb{E}[(|y[n]|^2 - R_2)^2]$ is completely independent of carrier phase angle $\arg(y[n])$. CMA opens the eye diagram and eliminates multipath dispersion while the constellation is still spinning, enabling subsequent carrier recovery loops to lock cleanly.
+    </div>
+  </div>
+
+  <h2>Primary Sources &amp; Further Reading</h2>
+  <ul>
+    <li>
+      <strong>Godard, Dominique N.</strong> (1980). <em>"Self-Recovering Equalization and Carrier Tracking in Two-Dimensional Data Communication Systems"</em>. IEEE Transactions on Communications, 28(11), 1867–1875. (The foundational paper introducing blind equalization without training sequences).
+    </li>
+    <li>
+      <strong>Treichler, John R. &amp; Agee, Brian G.</strong> (1983). <em>"A New Approach to Multipath Correction of Constant Modulus Signals"</em>. IEEE Transactions on Acoustics, Speech, and Signal Processing, 31(2), 459–472. (Derivation of CMA 2-2).
+    </li>
+    <li>
+      <strong>Belfiore, Carlos A. &amp; Park, John H.</strong> (1979). <em>"Decision Feedback Equalization"</em>. Proceedings of the IEEE, 67(8), 1143–1156. (Classic analysis of DFE structures and error propagation mechanics).
+    </li>
+    <li>
+      <strong>Proakis, John G. &amp; Salehi, Masoud.</strong> (2008). <em>Digital Communications</em> (5th Edition). McGraw-Hill. (Chapter 9: Adaptive Equalization, MMSE Wiener solutions, and LMS convergence).
+    </li>
+  </ul>
+
+  <p>
+    Review related synchronization and filtering concepts in <a href="0016-costas-loops-and-carrier-phase-synchronization.html">Lesson 0016: Costas Loops &amp; Carrier Recovery</a> and <a href="0017-pulse-shaping-nyquist-and-root-raised-cosine.html">Lesson 0017: Pulse Shaping, Nyquist, and Root-Raised Cosine</a>.
+  </p>
+
+  <div class="footer">
+    <span>Questions on CMA convergence, PAPR back-off, or SIMD equalizer pipelines? Ask your tutor agent!</span>
+    <span><a href="0023-fsk-afsk-demodulation-and-quadrature-discriminators.html">&larr; Lesson 0023</a> | Lesson 0030</span>
+  </div>
+</body>
+</html>

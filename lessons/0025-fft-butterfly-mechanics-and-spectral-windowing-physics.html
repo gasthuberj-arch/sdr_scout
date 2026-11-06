@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 25: FFT Butterfly Mechanics &amp; Spectral Windowing Physics — Discrete Fourier Math, SIMD Vectorization, and Leakage Dynamics</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0025</span>
+    <span class="badge badge-arch">DSP &amp; Systems Architecture</span>
+    <span>Reading time: 22 minutes</span>
+  </div>
+
+  <h1>FFT Butterfly Mechanics &amp; Spectral Windowing Physics: From Cooley-Tukey Cache Strides to RF Dynamic Range</h1>
+
+  <p>
+    In Software-Defined Radio (SDR) and computational RF engineering, the <strong>Fast Fourier Transform (FFT)</strong> is the computational backbone of modern receivers. From polyphase channelizers and panoramic waterfall displays to weak-signal digital demodulators (FT8, WSPR) and Orthogonal Frequency Division Multiplexing (OFDM) decoders, continuous-time electromagnetic waves are digitized into discrete complex baseband streams and mapped into frequency bins millions of times per second.
+  </p>
+  <p>
+    Yet, many engineers treat the FFT as a black-box mathematical oracle: an array of complex floats enters, and a spectral magnitude spectrum magically appears. In high-performance systems engineering, this abstraction breaks down immediately. A naive Cooley-Tukey implementation triggers catastrophic CPU cache thrashing due to power-of-two memory strides, stalling modern superscalar pipelines. Concurrently, in the RF physical domain, the mathematical truncation of infinite continuous-time signals into finite time apertures generates <em>spectral leakage</em>. If unmitigated by windowing physics, high sidelobes from a strong local amateur transmission can completely obliterate a weak $-120\ \text{dBm}$ DX signal tens of kilohertz away.
+  </p>
+  <p>
+    This lesson dissects both sides of the Fourier transform:
+  </p>
+  <ul>
+    <li><strong>The Computational Mechanics:</strong> The algebraic derivation of the Radix-2 Cooley-Tukey decimation-in-time algorithm, twiddle factor symmetries, bit-reversal indexing, cache line striding, the Stockham autosort algorithm, and AVX2/NEON complex Fused Multiply-Add (FMA) vectorization.</li>
+    <li><strong>The Physical RF Optics:</strong> Spectral leakage as frequency-domain convolution with a Dirichlet kernel ($\text{sinc}$ sidelobes at $-13.3\ \text{dB}$), windowing functions (Hann, Blackman-Harris, Flat-Top, Kaiser), Equivalent Noise Bandwidth (ENBW), and scalloping loss across discrete bins.</li>
+  </ul>
+
+  <h2>1. From DFT to Cooley-Tukey: The $O(N^2)$ to $O(N \log N)$ Divide</h2>
+
+  <p>
+    The <strong>Discrete Fourier Transform (DFT)</strong> maps a sequence of $N$ complex-valued time-domain samples $x[n]$ to an $N$-point sequence of frequency-domain coefficients $X[k]$:
+  </p>
+  <p>
+    $$X[k] = \sum_{n=0}^{N-1} x[n] \, W_N^{kn}, \quad k = 0, 1, \dots, N-1$$
+  </p>
+  <p>
+    where the complex rotational operator $W_N$, historically termed the <strong>twiddle factor</strong>, represents the primitive $N$-th root of unity:
+  </p>
+  <p>
+    $$W_N = e^{-j \frac{2\pi}{N}} = \cos\left(\frac{2\pi}{N}\right) - j \sin\left(\frac{2\pi}{N}\right)$$
+  </p>
+
+  <p>
+    Evaluating the DFT directly requires $N$ complex multiplications and $N-1$ complex additions for each of the $N$ output bins $X[k]$. For an $N$-point vector, this entails:
+  </p>
+  <p>
+    $$\text{Operations}_{\text{DFT}} = N^2 \text{ complex multiply-accumulate (MAC) steps}$$
+  </p>
+  <p>
+    In high-speed SDR, an RTL-SDR streaming at $2.4\ \text{MSPS}$ using an $N = 4096$ point transform demands $(4096)^2 \approx 16.78 \times 10^6$ complex MACs per transform. At $\approx 586$ transforms per second, a direct DFT consumes $9.8$ billion complex MACs per second—saturating multi-core CPUs solely on spectral transformations.
+  </p>
+
+  <h3>A. Radix-2 Decimation-In-Time (DIT) Algebraic Split</h3>
+  <p>
+    In 1965, J. W. Cooley and John Tukey popularized the divide-and-conquer decomposition (originally noted by Carl Friedrich Gauss in 1805) that reduces complexity from $O(N^2)$ to $O(N \log_2 N)$. Assuming $N$ is an integer power of two ($N = 2^m$), we decompose the $N$-point summation into two interleaving $(N/2)$-point sub-sequences: one containing the <strong>even-indexed</strong> samples and one containing the <strong>odd-indexed</strong> samples.
+  </p>
+  <p>
+    Let $n = 2m$ for even indices, and $n = 2m + 1$ for odd indices ($m = 0, 1, \dots, \frac{N}{2}-1$):
+  </p>
+  <p>
+    $$X[k] = \sum_{m=0}^{\frac{N}{2}-1} x[2m] \, W_N^{k(2m)} + \sum_{m=0}^{\frac{N}{2}-1} x[2m+1] \, W_N^{k(2m+1)}$$
+  </p>
+  <p>
+    We now examine the twiddle exponent in the even summation:
+  </p>
+  <p>
+    $$W_N^{2km} = \left(e^{-j \frac{2\pi}{N}}\right)^{2km} = e^{-j \frac{2\pi}{(N/2)} km} = W_{N/2}^{km}$$
+  </p>
+  <p>
+    Factoring out the term $W_N^k$ from the odd summation yields:
+  </p>
+  <p>
+    $$X[k] = \sum_{m=0}^{\frac{N}{2}-1} x[2m] \, W_{N/2}^{km} + W_N^k \sum_{m=0}^{\frac{N}{2}-1} x[2m+1] \, W_{N/2}^{km}$$
+  </p>
+  <p>
+    Notice that the two summations are themselves $(N/2)$-point DFTs! Define:
+  </p>
+  <ul>
+    <li>$E[k] = \text{DFT}_{N/2}\big(\{x[0], x[2], x[4], \dots, x[N-2]\}\big)$ (the Even transform)</li>
+    <li>$O[k] = \text{DFT}_{N/2}\big(\{x[1], x[3], x[5], \dots, x[N-1]\}\big)$ (the Odd transform)</li>
+  </ul>
+  <p>
+    Both $E[k]$ and $O[k]$ are periodic in $k$ with period $N/2$:
+  </p>
+  <p>
+    $$E[k + N/2] = E[k], \quad O[k + N/2] = O[k]$$
+  </p>
+
+  <div class="callout">
+    <div class="callout-title">Complexity Scaling Comparison</div>
+    <p>
+      For an SDR waterfall using $N = 4096$:
+    </p>
+    <ul>
+      <li><strong>Direct DFT:</strong> $N^2 = (4096)^2 = 16,777,216$ complex multiplications.</li>
+      <li><strong>Radix-2 FFT:</strong> $\frac{N}{2} \log_2 N = \frac{4096}{2} \times 12 = 24,576$ complex multiplications.</li>
+    </ul>
+    <p>
+      The Cooley-Tukey algorithm delivers a <strong>$682\times$ reduction</strong> in arithmetic workload!
+    </p>
+  </div>
+
+  <h2>2. Butterfly Mechanics &amp; Twiddle Symmetries</h2>
+
+  <p>
+    The fundamental building block of the Radix-2 FFT is the <strong>butterfly</strong> calculation. To compute the full spectrum $X[k]$ for all $k \in [0, N-1]$, we split the evaluation into two halves: the lower half $k \in [0, N/2 - 1]$ and the upper half $k + N/2 \in [N/2, N-1]$.
+  </p>
+  <p>
+    Using the half-period negation symmetry of the twiddle factor:
+  </p>
+  <p>
+    $$W_N^{k + N/2} = e^{-j \frac{2\pi (k + N/2)}{N}} = e^{-j \frac{2\pi k}{N}} \cdot e^{-j\pi} = -W_N^k$$
+  </p>
+  <p>
+    we obtain the symmetric <strong>Radix-2 Butterfly equations</strong>:
+  </p>
+  <p>
+    $$\begin{aligned}
+      X[k] &amp;= E[k] + W_N^k \, O[k] \\
+      X[k + N/2] &amp;= E[k] - W_N^k \, O[k]
+    \end{aligned}$$
+  </p>
+
+  <div class="diagram-box" style="background:#f4f4ea; border:1px solid #dcdcd0; padding:1.2rem; border-radius:6px; margin:1.5rem 0; font-family:monospace; line-height:1.4;">
+    <strong>Radix-2 Decimation-in-Time (DIT) Butterfly Kernel</strong><br><br>
+    E[k] &mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;(&Sigma;)&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&gt; X[k] = E[k] + W_N^k &middot; O[k]<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\&nbsp;&nbsp;&nbsp;^<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\&nbsp;&nbsp;|<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\&nbsp;|&nbsp;W_N^k<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;X|<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;/&nbsp;|<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;/&nbsp;&nbsp;v<br>
+    O[k] &mdash;&mdash;[&times; W_N^k]&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;(&Sigma;)&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&gt; X[k + N/2] = E[k] - W_N^k &middot; O[k]<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;-1
+  </div>
+
+  <p>
+    Notice the elegance of this structure: <strong>a single complex multiplication</strong> $T = W_N^k \cdot O[k]$ produces <em>both</em> $X[k]$ (via addition) and $X[k + N/2]$ (via subtraction).
+  </p>
+
+  <h3>B. Twiddle Symmetries Exploited in Hardware</h3>
+  <p>
+    High-performance DSP processors and SIMD accelerators do not compute transcendental trigonometric functions ($\sin$, $\cos$) on the fly. Twiddle factors are precomputed into lookup tables (LUTs) or generated recursively, utilizing four structural symmetries:
+  </p>
+  <ol>
+    <li><strong>Periodicity:</strong> $W_N^{k + N} = W_N^k$</li>
+    <li><strong>Half-Period Negation:</strong> $W_N^{k + N/2} = -W_N^k$ (halves table storage requirements)</li>
+    <li><strong>Quarter-Turn Reductions:</strong>
+      $$W_N^0 = 1, \quad W_N^{N/4} = -j, \quad W_N^{N/2} = -1, \quad W_N^{3N/4} = j$$
+      Multiplying by $\pm 1$ or $\pm j$ requires zero floating-point multiplications—only sign flips and real/imaginary lane swapping.
+    </li>
+    <li><strong>Conjugate Symmetry:</strong> $W_N^{N - k} = (W_N^k)^* = W_N^{-k}$, which permits quarter-circle LUT storage.</li>
+  </ol>
+
+  <h3>C. Bit-Reversal Indexing</h3>
+  <p>
+    If we recursively subdivide the sequence into even and odd indices down to 2-point transforms, where do the samples end up?
+  </p>
+  <p>
+    Consider an $N = 8$ sequence with indices $0, 1, 2, 3, 4, 5, 6, 7$. In 3-bit binary notation:
+  </p>
+  <ul>
+    <li>First split (Even / Odd): $\{0, 2, 4, 6\}$ and $\{1, 3, 5, 7\}$. (Sorted by Least Significant Bit, $b_0$).</li>
+    <li>Second split: $\{0, 4\}$, $\{2, 6\}$, $\{1, 5\}$, $\{3, 7\}$. (Sorted by next bit, $b_1$).</li>
+    <li>Final pairs: $\{0\}, \{4\}, \{2\}, \{6\}, \{1\}, \{5\}, \{3\}, \{7\}$.</li>
+  </ul>
+  <p>
+    Writing the initial sample index $n$ and its final position $n_{\text{perm}}$ in binary reveals the <strong>Bit-Reversal Permutation</strong>:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Sample Index $n$</th>
+        <th>Binary ($b_2 b_1 b_0$)</th>
+        <th>Bit-Reversed ($b_0 b_1 b_2$)</th>
+        <th>Permuted Index $n_{\text{perm}}$</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>$0$</td><td><code>000</code></td><td><code>000</code></td><td>$0$</td></tr>
+      <tr><td>$1$</td><td><code>001</code></td><td><code>100</code></td><td>$4$</td></tr>
+      <tr><td>$2$</td><td><code>010</code></td><td><code>010</code></td><td>$2$</td></tr>
+      <tr><td>$3$</td><td><code>011</code></td><td><code>110</code></td><td>$6$</td></tr>
+      <tr><td>$4$</td><td><code>100</code></td><td><code>001</code></td><td>$1$</td></tr>
+      <tr><td>$5$</td><td><code>101</code></td><td><code>101</code></td><td>$5$</td></tr>
+      <tr><td>$6$</td><td><code>110</code></td><td><code>011</code></td><td>$3$</td></tr>
+      <tr><td>$7$</td><td><code>111</code></td><td><code>111</code></td><td>$7$</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    To perform an <strong>in-place</strong> Cooley-Tukey DIT FFT without allocating intermediate scratch buffers, the input array must be scrambled into bit-reversed order before the butterfly stages begin. Once bit-reversed, each butterfly reads two adjacent elements and writes its two outputs directly back into the same memory locations!
+  </p>
+  <p>
+    On modern ARM architectures, hardware instructions like <code>RBIT</code> (Reverse Bits) allow bit-reversal indexing in a single clock cycle. On x86-64, compilers use shift-mask sequences or precomputed 256-entry 8-bit reversal lookup tables.
+  </p>
+
+  <h2>3. Systems Architecture: Cache Locality, Thrashing, and SIMD Vectorization</h2>
+
+  <p>
+    Computer Science textbooks frequently present the Cooley-Tukey algorithm as a clean, recursive function:
+  </p>
+  <pre><code>// NAIVE RECURSIVE FFT — DO NOT USE IN PRODUCTION
+void naive_fft_recursive(Complex *x, size_t N) {
+    if (N &lt;= 1) return;
+    Complex even[N/2], odd[N/2];
+    for (size_t i = 0; i &lt; N/2; i++) {
+        even[i] = x[2*i];
+        odd[i]  = x[2*i + 1];
+    }
+    naive_fft_recursive(even, N/2);
+    naive_fft_recursive(odd, N/2);
+    for (size_t k = 0; k &lt; N/2; k++) {
+        Complex t = twiddle(k, N) * odd[k];
+        x[k]       = even[k] + t;
+        x[k + N/2] = even[k] - t;
+    }
+}</code></pre>
+
+  <p>
+    In high-throughput SDR pipelines, this naive recursive formulation is catastrophic for three reasons:
+  </p>
+  <ol>
+    <li><strong>Stack Allocation &amp; Copy Overhead:</strong> Every recursive step copies elements into new stack-allocated arrays. For an $N = 65536$ transform, the CPU spends $90\%$ of its cycles executing <code>memcpy</code> and allocating stack frames rather than computing butterflies.</li>
+    <li><strong>Disjoint Strided Memory Access:</strong> Even in an in-place iterative formulation, stage $s$ ($s = 1, \dots, \log_2 N$) operates across a stride of $2^{s-1}$ elements. In late stages of a large transform (e.g., $N = 2^{20}$), butterfly pairs sit $2^{19}$ elements ($4\ \text{MB}$) apart.</li>
+    <li><strong>Cache Set Associativity Thrashing:</strong> CPU L1/L2 caches are set-associative (typically 8-way or 16-way). Memory addresses that differ by large powers of two (e.g., $4096$, $65536$) map to the <em>exact same cache set</em>. When accessing $x[k]$ and $x[k + N/2]$ across a large power-of-two stride, the CPU repeatedly evicts the very lines it just fetched, causing <strong>conflict misses</strong> and pipeline stalls while the rest of the cache sits empty.</li>
+  </ol>
+
+  <h3>A. The Stockham Autosort Architecture</h3>
+  <p>
+    How do world-class libraries like FFTW, Intel MKL, and Apple vDSP circumvent the bit-reversal overhead and cache line thrashing? They use the <strong>Stockham Autosort FFT</strong>.
+  </p>
+  <p>
+    The Stockham algorithm trades in-place execution for pure <strong>unit-stride streaming</strong>. By ping-ponging between two contiguous buffers (<code>buf_in</code> and <code>buf_out</code>):
+  </p>
+  <ul>
+    <li>Data is read sequentially with contiguous memory access and written sequentially at every stage.</li>
+    <li><strong>No bit-reversal pass is required.</strong> The permutation unfolds naturally across the $\log_2 N$ stages, leaving the final output in natural frequency order.</li>
+    <li>Hardware CPU prefetchers (L1 Streamer, L2 Spatial Prefetcher) effortlessly predict sequential memory lines, eliminating memory latency stalls.</li>
+  </ul>
+
+  <h3>B. AVX2 Vectorization of Complex Butterflies</h3>
+  <p>
+    Let us inspect how a butterfly executes inside a 256-bit AVX2 vector register. Each complex sample comprises two 32-bit single-precision floats: real ($I$) and imaginary ($Q$). A 256-bit register holds four complex numbers:
+  </p>
+  <pre><code>ymm = [ I_0, Q_0 | I_1, Q_1 | I_2, Q_2 | I_3, Q_3 ]</code></pre>
+
+  <p>
+    Given complex inputs $A$ and $B$, and twiddle factor $W = W_r + j W_i$, the complex product $T = B \cdot W$ expands as:
+  </p>
+  <p>
+    $$\begin{aligned}
+      T_r &amp;= B_r W_r - B_i W_i \\
+      T_i &amp;= B_r W_i + B_i W_r
+    \end{aligned}$$
+  </p>
+  <p>
+    Notice that $B_r$ multiplies both components of $W$, while $B_i$ multiplies a swapped, sign-inverted form of $W$. Modern x86 Fused Multiply-Add (FMA) instructions (<code>vfmaddsub231ps</code> / <code>vfmsubadd231ps</code>) execute this entire complex multiplication in two instructions!
+  </p>
+
+  <pre><code>// High-performance AVX2 Complex Radix-2 Butterfly step in C
+#include &lt;immintrin.h&gt;
+
+void avx2_butterfly_4x(
+    const float *__restrict__ A_ptr,    // [Ia0, Qa0, Ia1, Qa1, Ia2, Qa2, Ia3, Qa3]
+    const float *__restrict__ B_ptr,    // [Ib0, Qb0, Ib1, Qb1, Ib2, Qb2, Ib3, Qb3]
+    const float *__restrict__ W_ptr,    // [Wr0, Wi0, Wr1, Wi1, Wr2, Wi2, Wr3, Wi3]
+    float *__restrict__ OutA_ptr,
+    float *__restrict__ OutB_ptr
+) {
+    __m256 a = _mm256_loadu_ps(A_ptr);
+    __m256 b = _mm256_loadu_ps(B_ptr);
+    __m256 w = _mm256_loadu_ps(W_ptr);
+
+    // Duplicate real parts: [Ib0, Ib0, Ib1, Ib1, Ib2, Ib2, Ib3, Ib3]
+    __m256 b_re = _mm256_moveldup_ps(b);
+
+    // Duplicate imag parts: [Qb0, Qb0, Qb1, Qb1, Qb2, Qb2, Qb3, Qb3]
+    __m256 b_im = _mm256_movehdup_ps(b);
+
+    // Swap W lanes for imaginary multiplication: [Wi0, Wr0, Wi1, Wr1, ...]
+    __m256 w_swap = _mm256_permute_ps(w, _MM_SHUFFLE(2, 3, 0, 1));
+
+    // prod = b_re * w = [Ib*Wr, Ib*Wi, ...]
+    __m256 prod = _mm256_mul_ps(b_re, w);
+
+    // Fused Multiply-Subtract/Add:
+    // Even indices: prod[0] - b_im[0]*w_swap[0] = Ib*Wr - Qb*Wi = Re(T)
+    // Odd indices:  prod[1] + b_im[1]*w_swap[1] = Ib*Wi + Qb*Wr = Im(T)
+    __m256 t = _mm256_fmsubadd_ps(b_im, w_swap, prod);
+
+    // Butterfly outputs: OutA = A + T,  OutB = A - T
+    __m256 out_a = _mm256_add_ps(a, t);
+    __m256 out_b = _mm256_sub_ps(a, t);
+
+    _mm256_storeu_ps(OutA_ptr, out_a);
+    _mm256_storeu_ps(OutB_ptr, out_b);
+}</code></pre>
+
+  <p>
+    This routine processes <strong>four independent complex butterflies per iteration</strong> at a throughput of 1 butterfly per ~0.5 clock cycles on modern AVX2 execution ports!
+  </p>
+
+  <h2>4. The Physics of Spectral Leakage: Continuous Time vs. Finite Aperture</h2>
+
+  <p>
+    Now we shift focus from the processor's silicon pipelines to the physical RF electromagnetic spectrum.
+  </p>
+  <p>
+    The Continuous Fourier Transform assumes signals exist across infinite time ($t \in (-\infty, +\infty)$). A continuous, unmodulated RF carrier $x(t) = e^{j 2\pi f_0 t}$ produces a pure Dirac delta function in the frequency domain:
+  </p>
+  <p>
+    $$X(f) = \mathcal{F}\{e^{j 2\pi f_0 t}\} = \delta(f - f_0)$$
+  </p>
+  <p>
+    However, an SDR cannot sample for infinite time. To process signals, the receiver captures an observation block of length $T = N \cdot T_s$.
+  </p>
+
+  <h3>A. Time-Domain Truncation = Frequency-Domain Convolution</h3>
+  <p>
+    Capturing a block of $N$ samples is mathematically identical to multiplying an infinite signal $x(t)$ by a finite <strong>rectangular window</strong> $w_{\text{rect}}(t)$:
+  </p>
+  <p>
+    $$x_{\text{obs}}(t) = x(t) \cdot \Pi\left(\frac{t - T/2}{T}\right)$$
+  </p>
+  <p>
+    where $\Pi(t/T) = 1$ for $0 \le t \le T$, and $0$ elsewhere.
+  </p>
+  <p>
+    By the Fourier Convolution Theorem, multiplication in the time domain becomes <strong>continuous convolution</strong> in the frequency domain:
+  </p>
+  <p>
+    $$X_{\text{obs}}(f) = X(f) * W_{\text{rect}}(f)$$
+  </p>
+  <p>
+    The Fourier transform of a rectangular pulse of duration $T$ is the classic $\text{sinc}$ function:
+  </p>
+  <p>
+    $$W_{\text{rect}}(f) = T \, \frac{\sin(\pi f T)}{\pi f T} e^{-j \pi f T} = T \, \text{sinc}(f T) e^{-j \pi f T}$$
+  </p>
+  <p>
+    Convolving the ideal delta function $\delta(f - f_0)$ with this sinc response shifts the sinc center to $f_0$:
+  </p>
+  <p>
+    $$X_{\text{obs}}(f) = T \, \frac{\sin\big(\pi (f - f_0) T\big)}{\pi (f - f_0) T} e^{-j \pi (f - f_0) T}$$
+  </p>
+
+  <div class="callout warning">
+    <div class="callout-title">The Fundamental Sidelobe Problem</div>
+    <p>
+      The rectangular window's frequency response is notorious for its severe sidelobes:
+    </p>
+    <ul>
+      <li><strong>Peak Sidelobe Level (PSLL):</strong> The first sidelobe sits at only <strong>$-13.26\ \text{dB}$</strong> relative to the mainlobe crest!</li>
+      <li><strong>Roll-off Rate:</strong> The sidelobes decay at an agonizingly sluggish rate of <strong>$-6\ \text{dB/octave}$ ($-20\ \text{dB/decade}$)</strong> because of the sharp, discontinuous step at $t = 0$ and $t = T$.</li>
+    </ul>
+  </div>
+
+  <h3>B. Periodic vs. Non-Periodic Boundary Conditions</h3>
+  <p>
+    The Discrete Fourier Transform samples this continuous spectrum $X_{\text{obs}}(f)$ at exact bin intervals:
+  </p>
+  <p>
+    $$f_k = \frac{k}{T} = k \cdot \Delta f, \quad \text{where } \Delta f = \frac{f_s}{N}$$
+  </p>
+  <p>
+    Two distinct physical cases arise:
+  </p>
+  <ol>
+    <li><strong>Integer-Cycle Alignment:</strong> If the input tone frequency $f_0$ is an <em>exact integer multiple</em> of the bin spacing ($f_0 = m \cdot \Delta f$), the frequency bins fall exactly on the mainlobe peak and precisely on the zero-crossings of the $\text{sinc}$ function. All sidelobes sample to exactly zero! In this rare scenario, the rectangular window exhibits zero leakage.</li>
+    <li><strong>Non-Integer Frequency (Arbitrary RF Signals):</strong> In the real world, RF signals never land precisely on integer bin boundaries. When $f_0 = (m + 0.5) \cdot \Delta f$, the bins sample the $\text{sinc}$ response halfway between the nulls—directly across the peaks of the sidelobes! Energy "leaks" outward across every single bin in the entire FFT spectrum.</li>
+  </ol>
+
+  <h3>C. The Amateur Radio Calamity: Weak-Signal Discovery</h3>
+  <p>
+    Consider an SDR monitoring the 20-meter amateur band ($14.074\ \text{MHz}$) during an FT8 or CW contest:
+  </p>
+  <ul>
+    <li>Station A is a local legal-limit transmitter running $1500\ \text{Watts}$ into a directional beam antenna 2 miles away. It arrives at your SDR receiver front-end at <strong>$-10\ \text{dBm}$</strong>.</li>
+    <li>Station B is a QRP (low-power) DX station transmitting from an oceanic island with $5\ \text{Watts}$, arriving at your SDR antenna at <strong>$-125\ \text{dBm}$</strong> ($15\ \text{dB}$ above thermal noise in a $50\ \text{Hz}$ CW bandwidth).</li>
+    <li>The power ratio between Station A and Station B is:
+      $$\Delta P = -10\ \text{dBm} - (-125\ \text{dBm}) = \mathbf{115\ \text{dB}!}$$
+    </li>
+  </ul>
+  <p>
+    If you compute the spectrum using a rectangular window:
+  </p>
+  <ul>
+    <li>The first sidelobe of Station A arrives at $-10 - 13.3 = \mathbf{-23.3\ \text{dBm}}$—completely pulverizing Station B by over $100\ \text{dB}$.</li>
+    <li>Even $100$ bins away, the $-6\ \text{dB/octave}$ roll-off leaves sidelobe energy at $-10 - 20 \log_{10}(100) = \mathbf{-50\ \text{dBm}}$.</li>
+  </ul>
+  <p>
+    Station A's rectangular leakage skirt creates a massive synthetic noise floor that masks the entire amateur band. <strong>Station B is physically present at the antenna terminals, but mathematically erased by the FFT algorithm!</strong>
+  </p>
+
+  <h2>5. Windowing Functions Deep-Dive: Tapering the Discontinuity</h2>
+
+  <p>
+    To eliminate spectral leakage, we must eliminate the sharp, step-function discontinuity at the boundaries of the time window. By smoothly tapering the sample values to zero at $n = 0$ and $n = N-1$, the boundary becomes continuously differentiable, suppressing frequency-domain sidelobes by tens of decibels.
+  </p>
+  <p>
+    However, the <strong>Fourier Uncertainty Principle</strong> imposes an unyielding physics trade-off:
+  </p>
+  <div class="callout">
+    <div class="callout-title">The Fundamental Windowing Trade-Off</div>
+    <p>
+      <strong>Narrow Time Window $\iff$ Broad Frequency Mainlobe.</strong><br>
+      As you taper the edges of the time aperture to lower the sidelobes (increasing dynamic range), you reduce the effective observation length. This widens the central mainlobe, degrading your ability to resolve two closely spaced carrier frequencies.
+    </p>
+  </div>
+
+  <h3>A. Generalized Cosine Windows</h3>
+  <p>
+    Most classical windows belong to the generalized cosine family:
+  </p>
+  <p>
+    $$w[n] = \sum_{m=0}^{M} (-1)^m a_m \cos\left(\frac{2\pi m n}{N-1}\right), \quad 0 \le n \le N-1$$
+  </p>
+
+  <h4>1. Hann (Hanning) Window</h4>
+  <p>
+    $$w[n] = 0.5 - 0.5 \cos\left(\frac{2\pi n}{N-1}\right) = \sin^2\left(\frac{\pi n}{N-1}\right)$$
+  </p>
+  <p>
+    The Hann window touches zero smoothly at both ends ($w[0] = w[N-1] = 0$). Its first derivative is continuous at the boundaries, producing a rapid <strong>$-18\ \text{dB/octave}$ ($-60\ \text{dB/decade}$)</strong> sidelobe roll-off. Its peak sidelobe level sits at <strong>$-31.5\ \text{dB}$</strong>. It is the universal standard for general-purpose audio and SDR spectrum waterfalls.
+  </p>
+
+  <h4>2. Hamming Window</h4>
+  <p>
+    $$w[n] = 0.54 - 0.46 \cos\left(\frac{2\pi n}{N-1}\right)$$
+  </p>
+  <p>
+    Richard Hamming optimized the coefficients $a_0 = 0.54$ and $a_1 = 0.46$ to place a transmission zero (null) directly over the peak of the first sidelobe. This drives the peak sidelobe level down to <strong>$-42.7\ \text{dB}$</strong>. However, because $w[0] = 0.08 \ne 0$, the boundary contains a small step discontinuity. Consequently, its sidelobe roll-off reverts to a sluggish <strong>$-6\ \text{dB/octave}$</strong>. For distant interferers, Hann out-performs Hamming!
+  </p>
+
+  <h4>3. 4-Term Blackman-Harris Window</h4>
+  <p>
+    $$w[n] = a_0 - a_1 \cos\left(\frac{2\pi n}{N-1}\right) + a_2 \cos\left(\frac{4\pi n}{N-1}\right) - a_3 \cos\left(\frac{6\pi n}{N-1}\right)$$
+  </p>
+  <p>
+    with exact coefficients:
+  </p>
+  <p>
+    $$a_0 = 0.35875, \quad a_1 = 0.48829, \quad a_2 = 0.14128, \quad a_3 = 0.01168$$
+  </p>
+  <p>
+    The 4-term Blackman-Harris window is the gold standard for high-dynamic-range amateur radio receivers. It delivers a peak sidelobe level of <strong>$-92\ \text{dB}$</strong>! In our earlier scenario, Station A's $-10\ \text{dBm}$ signal drops to $-102\ \text{dBm}$ in the immediate adjacent bin, allowing the $-125\ \text{dBm}$ DX signal to be discovered clearly without interference.
+  </p>
+
+  <h4>4. Flat-Top Window (Amplitude Calibration)</h4>
+  <p>
+    Standard windows have rounded crests. If a carrier frequency drifts between two bins, the measured peak amplitude sags. The Flat-Top window uses 5 cosine terms with alternating negative coefficients to create an artificially flattened mainlobe peak:
+  </p>
+  <p>
+    $$w[n] = 0.21557895 - 0.41663158 \cos\left(\frac{2\pi n}{N-1}\right) + 0.277263158 \cos\left(\frac{4\pi n}{N-1}\right) - 0.083578947 \cos\left(\frac{6\pi n}{N-1}\right) + 0.006947368 \cos\left(\frac{8\pi n}{N-1}\right)$$
+  </p>
+  <p>
+    Its mainlobe is very wide ($5\times$ wider than rectangular), but its amplitude ripple across bin centers is <strong>less than $0.01\ \text{dB}$</strong>. It is used exclusively in RF spectrum analyzers and calibration receivers for laboratory-grade power measurement.
+  </p>
+
+  <h4>5. Kaiser Window (Bessel-Tuned Parameter $\beta$)</h4>
+  <p>
+    James Kaiser developed a near-optimal window based on the zeroth-order modified Bessel function of the first kind, $I_0(x)$:
+  </p>
+  <p>
+    $$w[n] = \frac{I_0\left(\beta \sqrt{1 - \left(\frac{2n}{N-1} - 1\right)^2}\right)}{I_0(\beta)}, \quad 0 \le n \le N-1$$
+  </p>
+  <p>
+    The shape parameter $\beta$ acts as a continuous dial between spectral resolution and sidelobe attenuation:
+  </p>
+  <ul>
+    <li>$\beta = 0$: Rectangular window ($-13.3\ \text{dB}$ PSLL, narrowest mainlobe).</li>
+    <li>$\beta = 5.0$: Mimics the Hann window ($-37\ \text{dB}$ PSLL).</li>
+    <li>$\beta = 8.6$: Blackman-equivalent ($-70\ \text{dB}$ PSLL).</li>
+    <li>$\beta = 12.0$: Ultra-low sidelobes ($-100\ \text{dB}$ PSLL) for deep astronomical observation.</li>
+  </ul>
+
+  <h2>6. Equivalent Noise Bandwidth (ENBW) &amp; Scalloping Loss</h2>
+
+  <p>
+    Applying a window modifies two fundamental metrics of the discrete spectrum: total integrated noise and peak amplitude fidelity.
+  </p>
+
+  <h3>A. Coherent Gain vs. Noise Power Gain</h3>
+  <p>
+    Because window coefficients $w[n] &lt; 1$ taper the samples, the average amplitude of an incoming sinusoidal tone is attenuated. The <strong>Coherent Gain (CG)</strong> measures this DC voltage scaling factor:
+  </p>
+  <p>
+    $$\text{CG} = \frac{1}{N} \sum_{n=0}^{N-1} w[n]$$
+  </p>
+  <p>
+    For a rectangular window, $\text{CG} = 1.0$. For Hann, $\text{CG} = 0.50$ (a $-6.02\ \text{dB}$ voltage scale). When plotting calibrated power spectra, FFT magnitudes must be divided by $\sum w[n]$ to restore true peak amplitude.
+  </p>
+  <p>
+    Conversely, broadband thermal noise is uncorrelated from sample to sample. The noise power transmitted through the window is determined by the sum of squared weights:
+  </p>
+  <p>
+    $$\text{NG} = \frac{1}{N} \sum_{n=0}^{N-1} w^2[n]$$
+  </p>
+
+  <h3>B. Equivalent Noise Bandwidth (ENBW)</h3>
+  <p>
+    The <strong>Equivalent Noise Bandwidth (ENBW)</strong> defines the bandwidth of an ideal brick-wall rectangular filter that would pass the exact same white-noise power as the windowed FFT bin:
+  </p>
+  <p>
+    $$\text{ENBW} = N \cdot \frac{\sum_{n=0}^{N-1} w^2[n]}{\left(\sum_{n=0}^{N-1} w[n]\right)^2} \quad \text{[expressed in bins]}$$
+  </p>
+  <p>
+    In physical Hertz: $\text{ENBW}_{\text{Hz}} = \text{ENBW}_{\text{bins}} \times \Delta f = \text{ENBW}_{\text{bins}} \times \frac{f_s}{N}$.
+  </p>
+  <p>
+    Because tapering concentrates the filter response into a broader mainlobe, <strong>windowing increases the effective noise bandwidth of every bin</strong>. For a Hann window, $\text{ENBW} = 1.50\ \text{bins}$. The bin admits $1.50\times$ more broadband noise power ($+1.76\ \text{dB}$ noise floor increase) in exchange for suppressing adjacent leakage sidelobes by $18.2\ \text{dB}$!
+  </p>
+
+  <h3>C. Scalloping Loss</h3>
+  <p>
+    When an incoming tone lies halfway between two adjacent bins ($f_0 = (k + 0.5) \Delta f$), the discrete bins straddle the peak of the window's frequency response. The reduction in measured peak power relative to an on-bin tone is termed <strong>scalloping loss</strong>:
+  </p>
+  <p>
+    $$\text{Scalloping Loss} = 20 \log_{10}\left( \frac{\left| W(\pi / N) \right|}{W(0)} \right)$$
+  </p>
+  <p>
+    A rectangular window exhibits a massive <strong>$-3.92\ \text{dB}$</strong> scalloping loss! If an amateur radio beacon drifts between bins, its reported power fluctuates by nearly $4\ \text{dB}$. A Flat-Top window suppresses scalloping loss to <strong>$-0.01\ \text{dB}$</strong>, eliminating picket-fence amplitude ripple completely.
+  </p>
+
+  <h2>7. Comprehensive Windowing Comparison</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Window Type</th>
+        <th>Peak Sidelobe (PSLL)</th>
+        <th>Sidelobe Roll-off</th>
+        <th>$-3\ \text{dB}$ Mainlobe</th>
+        <th>Null-to-Null Width</th>
+        <th>ENBW (Bins)</th>
+        <th>Scalloping Loss</th>
+        <th>Primary SDR / RF Domain</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Rectangular</strong></td>
+        <td>$-13.3\ \text{dB}$</td>
+        <td>$-6\ \text{dB/oct}$</td>
+        <td>$0.89\ \Delta f$</td>
+        <td>$2.0\ \Delta f$</td>
+        <td>$1.00$</td>
+        <td>$-3.92\ \text{dB}$</td>
+        <td>Transient pulses, exact integer RF carriers</td>
+      </tr>
+      <tr>
+        <td><strong>Hann</strong></td>
+        <td>$-31.5\ \text{dB}$</td>
+        <td>$-18\ \text{dB/oct}$</td>
+        <td>$1.44\ \Delta f$</td>
+        <td>$4.0\ \Delta f$</td>
+        <td>$1.50$</td>
+        <td>$-1.42\ \text{dB}$</td>
+        <td>Waterfall displays, general-purpose audio/RF</td>
+      </tr>
+      <tr>
+        <td><strong>Hamming</strong></td>
+        <td>$-42.7\ \text{dB}$</td>
+        <td>$-6\ \text{dB/oct}$</td>
+        <td>$1.30\ \Delta f$</td>
+        <td>$4.0\ \Delta f$</td>
+        <td>$1.36$</td>
+        <td>$-1.75\ \text{dB}$</td>
+        <td>Speech recognition, narrow close-in tone separation</td>
+      </tr>
+      <tr>
+        <td><strong>Blackman-Harris (4-term)</strong></td>
+        <td>$-92.0\ \text{dB}$</td>
+        <td>$-6\ \text{dB/oct}$</td>
+        <td>$1.90\ \Delta f$</td>
+        <td>$8.0\ \Delta f$</td>
+        <td>$2.00$</td>
+        <td>$-0.83\ \text{dB}$</td>
+        <td>Weak-signal amateur radio (FT8/WSPR), high dynamic range</td>
+      </tr>
+      <tr>
+        <td><strong>Flat-Top</strong></td>
+        <td>$-93.0\ \text{dB}$</td>
+        <td>$-6\ \text{dB/oct}$</td>
+        <td>$3.77\ \Delta f$</td>
+        <td>$10.0\ \Delta f$</td>
+        <td>$3.77$</td>
+        <td>$-0.01\ \text{dB}$</td>
+        <td>RF power calibration, laboratory spectrum analyzers</td>
+      </tr>
+      <tr>
+        <td><strong>Kaiser ($\beta = 8.6$)</strong></td>
+        <td>$-70.0\ \text{dB}$</td>
+        <td>$-6\ \text{dB/oct}$</td>
+        <td>$1.73\ \Delta f$</td>
+        <td>$6.8\ \Delta f$</td>
+        <td>$1.85$</td>
+        <td>$-1.02\ \text{dB}$</td>
+        <td>Parametric FIR filter design, adaptive SDR channelizers</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>8. Systems Implementation: SIMD Window Application</h2>
+
+  <p>
+    Before feeding I/Q samples into an FFT execution engine (such as an in-place Radix-2 pipeline or Stockham kernel), the window must be applied. In high-rate SDR pipelines, applying the window naively in scalar code introduces memory stalls.
+  </p>
+  <p>
+    Because window weights are real-valued ($w[n] \in \mathbb{R}$), multiplying a complex sample $x[n] = I[n] + j Q[n]$ by $w[n]$ scales both the in-phase and quadrature components identically:
+  </p>
+  <p>
+    $$x_w[n] = (I[n] \cdot w[n]) + j (Q[n] \cdot w[n])$$
+  </p>
+  <p>
+    In memory, complex I/Q samples are interleaved: $[I_0, Q_0, I_1, Q_1, \dots]$. To vectorize with AVX2:
+  </p>
+
+  <pre><code>// Vectorized windowing in Zig / C using AVX2
+// Multiplies 8 complex floats (16 f32 values = 512 bits = 2x YMM registers) per loop
+void apply_window_avx2(
+    const float *__restrict__ iq_in,   // Interleaved [I0, Q0, I1, Q1, ...]
+    const float *__restrict__ win,     // Scalar window table [w0, w1, w2, w3, ...]
+    float *__restrict__ iq_out,
+    size_t num_complex_samples
+) {
+    for (size_t i = 0; i &lt; num_complex_samples; i += 4) {
+        // Load 4 real window taps: [w0, w1, w2, w3]
+        __m128 w4 = _mm_loadu_ps(&amp;win[i]);
+
+        // Unpack into interleaved pairs:
+        // win_lo = [w0, w0, w1, w1]
+        // win_hi = [w2, w2, w3, w3]
+        __m128 win_lo = _mm_unpacklo_ps(w4, w4);
+        __m128 win_hi = _mm_unpackhi_ps(w4, w4);
+
+        // Combine into 256-bit register: [w0, w0, w1, w1, w2, w2, w3, w3]
+        __m256 w256 = _mm256_set_m128(win_hi, win_lo);
+
+        // Load 4 interleaved complex samples (8 floats)
+        __m256 iq = _mm256_loadu_ps(&amp;iq_in[2 * i]);
+
+        // Multiply: [I0*w0, Q0*w0, I1*w1, Q1*w1, I2*w2, Q2*w2, I3*w3, Q3*w3]
+        __m256 result = _mm256_mul_ps(iq, w256);
+
+        _mm256_storeu_ps(&amp;iq_out[2 * i], result);
+    }
+}</code></pre>
+
+  <p>
+    This routine applies a 4096-point Blackman-Harris window in less than $850\ \text{nanoseconds}$ on a modern x86 CPU, operating entirely within L1 cache lines before data passes to the FFT butterfly stages.
+  </p>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-25-1">
+    <div class="quiz-question">
+      1. Why does an in-place Radix-2 Cooley-Tukey decimation-in-time (DIT) FFT require a bit-reversal permutation of the input samples?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Because CPU SIMD registers can only load contiguous floats in reverse memory order.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Because recursive even/odd sub-sequence splitting orders the inputs by their reversed address bits.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Because twiddle factor trigonometric signs alternate between positive and negative half-cycles.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Because circular convolution requires conjugate symmetry across the discrete frequency bins.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> In Cooley-Tukey DIT, the sequence is recursively decomposed into even- and odd-indexed sub-sequences based on the least significant bit ($b_0$), then the next bit ($b_1$), down to single-element transforms. Tracing the samples through this binary decimation tree places sample $n$ at address $\text{bitrev}(n)$. Reversing the bits prior to the butterfly stages allows in-place butterfly pairs to combine adjacent items and produce natural, in-order frequency bins at the output.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-25-2">
+    <div class="quiz-question">
+      2. In a crowded amateur band, why is a 4-term Blackman-Harris window preferred over a Rectangular window when searching for faint FT8 signals adjacent to a 1.5 kW transmitter?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The Blackman-Harris window narrows the mainlobe to half the width of a rectangular window.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The Blackman-Harris window eliminates thermal Gaussian noise across the ADC input stages.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The Blackman-Harris window suppresses sidelobe leakage to -92 dB, preventing strong tone masking.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The Blackman-Harris window provides zero scalloping loss across all fractional bin frequencies.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> A rectangular window has a peak sidelobe level of only $-13.3\ \text{dB}$ and a slow $-6\ \text{dB/octave}$ roll-off, causing immense spectral energy from a local high-power transmitter to spill across dozens of adjacent bins. A 4-term Blackman-Harris window drives the peak sidelobe level down to $-92\ \text{dB}$, keeping leakage below the receiver noise floor and allowing weak DX signals to be detected.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-25-3">
+    <div class="quiz-question">
+      3. What is the fundamental operational advantage of the Stockham autosort FFT algorithm over the in-place Cooley-Tukey algorithm on modern superscalar CPUs?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="true">
+        It eliminates bit reversal and replaces large power-of-two strided writes with streaming unit strides.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It reduces the theoretical arithmetic complexity of an N-point transform from O(N log N) down to O(N).
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It avoids twiddle factor multiplications entirely by using integer-only circular bit rotations.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It operates strictly within CPU general-purpose registers without touching L1 data cache lines.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> While in-place Cooley-Tukey accesses memory with large power-of-two strides in late stages—causing severe cache set-associativity conflict misses and requiring an upfront bit-reversal pass—the Stockham algorithm alternates between two buffers with pure unit-stride reads and writes. This allows hardware prefetchers to operate at peak efficiency and yields naturally ordered frequency bins without an explicit bit-reversal step.
+    </div>
+  </div>
+
+  <h2>Follow-up &amp; Next Steps</h2>
+  <p>
+    You now possess a complete physical and computational mental model of the Fourier transform: from the twiddle symmetries and SIMD butterfly instructions that compute it at line rate, to the spectral leakage and windowing mechanics that preserve dynamic range in congested RF bands.
+  </p>
+  <p>
+    In subsequent lessons, we will build upon these frequency-domain foundations to explore <strong>Polyphase Channelizers (PFB)</strong> with arbitrary filter prototypes, <strong>Cyclostationary Feature Detectors</strong>, and <strong>Frequency-Domain Equalization (FDE)</strong> in wideband SDR systems.
+  </p>
+
+  <div class="footer">
+    <span>SDR Scout Architecture Course</span>
+    <span>Lesson 0025</span>
+  </div>
+</body>
+</html>

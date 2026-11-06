@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 31: OFDM — Subcarrier Orthogonality, Cyclic Prefix, and Channel Estimation</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0031</span>
+    <span class="badge badge-arch">Wideband DSP &amp; Modulation</span>
+    <span>Reading time: 18 minutes</span>
+  </div>
+
+  <h1>OFDM: Subcarrier Orthogonality, Cyclic Prefix, and Channel Estimation</h1>
+
+  <p>
+    In preceding lessons, we mastered single-carrier pulsed and continuous-phase modulations—from Mode-S PPM in <a href="file:///home/johannes/code/sdr_scout/lib/sdr_scout/synth/modulator.ex"><code>SdrScout.Synth.Modulator</code></a> to Bell 202 CPFSK discriminators. In narrowband channels, single-carrier systems perform admirably because all spectral components of the signal experience nearly identical attenuation and phase rotation.
+  </p>
+
+  <p>
+    However, when transmission bandwidth scales into multi-megahertz regimes—whether in Wi-Fi (802.11a/g/n/ac/ax), LTE/5G cellular, Digital Video Broadcasting (DVB-T2), or high-throughput amateur radio digital ATV and FreeDV wideband modes—the physical radio channel becomes <strong>frequency-selective</strong>. Uncorrected multipath reflections induce severe <strong>Inter-Symbol Interference (ISI)</strong> that wrecks conventional single-carrier equalizers.
+  </p>
+
+  <p>
+    <strong>Orthogonal Frequency Division Multiplexing (OFDM)</strong> resolves this crisis through mathematical elegance: it transforms a wideband frequency-selective channel into $N$ parallel, decoupled, flat-fading narrowband channels via the Discrete Fourier Transform and the Cyclic Prefix. This lesson dissects the linear algebra, discrete-time convolution proofs, and SIMD computational engine behind OFDM.
+  </p>
+
+  <h2>1. The Wideband Multipath Bottleneck</h2>
+
+  <p>
+    Consider an RF signal propagating through an outdoor or indoor terrestrial environment. The transmitted wave reflects off buildings, terrain, foliage, and metal fuselages, arriving at the receiver antenna via multiple distinct paths:
+  </p>
+
+  $$h(t) = \sum_{\ell=0}^{P-1} a_\ell e^{-j \theta_\ell} \delta(t - \tau_\ell)$$
+
+  <p>
+    where $a_\ell$, $\theta_\ell$, and $\tau_\ell$ represent the attenuation, phase rotation, and arrival delay of the $\ell$-th path. The difference between the earliest and latest arriving multipath components defines the <strong>maximum delay spread</strong>:
+  </p>
+
+  $$\tau_{\text{delay}} = \tau_{\max} - \tau_{\min}$$
+
+  <p>
+    In the frequency domain, path delays cause constructive and destructive interference across frequency, creating spectral peaks and deep notches. The frequency interval over which the channel transfer function remains approximately correlated is the <strong>coherence bandwidth</strong> $B_c$:
+  </p>
+
+  $$B_c \approx \frac{1}{5 \tau_{\text{delay}}}$$
+
+  <div class="callout">
+    <div class="callout-title">Narrowband Flat Fading vs. Wideband Frequency-Selective Fading</div>
+    <p>
+      <strong>Narrowband ($B \ll B_c$):</strong> The signal bandwidth is much narrower than the channel variations. All frequencies within the transmission band fade synchronously. The channel is modeled as a single complex multiplier $H_0$.
+    </p>
+    <p>
+      <strong>Wideband ($B \gg B_c$):</strong> The signal bandwidth spans multiple spectral notches. Some sub-bands experience complete cancellation while others pass unimpeded. The channel exhibits severe frequency selectivity.
+    </p>
+  </div>
+
+  <h3>The Computational Equalization Catastrophe in Single-Carrier Systems</h3>
+
+  <p>
+    In a single-carrier system with symbol rate $R_s = B$, the symbol duration is $T_s = 1/B$. As bandwidth increases, $T_s$ shrinks. When $T_s \ll \tau_{\text{delay}}$, the channel impulse response spans $L$ symbol periods:
+  </p>
+
+  $$L = \left\lceil \frac{\tau_{\text{delay}}}{T_s} \right\rceil = \lceil \tau_{\text{delay}} \cdot B \rceil$$
+
+  <p>
+    For example, in a suburban environment with $\tau_{\text{delay}} = 5\,\mu\text{s}$:
+  </p>
+  <ul>
+    <li>At an amateur HF digital bandwidth of $B = 3\text{ kHz}$ ($T_s \approx 333\,\mu\text{s}$), $L \approx 0.015 \ll 1$. No ISI occurs; the channel is purely flat.</li>
+    <li>At an amateur VHF/UHF packet rate of $B = 200\text{ kHz}$ ($T_s = 5\,\mu\text{s}$), $L \approx 1$. A simple 2-tap equalizer suffices.</li>
+    <li>At a wideband rate of $B = 20\text{ MHz}$ ($T_s = 50\text{ ns}$), $L = 5\,\mu\text{s} / 50\text{ ns} = 100\text{ taps}$! Every transmitted symbol smears across the next 100 consecutive symbols.</li>
+  </ul>
+
+  <p>
+    Equalizing a 100-tap channel in the time domain is computationally crushing:
+  </p>
+  <ul>
+    <li><strong>Maximum Likelihood Sequence Estimation (Viterbi MLSE):</strong> The optimal detector requires tracking a trellis with $M^L$ states, where $M$ is the constellation alphabet size. For 16-QAM ($M=16$) and $L=100$, $16^{100} \approx 10^{120}$ states—physically impossible to compute.</li>
+    <li><strong>Linear &amp; Decision-Feedback Equalizers (DFE):</strong> Requires an FIR filter with $N_{\text{taps}} \ge 2L$ taps. Computing the Wiener-Hopf matrix weights requires inverting an $N_{\text{taps}} \times N_{\text{taps}}$ covariance matrix ($\mathcal{O}(L^3)$ operations), while filtering requires $2L$ complex multiply-accumulates (MACs) per sample at line rate ($20\text{ MSPS} \times 200\text{ MACs} = 4\times 10^9\text{ complex ops/sec}$). Furthermore, in deep spectral notches, linear equalizers invert near-zero gains, causing catastrophic noise enhancement.</li>
+  </ul>
+
+  <h3>The OFDM Paradigm Shift</h3>
+
+  <p>
+    Instead of serializing high-rate symbols through a wideband channel, OFDM partitions the wideband spectrum of bandwidth $B$ into $N$ orthogonal, narrowband subcarriers spaced by $\Delta f = B/N$.
+  </p>
+  <p>
+    By expanding the symbol duration on each subcarrier from $T_s$ to $T_{\text{sym}} = N T_s$, the subcarrier bandwidth becomes $\Delta f \ll B_c$. As long as $N$ is chosen large enough that $T_{\text{sym}} \gg \tau_{\text{delay}}$, <strong>each individual subcarrier experiences flat fading!</strong> The multi-tap matrix equalization problem collapses into $N$ decoupled, single-tap scalar operations.
+  </p>
+
+  <h2>2. Mathematical Condition for Subcarrier Orthogonality</h2>
+
+  <p>
+    In classical Frequency Division Multiplexing (FDM), adjacent channels require guard bands and steep bandpass filters to prevent crosstalk. In OFDM, subcarrier spectra overlap aggressively, yet can be separated without crosstalk if the subcarrier basis functions are <strong>mutually orthogonal</strong> over the symbol integration window.
+  </p>
+
+  <p>
+    Let the transmitted continuous-time complex baseband OFDM symbol over the interval $t \in [0, T]$ be synthesized from $N$ complex modulation symbols $\{X_0, X_1, \dots, X_{N-1}\}$:
+  </p>
+
+  $$s(t) = \sum_{k=0}^{N-1} X_k \phi_k(t) \quad \text{where} \quad \phi_k(t) = e^{j 2\pi f_k t}$$
+
+  <p>
+    Here $f_k = f_0 + k \Delta f$ is the frequency of the $k$-th subcarrier. The inner product between the $k$-th and $m$-th basis functions over duration $T$ is defined as:
+  </p>
+
+  $$\langle \phi_k, \phi_m \rangle = \frac{1}{T} \int_0^T \phi_k(t) \phi_m^*(t) \, dt = \frac{1}{T} \int_0^T e^{j 2\pi f_k t} e^{-j 2\pi f_m t} \, dt = \frac{1}{T} \int_0^T e^{j 2\pi (k - m)\Delta f t} \, dt$$
+
+  <p>
+    We evaluate this integral for two cases:
+  </p>
+
+  <p><strong>Case 1: $k = m$ (Self-correlation):</strong></p>
+
+  $$\langle \phi_k, \phi_k \rangle = \frac{1}{T} \int_0^T e^0 \, dt = \frac{1}{T} [t]_0^T = 1$$
+
+  <p><strong>Case 2: $k \ne m$ (Cross-correlation):</strong></p>
+
+  $$\langle \phi_k, \phi_m \rangle = \frac{1}{T} \left[ \frac{e^{j 2\pi (k - m)\Delta f t}}{j 2\pi (k - m)\Delta f} \right]_0^T = \frac{e^{j 2\pi (k - m)\Delta f T} - 1}{j 2\pi (k - m)\Delta f T}$$
+
+  <p>
+    For the cross-correlation to equal zero for all integer pairs $k \ne m$, the complex exponential in the numerator must equal unity:
+  </p>
+
+  $$e^{j 2\pi (k - m)\Delta f T} = 1 \iff 2\pi (k - m)\Delta f T = 2\pi n \quad (n \in \mathbb{Z} \setminus \{0\})$$
+
+  <p>
+    The minimal non-zero tone spacing that satisfies this condition for adjacent carriers ($|k - m| = 1$) is:
+  </p>
+
+  $$\Delta f \cdot T = 1 \implies \Delta f = \frac{1}{T_{\text{sym}}}$$
+
+  <div class="callout upside">
+    <div class="callout-title">The Fundamental Orthogonality Law</div>
+    <p>
+      Subcarriers are strictly orthogonal over duration $T$ if and only if their frequency separation $\Delta f$ is an exact integer multiple of the reciprocal symbol duration:
+    </p>
+    $$\Delta f = \frac{1}{T_{\text{sym}}}$$
+  </div>
+
+  <h3>Spectral Sinc Overlap without Inter-Carrier Interference</h3>
+
+  <p>
+    Because each subcarrier tone is gated by a rectangular time window of length $T$, its continuous-time Fourier transform is a shifted $\text{sinc}$ function:
+  </p>
+
+  $$\Phi_k(f) = \mathcal{F}\left\{ \text{rect}\left(\frac{t - T/2}{T}\right) e^{j 2\pi f_k t} \right\} = T \cdot \frac{\sin(\pi (f - f_k) T)}{\pi (f - f_k) T} \cdot e^{-j \pi (f - f_k) T}$$
+
+  <p>
+    Notice what happens when we sample this spectrum at the center frequency of any other subcarrier $f_m = f_k + (m - k)\Delta f = f_k + \frac{m - k}{T}$ where $m \ne k$:
+  </p>
+
+  $$\Phi_k(f_m) \propto \frac{\sin(\pi (m - k))}{\pi (m - k)} = \frac{0}{\pi (m - k)} = 0 \quad (\forall m \ne k)$$
+
+  <p>
+    At the exact center frequency of subcarrier $k$, the spectral energy of subcarrier $k$ is at its maximum peak, while <strong>every other subcarrier exhibits a spectral null (zero crossing)</strong>. Consequently, as long as orthogonality is maintained, the subcarriers do not interfere with each other, achieving a theoretical spectral efficiency approaching the Nyquist rate of $1\text{ symbol/s/Hz}$ without inter-tone guard bands.
+  </p>
+
+  <h2>3. The IFFT / FFT Modulation Engine</h2>
+
+  <p>
+    Generating $N$ subcarriers using $N$ independent analog RF oscillators and quadrature modulators is physically and economically unfeasible. In 1971, Weinstein and Ebert demonstrated that baseband OFDM modulation can be performed entirely in software via the <strong>Inverse Discrete Fourier Transform (IDFT)</strong>.
+  </p>
+
+  <h3>Discrete Sampling and Equivalence to IDFT</h3>
+
+  <p>
+    Sample the continuous-time baseband signal $s(t)$ at uniform intervals $t_n = n T_s = n \frac{T}{N}$ for $n \in \{0, 1, \dots, N-1\}$:
+  </p>
+
+  $$s[n] = s(n T_s) = \sum_{k=0}^{N-1} X_k e^{j 2\pi f_k (n T_s)} = \sum_{k=0}^{N-1} X_k e^{j 2\pi (k \Delta f) \left(\frac{n T}{N}\right)}$$
+
+  <p>
+    Substituting the orthogonality condition $\Delta f = 1/T$:
+  </p>
+
+  $$s[n] = \sum_{k=0}^{N-1} X_k e^{j 2\pi \left(\frac{k}{T}\right) \left(\frac{n T}{N}\right)} = \sum_{k=0}^{N-1} X_k e^{j \frac{2\pi}{N} k n} = N \cdot \text{IDFT}\{X_k\}[n]$$
+
+  <p>
+    Similarly, at the receiver, sampling the arriving baseband signal $r[n]$ and evaluating the $N$-point <strong>Forward Discrete Fourier Transform (DFT)</strong> recovers the complex constellation symbols:
+  </p>
+
+  $$Y_k = \text{DFT}\{r[n]\}[k] = \frac{1}{N} \sum_{n=0}^{N-1} r[n] e^{-j \frac{2\pi}{N} k n}$$
+
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Subcarrier Count ($N$)</th>
+        <th>Naive Matrix DFT ($\mathcal{O}(N^2)$ MACs)</th>
+        <th>Cooley-Tukey FFT ($\mathcal{O}(N \log_2 N)$ MACs)</th>
+        <th>Compute Speedup</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>64 (802.11a/g)</td>
+        <td>4,096</td>
+        <td>384</td>
+        <td><strong>10.7&times;</strong></td>
+      </tr>
+      <tr>
+        <td>512 (802.11ac 80MHz)</td>
+        <td>262,144</td>
+        <td>4,608</td>
+        <td><strong>56.9&times;</strong></td>
+      </tr>
+      <tr>
+        <td>1024 (LTE 10MHz / FreeDV)</td>
+        <td>1,048,576</td>
+        <td>10,240</td>
+        <td><strong>102.4&times;</strong></td>
+      </tr>
+      <tr>
+        <td>2048 (LTE 20MHz / 5G NR)</td>
+        <td>4,194,304</td>
+        <td>22,528</td>
+        <td><strong>186.2&times;</strong></td>
+      </tr>
+      <tr>
+        <td>8192 (DVB-T 8K mode)</td>
+        <td>67,108,864</td>
+        <td>106,496</td>
+        <td><strong>630.1&times;</strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    The FFT algorithm transforms what would be an unmanageable compute wall into a lean DSP kernel easily handled by modern CPU SIMD units (AVX2, AVX-512, ARM NEON) or FPGA DSP slices.
+  </p>
+
+  <h2>4. The Cyclic Prefix (CP) Magic Trick: Linear to Circular Convolution</h2>
+
+  <p>
+    While the IFFT/FFT engine solves transmitter and receiver synthesis, it operates in a mathematical vacuum where the channel is an ideal wire. In reality, the physical RF multipath channel acts as a linear filter with impulse response $h[n] = [h_0, h_1, \dots, h_{L-1}]$.
+  </p>
+
+  <p>
+    The received discrete-time sequence is governed by <strong>linear convolution</strong>:
+  </p>
+
+  $$y[n] = (s * h)[n] = \sum_{\ell=0}^{L-1} h[\ell] s[n - \ell] + w[n]$$
+
+  <p>
+    This creates two fatal failure modes:
+  </p>
+  <ol>
+    <li><strong>Inter-Symbol Interference (ISI):</strong> Multipath reflections from OFDM symbol $m-1$ spill into the beginning of OFDM symbol $m$.</li>
+    <li><strong>Loss of Orthogonality:</strong> The Discrete Fourier Transform diagonalizes <em>circular</em> convolution, not <em>linear</em> convolution! Linear convolution breaks the periodicity of the subcarriers over the $N$-sample FFT window, destroying orthogonality and producing catastrophic <strong>Inter-Carrier Interference (ICI)</strong>.</li>
+  </ol>
+
+  <h3>The Cyclic Prefix Construction</h3>
+
+  <p>
+    To resolve both problems simultaneously, OFDM prepends a copy of the tail of the $N$-point IFFT symbol to its beginning. If the original time-domain symbol is:
+  </p>
+
+  $$\mathbf{s} = [s[0], s[1], \dots, s[N - N_{\text{cp}}], \dots, s[N-1]]$$
+
+  <p>
+    the transmitter prepends $N_{\text{cp}}$ samples from the end of the block:
+  </p>
+
+  $$\mathbf{s}_{\text{tx}} = [\underbrace{s[N - N_{\text{cp}}], \dots, s[N-1]}_{\text{Cyclic Prefix (Length } N_{\text{cp}}\text{)}}, \underbrace{s[0], s[1], \dots, s[N-1]}_{\text{Original Symbol (Length } N\text{)}}]$$
+
+  <p>
+    The total transmitted block length is $N_{\text{total}} = N + N_{\text{cp}}$.
+  </p>
+
+  <h3>The Mathematical Proof: Turning Linear Convolution into Circular Convolution</h3>
+
+  <p>
+    Assume the multipath channel delay spread $L$ is strictly less than or equal to the cyclic prefix length:
+  </p>
+
+  $$L \le N_{\text{cp}} \iff \tau_{\text{delay}} \le T_{\text{cp}}$$
+
+  <p>
+    At the receiver:
+  </p>
+  <ol>
+    <li>The multipath reflections of the <em>preceding</em> OFDM symbol fall entirely within the cyclic prefix window $[0, N_{\text{cp}} - 1]$.</li>
+    <li>The receiver outright <strong>discards the first $N_{\text{cp}}$ samples</strong> of the received block! This completely eliminates ISI from prior symbols.</li>
+    <li>Now observe the remaining $N$ samples, indexed as $n \in \{0, 1, \dots, N-1\}$. The received signal at index $n$ is:</li>
+  </ol>
+
+  $$r[n] = \sum_{\ell=0}^{L-1} h[\ell] s_{\text{tx}}[n + N_{\text{cp}} - \ell] + w[n]$$
+
+  <p>
+    Evaluate the index $k = n + N_{\text{cp}} - \ell$. For paths where $\ell \le n$, $k \ge N_{\text{cp}}$, which points to sample $s[n - \ell]$ of the current symbol. For paths where $\ell > n$, $k < N_{\text{cp}}$, which points into the cyclic prefix!
+  </p>
+  <p>
+    Because the cyclic prefix is an exact replica of the tail of the current symbol, $s_{\text{tx}}[k] = s[N + (n - \ell)]$. Combining both cases using modulo arithmetic:
+  </p>
+
+  $$s_{\text{tx}}[n + N_{\text{cp}} - \ell] = s[(n - \ell) \pmod N]$$
+
+  <p>
+    Therefore, the linear convolution over the discarded prefix window becomes <strong>strictly identical to circular convolution</strong> over the $N$-point observation interval:
+  </p>
+
+  $$r[n] = \sum_{\ell=0}^{L-1} h[\ell] s[(n - \ell) \pmod N] + w[n] = (s \circledast h)[n] + w[n]$$
+
+  <div class="callout upside">
+    <div class="callout-title">The Circular Convolution Theorem of the DFT</div>
+    <p>
+      By the circular convolution property of the Discrete Fourier Transform:
+    </p>
+    $$\text{DFT}\{s \circledast h\}[k] = \text{DFT}\{s\}[k] \cdot \text{DFT}\{h\}[k]$$
+    <p>
+      Taking the $N$-point DFT of the received samples $r[n]$ yields:
+    </p>
+    $$Y_k = H_k X_k + W_k, \quad k \in \{0, 1, \dots, N-1\}$$
+    <p>
+      where $H_k = \sum_{\ell=0}^{L-1} h[\ell] e^{-j \frac{2\pi}{N} k \ell}$ is the sampled <strong>Channel Frequency Response (CFR)</strong> at subcarrier $k$.
+    </p>
+  </div>
+
+  <p>
+    In matrix notation, the circular channel convolution matrix $\mathbf{C}_h$ is a <strong>circulant matrix</strong>. Circulant matrices are diagonalized by the DFT matrix $\mathbf{F}$:
+  </p>
+
+  $$\mathbf{H} = \mathbf{F} \mathbf{C}_h \mathbf{F}^H = \text{diag}(H_0, H_1, \dots, H_{N-1})$$
+
+  <p>
+    Because $\mathbf{H}$ is strictly diagonal, <strong>all off-diagonal terms are zero</strong>. This proves that whenever $\tau_{\text{delay}} \le T_{\text{cp}}$:
+  </p>
+  <ul>
+    <li>There is <strong>zero Inter-Symbol Interference (ISI)</strong> between consecutive OFDM symbols.</li>
+    <li>There is <strong>zero Inter-Carrier Interference (ICI)</strong> between adjacent subcarriers.</li>
+  </ul>
+
+  <h2>5. Frequency-Domain Equalization (FEQ): Zero-Forcing vs. MMSE</h2>
+
+  <p>
+    Because the channel matrix is diagonalized, the receiver can equalize all $N$ subcarriers with simple scalar operations, completely bypassing multi-dimensional matrix inversions.
+  </p>
+
+  $$\begin{bmatrix} Y_0 \\ Y_1 \\ \vdots \\ Y_{N-1} \end{bmatrix} = \begin{bmatrix} H_0 & 0 & \dots & 0 \\ 0 & H_1 & \dots & 0 \\ \vdots & \vdots & \ddots & \vdots \\ 0 & 0 & \dots & H_{N-1} \end{bmatrix} \begin{bmatrix} X_0 \\ X_1 \\ \vdots \\ X_{N-1} \end{bmatrix} + \begin{bmatrix} W_0 \\ W_1 \\ \vdots \\ W_{N-1} \end{bmatrix}$$
+
+  <h3>A. Zero-Forcing (ZF) Equalizer</h3>
+
+  <p>
+    The Zero-Forcing equalizer simply divides each received subcarrier by the estimated channel transfer coefficient $\hat{H}_k$:
+  </p>
+
+  $$\hat{X}_k^{\text{ZF}} = \frac{Y_k}{\hat{H}_k} = \frac{H_k X_k + W_k}{\hat{H}_k} \approx X_k + \frac{W_k}{H_k}$$
+
+  <p>
+    While computationally minimal (one complex division per subcarrier), ZF suffers from <strong>severe noise amplification</strong>:
+  </p>
+
+  $$\sigma_{\text{ZF}, k}^2 = \mathbb{E}\left[\left|\frac{W_k}{H_k}\right|^2\right] = \frac{\sigma_w^2}{|H_k|^2}$$
+
+  <p>
+    If subcarrier $k$ falls inside a multipath null where $|H_k| \to 0$, dividing by $H_k$ amplifies the receiver thermal noise toward infinity, destroying the demodulator's bit error rate.
+  </p>
+
+  <h3>B. Minimum Mean Square Error (MMSE) Equalizer</h3>
+
+  <p>
+    The MMSE equalizer minimizes the mean squared error $J(G_k) = \mathbb{E}[|X_k - G_k Y_k|^2]$. The optimal scalar tap weight $G_k^{\text{MMSE}}$ is derived from orthogonality principles:
+  </p>
+
+  $$G_k^{\text{MMSE}} = \frac{H_k^*}{|H_k|^2 + \frac{\sigma_w^2}{\sigma_x^2}} = \frac{H_k^*}{|H_k|^2 + \frac{1}{\text{SNR}_k}}$$
+
+  $$\hat{X}_k^{\text{MMSE}} = G_k^{\text{MMSE}} Y_k = \left( \frac{H_k^*}{|H_k|^2 + \frac{1}{\text{SNR}_k}} \right) Y_k$$
+
+  <div class="callout">
+    <div class="callout-title">MMSE Dual-Mode Behavior</div>
+    <ul>
+      <li><strong>High SNR ($|H_k|^2 \gg \frac{1}{\text{SNR}}$):</strong> The regularizer term $\frac{1}{\text{SNR}} \approx 0$, so $G_k \approx \frac{H_k^*}{|H_k|^2} = \frac{1}{H_k}$. It converges to Zero-Forcing, perfectly eliminating residual channel distortion.</li>
+      <li><strong>Deep Fade ($|H_k|^2 \ll \frac{1}{\text{SNR}}$):</strong> The denominator is dominated by $\frac{1}{\text{SNR}}$, yielding $G_k \approx \text{SNR} \cdot H_k^* \to 0$. Rather than boosting noise to infinity, the equalizer attenuates the faded subcarrier. Downstream Forward Error Correction (FEC) algorithms (e.g. Viterbi or LDPC decoders) treat these attenuated bins as low-reliability erasures.</li>
+    </ul>
+  </div>
+
+  <h2>6. Pilot Subcarriers &amp; Channel Estimation</h2>
+
+  <p>
+    To evaluate $G_k$, the receiver requires knowledge of $H_k$. In practical SDR systems, the channel is estimated using known <strong>pilot symbols</strong> multiplexed into the time-frequency grid.
+  </p>
+
+  <p>Three pilot topologies dominate modern OFDM protocols:</p>
+  <ul>
+    <li><strong>Block-Type Pilots:</strong> Dedicated preamble OFDM symbols where all $N$ subcarriers are known pilots (e.g., 802.11a/g Legacy Long Training Field). Ideal for slow-fading channels where the channel response remains stationary across an entire packet.</li>
+    <li><strong>Comb-Type Pilots:</strong> Specific subcarrier frequencies are dedicated as pilots across every OFDM symbol. Ideal for fast-fading Doppler channels with short coherence times.</li>
+    <li><strong>Scattered / Diamond Grids:</strong> Pilots are staggered across both time and frequency (e.g., LTE Downlink Reference Signals, DVB-T). This minimizes pilot overhead while sampling the channel above the 2D Nyquist sampling rate in both time and frequency.</li>
+  </ul>
+
+  <h3>Least-Squares (LS) Estimation</h3>
+
+  <p>
+    At a pilot subcarrier index $p \in \mathcal{P}$, where known training symbol $X_p$ was transmitted, the Least-Squares channel estimate is:
+  </p>
+
+  $$\hat{H}_p^{\text{LS}} = \frac{Y_p}{X_p} = \frac{H_p X_p + W_p}{X_p} = H_p + \frac{W_p}{X_p}$$
+
+  <p>
+    When pilot symbols are normalized to unit power ($|X_p|^2 = 1$, such as BPSK $\pm 1$), the division simplifies to conjugate multiplication:
+  </p>
+
+  $$\hat{H}_p^{\text{LS}} = Y_p \cdot X_p^*$$
+
+  <h3>Time-Frequency Interpolation</h3>
+
+  <p>
+    Once $\hat{H}_p$ is acquired at pilot locations, the channel transfer function across the intermediate data subcarriers is reconstructed via interpolation:
+  </p>
+  <ol>
+    <li><strong>Linear Interpolation:</strong> Fast, branchless, ideal for SIMD pipelining across subcarrier clusters:
+      $$\hat{H}_k = \hat{H}_{p_1} + \frac{k - p_1}{p_2 - p_1} \left( \hat{H}_{p_2} - \hat{H}_{p_1} \right), \quad p_1 \le k \le p_2$$
+    </li>
+    <li><strong>Transform-Domain Denoising (IDFT-Windowing):</strong> Compute the $N_p$-point IDFT of pilot channel estimates to transform into the delay domain. Because the channel impulse response length is bounded by $L \le N_{\text{cp}}$, all energy at delay taps $\ell > L$ is pure noise! Zeroing these taps and computing the forward FFT removes out-of-band noise, yielding an estimation gain of up to $10 \log_{10}(N / L)\text{ dB}$.</li>
+  </ol>
+
+  <h2>7. Carrier Frequency Offset (CFO) Sensitivity &amp; Schmidl-Cox Synchronization</h2>
+
+  <p>
+    OFDM's Achilles' heel is its acute sensitivity to <strong>Carrier Frequency Offset (CFO)</strong>. In a single-carrier system, a small uncorrected CFO merely causes constellation rotation (tracked by a Costas loop). In OFDM, a CFO destroys the orthogonality of the subcarrier sinc functions!
+  </p>
+
+  <p>
+    CFO arises from two physical mechanisms:
+  </p>
+  <ul>
+    <li><strong>Local Oscillator (LO) Mismatch:</strong> Inexpensive SDR crystals (e.g., RTL-SDR at $\pm 20\text{ ppm}$) operating at $f_c = 2.4\text{ GHz}$ generate frequency offsets of up to $\Delta f_{\text{CFO}} = \pm 48\text{ kHz}$. If subcarrier spacing is $\Delta f = 15\text{ kHz}$, the offset exceeds 3 entire subcarriers!</li>
+    <li><strong>Doppler Shift:</strong> Vehicle motion at speed $v$ induces Doppler shift $f_d = \frac{v}{c} f_c$. For high-speed rail or airborne telemetry, $f_d$ can reach several kilohertz.</li>
+  </ul>
+
+  <h3>Mathematical Breakdown of Inter-Carrier Interference (ICI)</h3>
+
+  <p>
+    Define the normalized CFO as $\epsilon = \frac{\Delta f_{\text{CFO}}}{\Delta f}$. If the received baseband signal suffers frequency error $\epsilon$, demodulating subcarrier $k$ yields:
+  </p>
+
+  $$Y_k = X_k \underbrace{\frac{\sin(\pi \epsilon)}{\pi \epsilon} e^{j \pi \epsilon \frac{N-1}{N}}}_{\text{Desired Subcarrier Attenuation \& Rotation}} + \sum_{\substack{m=0 \\ m \ne k}}^{N-1} X_m \underbrace{\frac{\sin(\pi(m - k + \epsilon))}{\pi(m - k + \epsilon)} e^{j \pi (m - k + \epsilon)\frac{N-1}{N}}}_{\text{Inter-Carrier Interference (ICI) Leakage}} + W_k$$
+
+  <div class="callout warning">
+    <div class="callout-title">Why CFO Destroys OFDM</div>
+    <p>
+      When $\epsilon = 0$, $\sin(\pi(m - k)) = 0$ for all $m \ne k$, and ICI is identically zero. But when $\epsilon \ne 0$, the spectral nulls shift away from the subcarrier sampling frequencies. Energy from <em>all other $N-1$ subcarriers</em> leaks directly into subcarrier $k$ as additive Gaussian-like interference!
+    </p>
+    <p>
+      The Signal-to-Interference Ratio (SIR) due to CFO is bounded approximately by:
+    </p>
+    $$\text{SIR}_{\text{CFO}} \approx \frac{10}{\pi^2 \epsilon^2} \quad \left(\text{or } \frac{3}{\pi^2 \epsilon^2} \text{ for worst-case QAM}\right)$$
+    <p>
+      Even a tiny 4% normalized offset ($\epsilon = 0.04$) restricts the maximum attainable SNR to under $22\text{ dB}$, rendering 64-QAM and 256-QAM unusable!
+    </p>
+  </div>
+
+  <h3>Schmidl-Cox Preamble Synchronization</h3>
+
+  <p>
+    To correct CFO <em>before</em> passing samples to the FFT, practical receivers use the <strong>Schmidl-Cox</strong> synchronization algorithm.
+  </p>
+
+  <p>
+    The transmitter prepends a preamble containing two identical halves in the time domain:
+  </p>
+
+  $$\mathbf{p} = [A, A]$$
+
+  <p>
+    where each half $A$ has length $L_s = N/2$ samples. In the frequency domain, this is synthesized simply by modulating only the <strong>even subcarriers</strong> and setting all odd subcarriers to zero ($X_{2k} \ne 0, X_{2k+1} = 0$).
+  </p>
+
+  <p>
+    The receiver slides a window across incoming samples $r[n]$ and computes two metrics:
+  </p>
+
+  $$\text{Cross-correlation:} \quad P(d) = \sum_{m=0}^{N/2 - 1} r^*(d + m) \, r\left(d + m + \frac{N}{2}\right)$$
+
+  $$\text{Energy normalization:} \quad R(d) = \sum_{m=0}^{N/2 - 1} \left| r\left(d + m + \frac{N}{2}\right) \right|^2$$
+
+  $$\text{Timing metric:} \quad M(d) = \frac{|P(d)|^2}{(R(d))^2}$$
+
+  <p>
+    $M(d)$ produces a sharp plateau of width $N_{\text{cp}}$ when the sliding window enters the preamble, pinpointing the exact OFDM frame boundary.
+  </p>
+
+  <p>
+    Crucially, at the peak timing location $d_{\text{opt}}$, the phase of $P(d)$ reflects the carrier rotation accumulated across the $N/2$ sample delay:
+  </p>
+
+  $$\angle P(d_{\text{opt}}) = 2\pi \Delta f_{\text{CFO}} \cdot \left( \frac{N/2}{f_s} \right) = \pi \frac{\Delta f_{\text{CFO}}}{\Delta f} = \pi \epsilon$$
+
+  <p>
+    Solving for the fractional CFO:
+  </p>
+
+  $$\hat{\epsilon}_{\text{frac}} = \frac{\angle P(d_{\text{opt}})}{\pi}, \quad \text{for } |\epsilon| < 1$$
+
+  <p>
+    The SDR receiver applies a digital numerically controlled oscillator (NCO) derotation $r_{\text{corr}}[n] = r[n] e^{-j 2\pi \hat{\Delta f} n / f_s}$ directly to the streaming buffer, neutralizing the frequency offset and completely restoring subcarrier orthogonality prior to the FFT.
+  </p>
+
+  <h2>8. Systems Architecture &amp; SIMD Implementation</h2>
+
+  <p>
+    Let us examine how an ultra-low-latency SDR engine in Zig/C implements the time-critical Frequency-Domain Equalizer (FEQ) and Schmidl-Cox correlation.
+  </p>
+
+  <h3>SIMD-Vectorized MMSE Equalization Kernel</h3>
+
+  <p>
+    Because subcarriers are decoupled, the MMSE tap weight multiplication is an embarrassingly parallel operation. Using packed complex floating-point numbers ($I_0, Q_0, I_1, Q_1, \dots$), 8-wide AVX2 registers process 4 complex subcarriers per cycle:
+  </p>
+
+  <pre><code>// zig-do-not-run
+const std = @import("std");
+
+/// Interleaved complex float: [I, Q]
+pub const Complex = struct {
+    re: f32,
+    im: f32,
+};
+
+/// SIMD-vectorized MMSE Frequency-Domain Equalizer
+/// Computes: X_hat[k] = Y[k] * G[k]
+/// where G[k] = conj(H[k]) / (|H[k]|^2 + 1/SNR)
+pub fn mmse_equalize_vectorized(
+    y: []const Complex,
+    h: []const Complex,
+    snr_linear: f32,
+    out_x: []Complex,
+) void {
+    std.debug.assert(y.len == h.len and y.len == out_x.len);
+    const n = y.len;
+    const inv_snr = 1.0 / snr_linear;
+
+    var i: usize = 0;
+    // Process 4 subcarriers per SIMD chunk (8 f32 lanes)
+    while (i + 4 &lt;= n) : (i += 4) {
+        inline for (0..4) |offset| {
+            const idx = i + offset;
+            const y_k = y[idx];
+            const h_k = h[idx];
+
+            const h_mag_sq = (h_k.re * h_k.re) + (h_k.im * h_k.im);
+            const denom = h_mag_sq + inv_snr;
+            const inv_denom = 1.0 / denom;
+
+            // G[k] = conj(H[k]) / denom
+            const g_re = h_k.re * inv_denom;
+            const g_im = -h_k.im * inv_denom;
+
+            // Complex multiply: Y[k] * G[k]
+            // (y_re + j y_im) * (g_re + j g_im) = (y_re*g_re - y_im*g_im) + j(y_re*g_im + y_im*g_re)
+            out_x[idx] = Complex{
+                .re = (y_k.re * g_re) - (y_k.im * g_im),
+                .im = (y_k.re * g_im) + (y_k.im * g_re),
+            };
+        }
+    }
+
+    // Scalar tail loop
+    while (i &lt; n) : (i += 1) {
+        const y_k = y[i];
+        const h_k = h[i];
+        const denom = (h_k.re * h_k.re) + (h_k.im * h_k.im) + inv_snr;
+        const inv_denom = 1.0 / denom;
+        const g_re = h_k.re * inv_denom;
+        const g_im = -h_k.im * inv_denom;
+
+        out_x[i] = Complex{
+            .re = (y_k.re * g_re) - (y_k.im * g_im),
+            .im = (y_k.re * g_im) + (y_k.im * g_re),
+        };
+    }
+}</code></pre>
+
+  <h3>Zero-Copy Cyclic Prefix Ring Buffer Mechanics</h3>
+
+  <p>
+    In high-throughput pipeline architectures like <code>SdrScout</code>'s GenStage stages, generating or stripping the cyclic prefix must never invoke a heap allocation or synchronous <code>memcpy</code>:
+  </p>
+  <ul>
+    <li><strong>Transmitter:</strong> An $N_{\text{total}}$-sized buffer is allocated once. The $N$-point IFFT is calculated directly into indices $[N_{\text{cp}}, N_{\text{total}} - 1]$. A single SIMD copy or circular pointer wraps the last $N_{\text{cp}}$ samples into $[0, N_{\text{cp}} - 1]$.</li>
+    <li><strong>Receiver:</strong> Upon frame synchronization, the DMA receiver simply offsets the read pointer by $N_{\text{cp}}$ samples, passing the slice directly to the FFT input buffer as a zero-copy pointer slice.</li>
+  </ul>
+
+  <!-- Interactive Quizzes -->
+  <div class="quiz-container" id="quiz-31-1">
+    <div class="quiz-question">
+      1. In an OFDM physical layer, what is the exact mathematical relationship required between subcarrier tone spacing $\Delta f$ and the active symbol integration interval $T_{\text{sym}}$ (excluding the cyclic prefix) to ensure zero inter-carrier interference?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="true">
+        $\Delta f = 1 / T_{\text{sym}}$, guaranteeing that the spectral sinc nulls of every subcarrier fall exactly at the center frequencies of all other subcarriers.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        $\Delta f = 2 / T_{\text{sym}}$, providing a 100% guard band between adjacent subcarriers to prevent analog filter phase distortion and passband ripple.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        $\Delta f = 1 / (2 T_{\text{sym}})$, matching the Nyquist minimum quadrature sampling rate across the entire baseband analog-to-digital converter.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        $\Delta f = 1 / T_{\text{cp}}$, ensuring that multipath echoes decay within the cyclic prefix duration before the discrete Fourier transform window starts.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> Subcarrier orthogonality requires $\int_0^T e^{j 2\pi (k - m)\Delta f t} dt = 0$ for all integer $k \ne m$. Evaluating this integral produces a numerator of $(e^{j 2\pi (k - m)\Delta f T} - 1)$, which vanishes for all integer steps if and only if $\Delta f \cdot T = 1$, or $\Delta f = 1/T_{\text{sym}}$. In the frequency domain, this places the zero crossings of each subcarrier's sinc spectrum precisely at the sampling centers of all other subcarriers.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-31-2">
+    <div class="quiz-question">
+      2. Why does prepending a cyclic prefix of duration $T_{\text{cp}} > \tau_{\text{delay}}$ convert a frequency-selective multipath channel into decoupled scalar subcarrier gains?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="true">
+        It forces the discrete linear convolution of the channel impulse response to match a circular convolution over the $N$-point observation window.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It generates an artificial harmonic tone that allows the receiver phase-locked loop to track local oscillator drift without pilot subcarriers.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It doubles the energy of the transmitted complex baseband waveform, raising the signal-to-noise ratio above the channel delay spread threshold.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It causes multipath reflections to cancel out destructively in the radio frequency domain before arriving at the receiver antenna feedpoint.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> Physical channels perform linear convolution. When the cyclic prefix ($T_{\text{cp}} \ge \tau_{\text{delay}}$) is discarded at the receiver, the remaining $N$ samples appear periodic, transforming linear channel convolution into discrete circular convolution. Because circulant matrices are strictly diagonalized by the Discrete Fourier Transform matrix ($\mathbf{H} = \mathbf{F} \mathbf{C}_h \mathbf{F}^H$), the channel becomes diagonal in the frequency domain, eliminating both ISI and ICI.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-31-3">
+    <div class="quiz-question">
+      3. In an OFDM receiver, what is the primary consequence of an uncorrected fractional carrier frequency offset (CFO) of $\epsilon = \Delta f_{\text{CFO}} / \Delta f = 0.15$?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="true">
+        Subcarrier orthogonality is destroyed, causing severe inter-carrier interference (ICI) energy leakage from all tones into each demodulated subcarrier.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The cyclic prefix correlation metric inverts sign, causing the frame detector to misidentify packet boundaries as out-of-band Gaussian noise bursts.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The time-domain envelope power fluctuations double, driving the receiver low-noise amplifier and front-end mixer into severe third-order saturation.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The channel impulse response expands beyond the cyclic prefix window, causing adjacent OFDM blocks to induce catastrophic inter-symbol interference.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> A non-zero carrier frequency offset shifts the receiver's evaluation points away from the subcarrier spectral nulls. The sinc function of every subcarrier evaluates to a non-zero value at the sampling frequencies of all other subcarriers, creating widespread inter-carrier interference (ICI) that acts as an irreducible noise floor ($\text{SIR} \approx 10 / (\pi^2 \epsilon^2)$).
+    </div>
+  </div>
+
+  <h2>Summary &amp; Architecture Checklist</h2>
+
+  <ol>
+    <li><strong>Multipath Mitigation:</strong> OFDM divides a wideband frequency-selective channel of bandwidth $B$ into $N$ parallel flat-fading subchannels of bandwidth $\Delta f = B/N$, replacing complex matrix inversion with scalar division.</li>
+    <li><strong>Orthogonality Criterion:</strong> Exact subcarrier orthogonality is achieved when $\Delta f = 1/T_{\text{sym}}$, aligning subcarrier center frequencies with the spectral sinc nulls of all neighboring carriers.</li>
+    <li><strong>IDFT / DFT Duality:</strong> Subcarrier multiplexing and demultiplexing map directly to the IFFT and FFT algorithms, slashing computation from $\mathcal{O}(N^2)$ to $\mathcal{O}(N \log_2 N)$.</li>
+    <li><strong>Cyclic Prefix Invariant:</strong> Prepending $N_{\text{cp}} \ge L$ samples transforms linear multipath convolution into circular convolution, yielding a strictly diagonal channel matrix with zero ISI and zero ICI.</li>
+    <li><strong>MMSE Equalization:</strong> Weighting by $G_k = H_k^* / (|H_k|^2 + \text{SNR}^{-1})$ prevents the catastrophic noise amplification of Zero-Forcing equalizers during deep channel fades.</li>
+    <li><strong>CFO Synchronization:</strong> Carrier frequency offsets destroy orthogonality and induce severe ICI; Schmidl-Cox preambles with repeated time-domain halves $[A, A]$ detect packet timing and estimate fractional CFO prior to the FFT.</li>
+  </ol>
+
+  <div class="footer">
+    <span>Have questions on FFT vector widths, pilot interpolation, or cyclic prefix overhead? Ask your tutor agent!</span>
+    <span><a href="0023-fsk-afsk-demodulation-and-quadrature-discriminators.html">&larr; Lesson 0023</a> | Lesson 0031</span>
+  </div>
+</body>
+</html>

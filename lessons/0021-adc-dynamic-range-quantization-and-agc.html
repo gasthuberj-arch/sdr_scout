@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 21: ADC Dynamic Range, Quantization Noise, and Automatic Gain Control (AGC)</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = {
+      tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] }
+    };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0021</span>
+    <span class="badge badge-arch">RF Front-End &amp; DSP</span>
+    <span>Reading time: 12 minutes</span>
+  </div>
+
+  <h1>ADC Dynamic Range, Quantization Noise, &amp; AGC</h1>
+
+  <p>
+    In software-defined radio, the boundary between the continuous physical universe and discrete numerical algorithms is defined by the <strong>Analog-to-Digital Converter (ADC)</strong>. While computational engineers often treat digitizers as ideal mathematical samplers that map voltages directly into floating-point arrays, physical ADCs introduce strict fundamental limits: quantization noise, clipping boundaries, and finite dynamic range.
+  </p>
+
+  <p>
+    When operating an SDR on crowded amateur radio bands, these physics dictate whether you decode a distant station or see your entire receiver blinded by a nearby transmitter. In this lesson, we derive the mathematical foundations of quantization noise, evaluate real-world SDR hardware architectures, analyze the amateur radio <em>Near-Far Problem</em>, demonstrate processing gain through oversampling, and build robust digital Automatic Gain Control (AGC) feedback loops.
+  </p>
+
+  <h2>1. Physics of Analog-to-Digital Conversion</h2>
+
+  <p>
+    An ADC maps a continuous voltage $v(t) \in [-V_{\text{ref}}/2, +V_{\text{ref}}/2]$ onto one of $2^B$ discrete integer quantization levels, where $B$ represents the converter's bit depth. The resolution between adjacent levels—known as the <strong>quantization step size</strong> or Least Significant Bit ($\text{LSB}$)—is given by:
+  </p>
+
+  $$\Delta = \frac{V_{\text{ref}}}{2^B}$$
+
+  <p>
+    When an analog voltage $v$ is quantized to the nearest discrete code $v_q$, it incurs a <strong>quantization error</strong> $e$:
+  </p>
+
+  $$e = v - v_q, \quad \text{where } -\frac{\Delta}{2} \le e \le \frac{\Delta}{2}$$
+
+  <p>
+    Under Bennett's classical quantization conditions (the input signal spans many quantization intervals, varies rapidly, and does not synchronize harmonically with the sampling clock $f_s$), the error $e$ is modeled as a stationary, zero-mean white random process uniformly distributed over $[-\Delta/2, +\Delta/2]$:
+  </p>
+
+  $$p(e) = \begin{cases} \frac{1}{\Delta}, & -\frac{\Delta}{2} \le e \le \frac{\Delta}{2} \\ 0, & \text{otherwise} \end{cases}$$
+
+  <p>
+    Because $\mathbb{E}[e] = 0$, the quantization noise variance (mean noise power dissipated across a normalized $1\,\Omega$ load) is derived directly by integrating the second moment:
+  </p>
+
+  $$\sigma_q^2 = \mathbb{E}[e^2] = \int_{-\Delta/2}^{\Delta/2} e^2 \, p(e) \, de = \frac{1}{\Delta} \left[ \frac{e^3}{3} \right]_{-\Delta/2}^{\Delta/2} = \frac{1}{\Delta} \left( \frac{\Delta^3}{24} - \left(-\frac{\Delta^3}{24}\right) \right) = \frac{\Delta^2}{12}$$
+
+  <div class="callout">
+    <div class="callout-title">Physical Intuition: Quantization Noise is Irreversible Power</div>
+    <p>
+      Quantization noise is not electrical thermal noise ($k_B T B$); it is an irrecoverable loss of information caused by rounding infinite-precision analog states into finite integer states. Once converted, $\sigma_q^2 = \Delta^2 / 12$ acts as an irreducible additive white noise floor across the entire Nyquist band.
+    </p>
+  </div>
+
+  <h2>2. Theoretical Signal-to-Quantization-Noise Ratio (SQNR)</h2>
+
+  <p>
+    What is the maximum theoretical dynamic range achievable by a $B$-bit ADC? Consider a full-scale pure sinusoidal input signal that exercises the converter's full dynamic span without clipping:
+  </p>
+
+  $$v(t) = \frac{V_{\text{ref}}}{2} \sin(2\pi f t)$$
+
+  <p>
+    The mean signal power $P_{\text{signal}}$ of this sinusoid across a $1\,\Omega$ load is:
+  </p>
+
+  $$P_{\text{signal}} = \frac{1}{T} \int_0^T v^2(t)\,dt = \frac{1}{2}\left(\frac{V_{\text{ref}}}{2}\right)^2 = \frac{V_{\text{ref}}^2}{8}$$
+
+  <p>
+    Expressing $V_{\text{ref}}$ in terms of the quantization step size $\Delta = V_{\text{ref}} / 2^B$, we obtain $V_{\text{ref}} = \Delta \cdot 2^B$. Substituting this into our power equation:
+  </p>
+
+  $$P_{\text{signal}} = \frac{(\Delta \cdot 2^B)^2}{8} = \frac{\Delta^2 \cdot 2^{2B}}{8}$$
+
+  <p>
+    The <strong>Signal-to-Quantization-Noise Ratio (SQNR)</strong> is the ratio of full-scale signal power to quantization noise variance:
+  </p>
+
+  $$\text{SQNR} = \frac{P_{\text{signal}}}{\sigma_q^2} = \frac{\frac{\Delta^2 \cdot 2^{2B}}{8}}{\frac{\Delta^2}{12}} = \frac{12}{8} \cdot 2^{2B} = 1.5 \cdot 2^{2B}$$
+
+  <p>
+    Converting to decibels yields the cornerstone rule of digital signal acquisition:
+  </p>
+
+  $$\text{SQNR}_{\text{dB}} = 10 \log_{10}(1.5 \cdot 2^{2B}) = 10 \log_{10}(1.5) + 20 B \log_{10}(2)$$
+
+  $$\text{SQNR}_{\text{dB}} \approx 1.76 + 6.02 B \text{ dB}$$
+
+  <div class="callout upside">
+    <div class="callout-title">The 6.02 dB per Bit Axiom</div>
+    <p>
+      Every single bit added to an ADC's resolution adds a factor of 4 in power dynamic range ($20 \log_{10}(2) \approx 6.02\text{ dB}$). An 8-bit converter offers roughly $50\text{ dB}$ of instantaneous dynamic range, while a 16-bit converter provides over $98\text{ dB}$.
+    </p>
+  </div>
+
+  <h2>3. The Hardware Spectrum: Real-World SDR Architectures</h2>
+
+  <p>
+    In practical SDR front-ends, ADCs fall into distinct architectural tiers governed by manufacturing cost, thermal dissipation, sampling rate, and interface bandwidth.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Device Tier</th>
+        <th>Representative Hardware</th>
+        <th>ADC Bit Depth ($B$)</th>
+        <th>Theoretical SQNR</th>
+        <th>Typical Real ENOB</th>
+        <th>RF Architecture &amp; Common Uses</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Budget Entry</strong></td>
+        <td>RTL-SDR (RTL2832U), HackRF One (MAX5864)</td>
+        <td>8-bit</td>
+        <td>$\approx 49.9\text{ dB}$</td>
+        <td>$\approx 7.0 - 7.4\text{ bits}$</td>
+        <td>DVB-T / Wideband zero-IF. Excellent for high-SNR packet decodes (ADS-B, local FM, AIS), but quickly blinded by out-of-band signals.</td>
+      </tr>
+      <tr>
+        <td><strong>Intermediate</strong></td>
+        <td>Airspy R2, SDRplay RSPdx, LimeSDR</td>
+        <td>12-bit / 14-bit</td>
+        <td>$\approx 74 - 86\text{ dB}$</td>
+        <td>$\approx 10.5 - 12.2\text{ bits}$</td>
+        <td>Low-IF / polyphase downconversion. Clean front-end tracking filters; handles amateur VHF/UHF repeater traffic and moderate HF DXing.</td>
+      </tr>
+      <tr>
+        <td><strong>High-End / Direct HF</strong></td>
+        <td>Ettus USRP X310, Hermes-Lite 2, Icom IC-7300</td>
+        <td>14-bit / 16-bit</td>
+        <td>$\approx 86 - 98\text{ dB}$</td>
+        <td>$\approx 13.0 - 14.8\text{ bits}$</td>
+        <td>Direct RF sampling (no analog mixers). Extreme linearity, high IP3; simultaneously ingests entire HF bands without intermodulation wash.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Notice that the <strong>Effective Number of Bits (ENOB)</strong> in real hardware is always lower than the nominal physical bit depth $B$. Internal clock jitter (phase noise), analog non-linearities (causing harmonic distortion), and thermal aperture noise degrade practical performance according to:
+  </p>
+
+  $$\text{ENOB} = \frac{\text{SINAD}_{\text{dB}} - 1.76}{6.02}$$
+
+  <p>
+    where $\text{SINAD}$ is the Signal-to-Noise-and-Distortion ratio.
+  </p>
+
+  <h2>4. The Near-Far Problem in Amateur Radio</h2>
+
+  <p>
+    To understand why dynamic range is the paramount metric in RF engineering, consider a standard amateur radio operating scenario on the 2-meter band ($144\text{ MHz}$).
+  </p>
+
+  <p>
+    Suppose you are using an 8-bit RTL-SDR dongle to decode a weak 2-meter SSB or digital transmission arriving from 80 km away. The weak signal arrives at your antenna terminal at $-120\text{ dBm}$ (approximately $0.224\ \mu\text{V}_{\text{RMS}}$ into $50\ \Omega$).
+  </p>
+
+  <p>
+    Simultaneously, a local amateur operator living 400 meters away keys up a 100-Watt transmitter ($+50\text{ dBm}$) on $144.400\text{ MHz}$, only $200\text{ kHz}$ above your target channel.
+  </p>
+
+  <div class="callout warning">
+    <div class="callout-title">The Blinding Arithmetic of Free-Space Path Loss</div>
+    <p>
+      Using the free-space path loss formula $\text{FSPL} = 20 \log_{10}(d) + 20 \log_{10}(f) - 147.55$, the 400-meter path loss at $144\text{ MHz}$ is approximately $67.7\text{ dB}$. Assuming $3\text{ dBi}$ antenna gains on both ends:
+    </p>
+    $$P_{\text{blocker}} \approx +50\text{ dBm} - 67.7\text{ dB} + 6\text{ dB} = -11.7\text{ dBm} \quad (\approx 58\text{ mV}_{\text{RMS}})$$
+    <p>
+      The received power differential between the blocker and the desired DX signal is:
+    </p>
+    $$\Delta P = (-11.7\text{ dBm}) - (-120\text{ dBm}) = 108.3\text{ dB}$$
+  </div>
+
+  <p>
+    Now observe the irreconcilable dilemma forced onto an 8-bit SDR with only $48\text{ dB}$ of usable instantaneous dynamic range:
+  </p>
+
+  <ol>
+    <li>
+      <strong>Case A: Increasing LNA Gain to Digitize the Weak Signal.</strong> If you increase front-end analog gain so that the $-120\text{ dBm}$ signal rises comfortably above the ADC's bottom quantization bit ($1\text{ LSB}$), the $-11.7\text{ dBm}$ blocker will demand hundreds of volts beyond $V_{\text{ref}}$. The ADC rails violently into hard saturation. The resulting clipped square-wave harmonics fold back across the Nyquist spectrum, generating massive intermodulation products ($\text{IMD3}$) that obliterate the entire $2\text{ MHz}$ receiver window.
+    </li>
+    <li>
+      <strong>Case B: Decreasing LNA Gain to Prevent ADC Clipping.</strong> If you apply front-end attenuation so the $-11.7\text{ dBm}$ blocker peaks just below full-scale ($0\text{ dBFS}$), the $-120\text{ dBm}$ weak signal falls $108\text{ dB}$ below full-scale. Because the 8-bit converter's noise floor sits at $-49.9\text{ dBFS}$, the weak signal is $58\text{ dB}$ below the smallest quantization step $\Delta$. Its peak-to-peak swing does not cross even a single ADC code boundary. It simply vanishes into digital silence.
+    </li>
+  </ol>
+
+  <p>
+    In contrast, a 16-bit direct-sampling SDR ($98\text{ dB}$ instantaneous dynamic range) combined with modest oversampling easily retains both signals simultaneously, allowing downstream DSP digital FIR filters to cleanly isolate the weak signal without clipping.
+  </p>
+
+  <h2>5. Processing Gain through Oversampling &amp; Decimation</h2>
+
+  <p>
+    Can we extract higher effective resolution from a low-bit ADC? <strong>Yes, through oversampling and decimation.</strong>
+  </p>
+
+  <p>
+    The total quantization noise power $\sigma_q^2 = \Delta^2 / 12$ does not concentrate at a single frequency; it spreads uniformly across the entire Nyquist bandwidth from $-f_s / 2$ to $+f_s / 2$. The two-sided Power Spectral Density (PSD) of quantization noise is therefore:
+  </p>
+
+  $$S_q(f) = \frac{\sigma_q^2}{f_s} = \frac{\Delta^2}{12 f_s} \quad \left[\frac{\text{W}}{\text{Hz}}\right]$$
+
+  <p>
+    If our target signal occupies a narrow channel bandwidth $B_{\text{signal}} \ll f_s$, we can sample at the full rate $f_s$, pass the digitized stream through a sharp digital low-pass FIR filter with cutoff $B_{\text{signal}}$, and decimate the sample rate down to the Nyquist rate of the channel ($2 B_{\text{signal}}$ for real signals, or $B_{\text{signal}}$ for complex $I/Q$ baseband).
+  </p>
+
+  <p>
+    The digital filter discards all out-of-band quantization noise. The noise power remaining inside the signal channel is:
+  </p>
+
+  $$P_{n,\text{in-band}} = \int_{-B_{\text{signal}}}^{B_{\text{signal}}} S_q(f)\,df = \frac{\sigma_q^2}{f_s} \cdot 2 B_{\text{signal}} = \sigma_q^2 \left( \frac{2 B_{\text{signal}}}{f_s} \right)$$
+
+  <p>
+    The improvement in signal-to-noise ratio—the <strong>Processing Gain</strong>—is the ratio of total noise power to filtered in-band noise power:
+  </p>
+
+  $$\text{Gain}_{\text{proc}} = \frac{\sigma_q^2}{P_{n,\text{in-band}}} = \frac{f_s}{2 B_{\text{signal}}}$$
+
+  $$\Delta\text{SNR}_{\text{dB}} = 10 \log_{10}\left(\frac{f_s}{2 B_{\text{signal}}}\right)$$
+
+  <h3>Effective Number of Bits (ENOB) Gain</h3>
+
+  <p>
+    Since each extra bit of resolution corresponds to $6.02\text{ dB}$ of dynamic range, the effective bit gain $\Delta B$ is:
+  </p>
+
+  $$\Delta B = \frac{10 \log_{10}(f_s / 2 B_{\text{signal}})}{20 \log_{10}(2)} = \frac{1}{2} \log_2\left(\frac{f_s}{2 B_{\text{signal}}}\right)$$
+
+  <div class="callout upside">
+    <div class="callout-title">The Factor-of-4 Rule</div>
+    <p>
+      For every factor of $4$ oversampling ($f_s \to 4 f_s$), in-band quantization noise drops by $10 \log_{10}(4) \approx 6.02\text{ dB}$, yielding <strong>exactly $+1$ extra bit of effective resolution</strong> ($\text{ENOB}$). Oversampling an 8-bit stream by a factor of 64 ($\text{OSR} = 64 = 4^3$) yields $+3$ bits of resolution, turning an 8-bit converter into an effective 11-bit converter!
+    </p>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">The Dithering Requirement</div>
+    <p>
+      Oversampling gain assumes the quantization error $e[n]$ is decorrelated white noise. If a weak signal is smaller than $1\text{ LSB}$ and static (e.g., a pure DC or slow CW tone), the ADC output gets stuck on a single code, generating zero transitions regardless of sample rate.
+    </p>
+    <p>
+      To restore decorrelation, SDR front-ends inject <strong>dither</strong>: wideband analog Gaussian noise with amplitude $\approx 0.5 - 1\text{ LSB}$ prior to the ADC. Dithering breaks deterministic limit cycles, homogenizes the error spectrum, and allows oversampling and averaging to resolve signals buried deep beneath the LSB step.
+    </p>
+  </div>
+
+  <h2>6. Digital Automatic Gain Control (AGC) Loops</h2>
+
+  <p>
+    Because real-world RF signals span more than $100\text{ dB}$ of dynamic variance while downstream demodulators (e.g., PSK constellation slicers, FM discriminators) require a stable, predictable signal envelope, software receivers employ <strong>Automatic Gain Control (AGC)</strong>.
+  </p>
+
+  <p>
+    An SDR AGC dynamically adjusts an amplifier gain $G[n]$ to drive the output signal envelope $y[n] = G[n] \cdot x[n]$ toward an established target setpoint $V_{\text{target}}$.
+  </p>
+
+  <h3>Envelope Detection: Peak vs. RMS Power</h3>
+
+  <p>
+    The first design choice in an AGC feedback loop is the signal envelope detector:
+  </p>
+
+  <ul>
+    <li>
+      <strong>Peak Envelope Detector:</strong> Measures the instantaneous sample magnitude $v_{\text{env}}[n] = \sqrt{I^2[n] + Q^2[n]}$ or its fast approximation $\max(|I|, |Q|) + 0.375 \min(|I|, |Q|)$. It reacts instantly to single-sample peaks, making it essential for protecting fixed-point pipelines and detecting rapid pulse preambles (such as ADS-B Mode-S or Wi-Fi).
+    </li>
+    <li>
+      <strong>RMS / Mean-Square Power Detector:</strong> Averages power across a sliding window: $P_{\text{avg}}[n] = (1 - \lambda) P_{\text{avg}}[n-1] + \lambda (I^2[n] + Q^2[n])$. It ignores isolated impulsive static spikes and tracks true modulation energy, making it ideal for continuous modes (SSB voice, AM broadcast, FT8, PSK31).
+    </li>
+  </ul>
+
+  <h3>Attack Time vs. Decay Time Asymmetry</h3>
+
+  <p>
+    In radio communications, AGC loops must never be symmetric. If gain adjustments responded identically to rising and falling signals, speech pauses or modulation dips would cause the receiver to violently crank up gain, amplifying background receiver noise into loud bursts (an artifact known as <strong>noise pumping</strong>).
+  </p>
+
+  <p>
+    A robust AGC utilizes <strong>dual time constants</strong>:
+  </p>
+
+  <ul>
+    <li>
+      <strong>Attack Time ($\tau_{\text{attack}} \approx 0.5 - 5\text{ ms}$):</strong> Activated when the incoming signal suddenly surges ($v_{\text{env}} > V_{\text{target}}$). The gain must drop almost instantaneously to prevent downstream integer overflow, digital clipping, and loudspeaker popping.
+    </li>
+    <li>
+      <strong>Decay Time ($\tau_{\text{decay}} \approx 200 - 1000\text{ ms}$):</strong> Activated when the signal envelope drops below setpoint. Gain recovers slowly and smoothly, preserving speech cadence and fading dynamics.
+    </li>
+  </ul>
+
+  <h3>Avoiding Gain-Hunting Oscillations</h3>
+
+  <p>
+    Without careful loop damping, an AGC loop will hunt and oscillate around the setpoint:
+  </p>
+
+  <ol>
+    <li>
+      <strong>Logarithmic (dB) Loop Control:</strong> Linear gain feedback $\Delta G \propto (V_{\text{target}} - v_{\text{env}})$ exhibits non-linear loop gain because the output varies as $G \cdot x$. Implementing the loop in the logarithmic decibel domain ($\Delta G_{\text{dB}} = \alpha \cdot (\text{Setpoint}_{\text{dB}} - P_{\text{meas, dB}})$) linearizes the feedback system, guaranteeing uniform damping regardless of absolute signal amplitude.
+    </li>
+    <li>
+      <strong>Hysteresis Deadband:</strong> If the measured power sits within a narrow error window $\pm \epsilon$ around $V_{\text{target}}$, gain adjustment is frozen ($\Delta G = 0$). This eliminates quantization jitter and limit-cycle hunting during steady tones.
+    </li>
+    <li>
+      <strong>Hang Time:</strong> When an incoming signal ceases, a counter holds gain constant for a configurable interval (e.g., $100\text{ ms}$) before initiating decay. This prevents noise pumping during inter-syllable pauses in SSB phone.
+    </li>
+  </ol>
+
+  <h2>7. High-Performance AGC Implementation in C/Rust</h2>
+
+  <p>
+    Below is a production-grade single-channel digital AGC suitable for embedded DSP pipelines. It operates in the decibel domain with an envelope detector, asymmetric attack/decay coefficients, hysteresis, and output clipping protection:
+  </p>
+
+  <pre><code>// agc.h: Single-pole log-domain AGC with hang timer and hysteresis
+#include &lt;math.h&gt;
+#include &lt;stdbool.h&gt;
+
+typedef struct {
+    float target_dbfs;      // Desired output level (e.g. -12.0 dBFS)
+    float gain_db;          // Current loop gain in dB
+    float min_gain_db;      // Minimum gain limit (e.g. -20.0 dB)
+    float max_gain_db;      // Maximum gain limit (e.g. +60.0 dB)
+    float attack_alpha;     // Fast coefficient (e.g. 0.05 per sample)
+    float decay_alpha;      // Slow coefficient (e.g. 0.0001 per sample)
+    float hysteresis_db;    // Deadband threshold (e.g. 0.5 dB)
+    int   hang_samples;     // Samples to hold before decay begins
+    int   hang_counter;     // Current hang state countdown
+} AgcState;
+
+void agc_process_block(AgcState* agc, const float* in_i, const float* in_q,
+                       float* out_i, float* out_q, int n_samples) {
+    for (int i = 0; i &lt; n_samples; i++) {
+        // 1. Calculate linear envelope magnitude: sqrt(I^2 + Q^2)
+        float mag = sqrtf(in_i[i] * in_i[i] + in_q[i] * in_q[i]) + 1e-12f;
+        
+        // 2. Compute current sample output power in dBFS with existing gain
+        float lin_gain = powf(10.0f, agc-&gt;gain_db / 20.0f);
+        float out_mag = mag * lin_gain;
+        float out_dbfs = 20.0f * log10f(out_mag);
+        
+        // 3. Error against target setpoint
+        float error_db = agc-&gt;target_dbfs - out_dbfs;
+        
+        // 4. Asymmetric feedback with hysteresis deadband
+        if (fabsf(error_db) &gt; agc-&gt;hysteresis_db) {
+            if (error_db &lt; 0.0f) {
+                // Signal exceeds setpoint: rapid attack to prevent saturation
+                agc-&gt;gain_db += agc-&gt;attack_alpha * error_db;
+                agc-&gt;hang_counter = agc-&gt;hang_samples; // Reset hang timer
+            } else {
+                // Signal below setpoint: check hang timer before decay recovery
+                if (agc-&gt;hang_counter &gt; 0) {
+                    agc-&gt;hang_counter--;
+                } else {
+                    agc-&gt;gain_db += agc-&gt;decay_alpha * error_db;
+                }
+            }
+        }
+        
+        // 5. Clamp gain to physical hardware limits
+        if (agc-&gt;gain_db &gt; agc-&gt;max_gain_db) agc-&gt;gain_db = agc-&gt;max_gain_db;
+        if (agc-&gt;gain_db &lt; agc-&gt;min_gain_db) agc-&gt;gain_db = agc-&gt;min_gain_db;
+        
+        // 6. Apply calibrated gain to output stream
+        float applied_gain = powf(10.0f, agc-&gt;gain_db / 20.0f);
+        out_i[i] = in_i[i] * applied_gain;
+        out_q[i] = in_q[i] * applied_gain;
+    }
+}</code></pre>
+
+  <h2>Checking Your Understanding</h2>
+
+  <div class="quiz-container" id="quiz-21-1">
+    <div class="quiz-question">
+      1. An engineer samples a 10 kHz amateur CW signal using an 8-bit ADC clocked at 2.56 MSPS. After passing the digital stream through a 10 kHz bandpass FIR filter and decimating down to the Nyquist rate, what is the theoretical processing gain and resulting effective resolution?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The system achieves exactly 12 dB of processing gain, elevating the effective converter resolution by 2.0 bits.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The system achieves approximately 21 dB of processing gain, elevating the effective converter resolution by 3.5 bits.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The system achieves exactly 36 dB of processing gain, elevating the effective converter resolution by 6.0 bits.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The system achieves no processing gain because decimation preserves original quantization noise variance.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> The oversampling ratio is $\text{OSR} = f_s / (2 B) = 2{,}560{,}000 / (2 \times 10{,}000) = 128$. The processing gain is $10 \log_{10}(128) \approx 21.07\text{ dB}$. Dividing by $6.02\text{ dB/bit}$ gives an effective resolution gain of $\Delta B = 21.07 / 6.02 \approx 3.5\text{ bits}$, elevating the 8-bit stream to an effective 11.5 bits of resolution!
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-21-2">
+    <div class="quiz-question">
+      2. In the Amateur Radio Near-Far Problem, why does connecting an unattenuated 8-bit SDR to a rooftop antenna often prevent decoding a distant microvolt station when a nearby repeater transmits?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The transmitter carrier consumes excessive USB bus bandwidth, causing kernel queue packet drops.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The strong blocker forces attenuation that places the weak signal below the ADC quantization step.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The incoming electromagnetic field de-tunes the local oscillator crystal via capacitive dielectric loading.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The complex baseband polyphase Hilbert transform flips negative frequencies during envelope detection.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> An 8-bit ADC provides only ~48–50 dB of instantaneous dynamic range. If the front-end gain is backed off to keep a high-power local blocker from clipping the ADC, a weak microvolt signal arrives at an amplitude far smaller than the least significant bit ($\Delta$), disappearing entirely into quantization noise.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-21-3">
+    <div class="quiz-question">
+      3. Why do digital AGC loops in voice and digital radio receivers maintain an attack time constant that is orders of magnitude faster than their decay time constant?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Fast attack reduces local oscillator phase noise while slow decay keeps CPU cache registers hot.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Symmetric time constants cause infinite recursion within digital IIR feedback calculation threads.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Fast attack prevents digital saturation during bursts while slow decay avoids speech noise pumping.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Slow decay linearizes phase response while fast attack stabilizes the decimation polyphase filter.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> A rapid attack time (microseconds to low milliseconds) prevents sudden high-amplitude signals from clipping downstream buffers or creating acoustic distortion. A slow decay time (hundreds of milliseconds) prevents the AGC from ramping gain to maximum during natural pauses in speech or between symbols, which would otherwise amplify background thermal noise into loud hiss ("noise pumping").
+    </div>
+  </div>
+
+  <h2>Follow-up &amp; Next Steps</h2>
+  <p>
+    You now understand the mathematical and physical tradeoffs governing ADC quantization noise, real-world hardware limits, oversampling processing gains, and digital AGC loop stabilization.
+  </p>
+  <p>
+    Review our architectural breakdown in <a href="../reference/sdr-architecture-comparison.html">SDR Architecture Comparison</a> and domain definitions in <a href="../GLOSSARY.md">GLOSSARY.md</a>. When you are ready, continue exploring SIMD-vectorized decimation pipelines and polyphase channelizers!
+  </p>
+
+  <div class="footer">
+    <span>Questions on dynamic range, dithering math, or AGC loop filters? Ask your tutor agent!</span>
+    <span><a href="0013-zigler-in-sdr-architecture.html">&larr; Lesson 0013</a> | Lesson 0021</span>
+  </div>
+</body>
+</html>

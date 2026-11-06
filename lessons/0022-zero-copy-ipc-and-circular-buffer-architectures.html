@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 22: Zero-Copy IPC &amp; Circular Buffer Architectures — Page-Table Tricks vs. Erlang Refc Memory</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0022</span>
+    <span class="badge badge-arch">Systems &amp; DSP Architecture</span>
+    <span>Reading time: 15 minutes</span>
+  </div>
+
+  <h1>Zero-Copy IPC &amp; Circular Buffer Architectures: Page-Table Tricks vs. Erlang Refc Memory</h1>
+
+  <p>
+    In high-throughput Software-Defined Radio (SDR) engineering, memory bandwidth and cache locality dominate system performance. When sampling an RF spectrum at rates from $2.4\ \text{MSPS}$ (a modest RTL-SDR) up to $100\ \text{MSPS}$ (a dual-channel Ettus USRP X310 over 10-Gigabit Ethernet), raw complex baseband I/Q data arrives at rates between $4.8\ \text{MB/s}$ and $800\ \text{MB/s}$.
+  </p>
+  <p>
+    If your software pipeline copies each sample multiple times between kernel space, inter-process communication (IPC) queues, actor message mailboxes, and DSP compute kernels, memory bus contention quickly saturates the CPU memory controllers, induces cache eviction storms, and causes packet drops.
+  </p>
+  <p>
+    This lesson dissects the systems engineering mechanics of circular streaming buffers. We will contrast the classical <strong>GNU Radio double-<code>mmap</code> virtual memory trick</strong> (used in C++ flowgraphs) against the <strong>Erlang BEAM reference-counted binary model paired with native Zig tail buffers</strong> (used in <code>SdrScout</code>), examining page tables, MMU hardware translation, SIMD vector loads, and CPU cache-line alignment.
+  </p>
+
+  <h2>1. The Streaming Buffer Dilemma in Real-Time DSP</h2>
+
+  <p>
+    Why can't an SDR pipeline simply divide incoming sample streams into isolated, independent blocks and process them independently? The answer lies in the mathematical formulation of core DSP primitives:
+  </p>
+
+  <h3>A. Finite Impulse Response (FIR) Filtering</h3>
+  <p>
+    A discrete-time causal FIR filter computes output $y[n]$ as the linear convolution of input sequence $x[n]$ with an $M$-tap filter impulse response $h[k]$:
+  </p>
+  <p>
+    $$y[n] = (x * h)[n] = \sum_{k=0}^{M-1} h[k] \, x[n - k]$$
+  </p>
+  <p>
+    Notice the index term $x[n - k]$. To compute the very first output sample $y[0]$ of a freshly arrived buffer, the algorithm requires $x[-1], x[-2], \dots, x[-(M-1)]$—the final $M-1$ history samples from the <em>previous</em> buffer. Without contiguous access to these historical samples, convolution breaks across chunk boundaries.
+  </p>
+
+  <h3>B. Matched Filtering and Preamble Correlation</h3>
+  <p>
+    In digital communications and radar (e.g., Mode-S ADS-B preambles, FT8 synchronization sequences, or Barker codes), a receiver continuously evaluates the cross-correlation $R_{xp}[n]$ between incoming baseband samples $x[n]$ and a known reference pattern $p[k]$ of length $L$:
+  </p>
+  <p>
+    $$R_{xp}[n] = \sum_{k=0}^{L-1} p[k] \, x[n + k]$$
+  </p>
+  <p>
+    If an RF burst begins near the tail of chunk $N$ (for instance, at sample index $N_{\text{chunk}} - 10$), its remaining samples reside in chunk $N+1$. An isolated per-chunk processor will fail to detect the preamble because the pulse pattern is sliced in two.
+  </p>
+
+  <h3>C. Fast Fourier Transforms (FFT) and Overlap-Save</h3>
+  <p>
+    In polyphase channelizers and frequency-domain filtering, circular convolution via the Discrete Fourier Transform (DFT) is converted to linear convolution using the <strong>Overlap-Save</strong> or <strong>Overlap-Add</strong> algorithms. An $N_{\text{FFT}}$-point FFT requires an overlap of $M-1$ samples between successive blocks to discard time-aliased edge samples:
+  </p>
+  <p>
+    $$L_{\text{valid}} = N_{\text{FFT}} - M + 1$$
+  </p>
+  <p>
+    Every one of these fundamental DSP operations imposes the same strict hardware requirement: <strong>the vector compute engine must be supplied with a physically contiguous slice of memory containing the historical overlap followed immediately by the new samples.</strong>
+  </p>
+
+  <h2>2. Traditional Ring Buffers and the SIMD Vectorization Breakage</h2>
+
+  <p>
+    The classic computer science solution for streaming data is a FIFO circular ring buffer. A fixed-size array of length $N$ is accessed via modulo pointer arithmetic:
+  </p>
+  <pre><code>sample = ring_buffer[index % N];</code></pre>
+  <p>
+    When $N$ is constrained to a power of two ($N = 2^k$), the expensive integer division instruction (<code>div</code> / <code>idiv</code> taking 12–25 CPU cycles) is replaced with a single-cycle bitwise AND mask:
+  </p>
+  <pre><code>sample = ring_buffer[index & (N - 1)];</code></pre>
+
+  <p>
+    While masking is fast for scalar loops, it completely breaks down when modern vector processing instructions (AVX2, AVX-512, ARM NEON, or Zig <code>@Vector</code>) are introduced.
+  </p>
+
+  <div class="callout warning">
+    <div class="callout-title">The SIMD Boundary Wall</div>
+    <p>
+      An AVX2 vector load instruction (e.g., <code>vmovups</code> or <code>_mm256_loadu_ps</code>) reads <strong>256 bits (32 contiguous bytes, or 8 single-precision floats)</strong> in a single clock cycle. It expects those 32 bytes to reside sequentially in the virtual address space.
+    </p>
+    <p>
+      If your read pointer sits at index $N - 4$ of an $N$-element buffer, a contiguous 8-float load requires elements:
+    </p>
+    <p style="text-align:center; font-family:monospace;">
+      [ x[N-4], x[N-3], x[N-2], x[N-1], <strong>x[N], x[N+1], x[N+2], x[N+3]</strong> ]
+    </p>
+    <p>
+      In a normal ring buffer, memory past $x[N-1]$ either belongs to another heap variable or is completely unmapped! If unmapped, the CPU triggers a <strong>Page Fault (SIGSEGV)</strong>. If mapped to other memory, the CPU silently ingests garbage data into the DSP pipeline.
+    </p>
+  </div>
+
+  <p>
+    Engineers attempting to vectorise traditional ring buffers face three unsatisfactory workarounds:
+  </p>
+  <ul>
+    <li><strong>SIMD Gather Instructions (<code>_mm256_i32gather_ps</code>):</strong> The CPU fetches each element using independent address translations. Gather instructions have high latency (12–20 cycles) and consume memory controller bandwidth, erasing SIMD speedups.</li>
+    <li><strong>Scalar Loop Fallbacks:</strong> Splitting the loop into three sections: a vectorized prefix, a scalar boundary-wrap handler, and a vectorized suffix. This bloats code size, generates branch misprediction penalties, and complicates filter tap pipelines.</li>
+    <li><strong>Intermediate Buffer Copying:</strong> Copying the wrap-around data into a linear temporary scratchpad before computing. This burns precious memory bandwidth on redundant memory writes.</li>
+  </ul>
+
+  <h2>3. The GNU Radio `vm_circbuf` Double-mmap Trick</h2>
+
+  <p>
+    GNU Radio solved this problem at the operating system and silicon level with an ingenious virtual memory architecture known as <code>vm_circbuf</code>.
+  </p>
+  <p>
+    Instead of performing modulo arithmetic in software, <code>vm_circbuf</code> offloads the circular wrap to the CPU's hardware <strong>Memory Management Unit (MMU)</strong> and page tables.
+  </p>
+
+  <h3>How Hardware Page Tables Work</h3>
+  <p>
+    Modern CPUs execute code using <em>virtual addresses</em>. The MMU translates every virtual address into a physical address using a hierarchy of multi-level page tables (PML4/PML5 on x86-64). The operating system controls the translation mappings by populating Page Table Entries (PTEs).
+  </p>
+  <p>
+    Crucially, <strong>multiple distinct virtual addresses can point to the exact same physical memory frame.</strong>
+  </p>
+
+  <center>
+    <svg viewBox="0 0 780 290" width="100%" height="290" style="background:#1e1e2e; border-radius:8px; font-family:monospace; margin:20px 0;">
+      <!-- Title -->
+      <text x="20" y="28" fill="#cdd6f4" font-size="14" font-weight="bold">GNU Radio vm_circbuf: Virtual vs. Physical Memory Mapping</text>
+
+      <!-- Virtual Address Space Container -->
+      <rect x="30" y="50" width="720" height="75" fill="#181825" stroke="#45475a" stroke-width="1.5" rx="6"/>
+      <text x="40" y="70" fill="#a6adc8" font-size="12">Virtual Address Space (Contiguous 2B Range: 0x7FFF0000 -> 0x7FFF2000)</text>
+
+      <!-- Virtual Mirror 1 -->
+      <rect x="50" y="80" width="330" height="36" fill="#313244" stroke="#89b4fa" stroke-width="2" rx="4"/>
+      <text x="120" y="103" fill="#89b4fa" font-weight="bold" font-size="13">Virtual Mirror 1 [0 .. B-1]</text>
+
+      <!-- Virtual Mirror 2 -->
+      <rect x="400" y="80" width="330" height="36" fill="#313244" stroke="#a6e3a1" stroke-width="2" rx="4"/>
+      <text x="470" y="103" fill="#a6e3a1" font-weight="bold" font-size="13">Virtual Mirror 2 [B .. 2B-1]</text>
+
+      <!-- Vector Load Indicator straddling the boundary -->
+      <rect x="330" y="75" width="140" height="46" fill="none" stroke="#f38ba8" stroke-width="2.5" stroke-dasharray="4,4" rx="4"/>
+      <text x="340" y="68" fill="#f38ba8" font-size="11" font-weight="bold">256-bit SIMD Load</text>
+
+      <!-- Arrows from Virtual to Physical -->
+      <!-- Left side arrows -->
+      <path d="M 120 116 L 220 180" stroke="#89b4fa" stroke-width="2" marker-end="url(#arrow)" fill="none"/>
+      <path d="M 300 116 L 350 180" stroke="#89b4fa" stroke-width="2" fill="none"/>
+
+      <!-- Right side arrows pointing to SAME physical -->
+      <path d="M 480 116 L 270 180" stroke="#a6e3a1" stroke-width="2" fill="none"/>
+      <path d="M 650 116 L 410 180" stroke="#a6e3a1" stroke-width="2" fill="none"/>
+
+      <!-- Physical Memory Frame Container -->
+      <rect x="180" y="180" width="380" height="65" fill="#181825" stroke="#fab387" stroke-width="2" rx="6"/>
+      <text x="195" y="202" fill="#fab387" font-weight="bold" font-size="12">Physical RAM (Single Allocation of Size B = 4096 bytes)</text>
+
+      <!-- Physical frames -->
+      <rect x="200" y="210" width="80" height="25" fill="#45475a" stroke="#fab387" stroke-width="1" rx="2"/>
+      <text x="215" y="227" fill="#cdd6f4" font-size="11">Page 0</text>
+      <rect x="290" y="210" width="80" height="25" fill="#45475a" stroke="#fab387" stroke-width="1" rx="2"/>
+      <text x="305" y="227" fill="#cdd6f4" font-size="11">Page 1</text>
+      <text x="385" y="227" fill="#cdd6f4" font-size="12">...</text>
+      <rect x="420" y="210" width="120" height="25" fill="#45475a" stroke="#fab387" stroke-width="1" rx="2"/>
+      <text x="435" y="227" fill="#cdd6f4" font-size="11">Page (B/4096)-1</text>
+
+      <!-- Explanation note -->
+      <text x="70" y="272" fill="#cdd6f4" font-size="11.5">Reading Virtual Mirror 2 automatically accesses Page 0 at the hardware MMU level with 0 copy overhead.</text>
+    </svg>
+  </center>
+
+  <h3>The Step-by-Step OS Implementation</h3>
+  <p>
+    To create a hardware-wrapped circular buffer of size $B$ (where $B$ is an integer multiple of the OS page size, typically $4096$ bytes), GNU Radio executes the following POSIX system call sequence:
+  </p>
+
+  <ol>
+    <li>
+      <strong>Create an anonymous shared memory file descriptor:</strong>
+      <pre><code>int fd = memfd_create("circbuf", MFD_CLOEXEC);
+// or on older POSIX systems:
+// int fd = shm_open("/circbuf_123", O_RDWR | O_CREAT | O_EXCL, 0600);
+ftruncate(fd, B);</code></pre>
+      This allocates physical backing store for exactly $B$ bytes in kernel shared memory.
+    </li>
+    <li>
+      <strong>Reserve an unbroken contiguous virtual address space of size $2B$:</strong>
+      <pre><code>void *addr = mmap(NULL, 2 * B, PROT_NONE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);</code></pre>
+      The process obtains a continuous virtual window from address $A$ to $A + 2B$ without allocating physical RAM (<code>PROT_NONE</code>).
+    </li>
+    <li>
+      <strong>Map the physical buffer into the first half $[A, A + B)$:</strong>
+      <pre><code>mmap(addr, B, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);</code></pre>
+    </li>
+    <li>
+      <strong>Map the exact same physical buffer into the second half $[A + B, A + 2B)$:</strong>
+      <pre><code>mmap((char *)addr + B, B, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);</code></pre>
+    </li>
+    <li>
+      <strong>Close the file descriptor:</strong>
+      <pre><code>close(fd);</code></pre>
+      The mapping remains valid until unmapped.
+    </li>
+  </ol>
+
+  <h3>The Architectural Payoff</h3>
+  <p>
+    Consider what happens when a DSP algorithm running AVX2 instructions processes data near the end of the buffer:
+  </p>
+  <ul>
+    <li>The read pointer is at index $B - 4$.</li>
+    <li>The SIMD kernel issues a 32-byte load instruction: <code>_mm256_loadu_ps((float*)(addr + B - 4))</code>.</li>
+    <li>The first 4 floats (16 bytes) are read from the tail of Virtual Mirror 1 ($[B-4 .. B-1]$).</li>
+    <li>The remaining 4 floats (16 bytes) are read from the head of Virtual Mirror 2 ($[B .. B+3]$).</li>
+    <li>Because the MMU maps virtual page $[A + B .. A + B + 4096]$ to the exact same physical frame as $[A .. A + 4096]$, <strong>the hardware MMU fetches the first 4 samples of the physical buffer automatically.</strong></li>
+  </ul>
+  <p>
+    There are zero branch instructions, zero modulo operations, zero temporary buffer copies, and zero scalar loops. As long as no single SIMD kernel access spans more than $B$ contiguous bytes, the pointer can advance linearly through the buffer indefinitely!
+  </p>
+
+  <h2>4. The Architectural Tradeoff on the BEAM</h2>
+
+  <p>
+    If the double-<code>mmap</code> trick is so elegant, why doesn't every high-performance language—including Elixir and the Erlang VM (BEAM)—use it for all I/Q streaming buffers?
+  </p>
+
+  <p>
+    To understand this, we must inspect the Erlang Run-Time System (ERTS) memory model:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Binary Type</th>
+        <th>Size Threshold</th>
+        <th>Allocation Location</th>
+        <th>Lifecycle &amp; GC Mechanics</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Heap Binary</strong></td>
+        <td>$\le 64$ bytes</td>
+        <td>Private process heap</td>
+        <td>Copied between processes on message passing; collected during generational process GC.</td>
+      </tr>
+      <tr>
+        <td><strong>Refc (Reference-Counted) Binary</strong></td>
+        <td>$&gt; 64$ bytes</td>
+        <td>Global off-heap ERTS slab memory</td>
+        <td>Shared globally across all processes; processes only pass a 24-byte <code>ProcBin</code> pointer. Reclaimed when atomic refcount drops to 0.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Why Double-mmap Cannot Safely Wrap BEAM Process Heaps</h3>
+  <p>
+    Attempting to apply double-<code>mmap</code> directly to BEAM managed memory creates insurmountable architectural collisions:
+  </p>
+  <ol>
+    <li>
+      <strong>Slab Allocator Incompatibility:</strong> ERTS manages off-heap memory through custom multicarrier allocators (<code>erts_mseg</code> and <code>sys_alloc</code>). Arbitrary Refc binaries are sub-allocated inside shared memory supercarriers. They are not guaranteed to begin on an OS $4096$-byte page boundary, nor are their lengths page-aligned.
+    </li>
+    <li>
+      <strong>Catastrophic Page Table Clashing:</strong> Calling <code>mmap</code> with <code>MAP_FIXED</code> over memory belonging to the BEAM process heap would clobber Erlang memory tags, corrupt the Cheney copying garbage collector pointers, and cause immediate VM panics.
+    </li>
+    <li>
+      <strong>Violation of Immutability and Shared-Nothing Semantics:</strong> In OTP, Erlang terms are fundamentally immutable. A double-<code>mmap</code> buffer creates an aliased, mutable memory region where writing to address $V_2$ mutates address $V_1$. If this memory were exposed to Elixir processes, it would violate the referential transparency and actor isolation that makes the BEAM fault-tolerant.
+    </li>
+    <li>
+      <strong>Virtual Memory Allocation Limits:</strong> Operating systems enforce limits on the number of distinct memory mappings per process (e.g., Linux <code>vm.max_map_count</code>, typically defaulting to 65,530). In an SDR cluster running thousands of concurrent channelizers or detector actors, creating two VMAs per channel would exhaust kernel descriptor tables.
+    </li>
+  </ol>
+
+  <h2>5. The SdrScout Tail-Buffer Hybrid Architecture</h2>
+
+  <p>
+    In <a href="file:///home/johannes/code/sdr_scout/lib/sdr_scout/native/dsp.ex"><code>lib/sdr_scout/native/dsp.ex</code></a>, <code>SdrScout</code> resolves this dilemma with a hybrid architecture:
+  </p>
+  <ul>
+    <li><strong>Elixir / GenStage</strong> moves <strong>64 KB Refc Binaries</strong> with zero copying.</li>
+    <li><strong>Zig NIFs</strong> maintain a lightweight <strong>480-byte persistent overlap buffer</strong> inside an Erlang Resource (<code>beam.Resource</code>).</li>
+  </ul>
+
+  <center>
+    <svg viewBox="0 0 780 240" width="100%" height="240" style="background:#1e1e2e; border-radius:8px; font-family:monospace; margin:20px 0;">
+      <!-- Title -->
+      <text x="20" y="26" fill="#cdd6f4" font-size="13.5" font-weight="bold">SdrScout Tail-Buffer Hybrid Architecture</text>
+
+      <!-- Step 1: BEAM Refc Binary -->
+      <rect x="30" y="45" width="220" height="70" fill="#181825" stroke="#89b4fa" stroke-width="1.5" rx="5"/>
+      <text x="45" y="68" fill="#89b4fa" font-weight="bold" font-size="12">BEAM Refc Binary</text>
+      <text x="45" y="88" fill="#cdd6f4" font-size="11">Incoming Chunk N (65,536 B)</text>
+      <text x="45" y="104" fill="#a6adc8" font-size="10">Zero-copy pointer passing via []const u8</text>
+
+      <!-- Step 2: DspContext Resource -->
+      <rect x="290" y="45" width="200" height="70" fill="#181825" stroke="#f38ba8" stroke-width="1.5" rx="5"/>
+      <text x="305" y="68" fill="#f38ba8" font-weight="bold" font-size="12">DspContext (beam.Resource)</text>
+      <text x="305" y="88" fill="#cdd6f4" font-size="11">Tail Buffer: 480 Bytes</text>
+      <text x="305" y="104" fill="#a6adc8" font-size="10">(Last 240 I/Q samples of Chunk N-1)</text>
+
+      <!-- Stitched Linear Stream -->
+      <rect x="30" y="145" width="720" height="70" fill="#181825" stroke="#a6e3a1" stroke-width="2" rx="5"/>
+      <text x="45" y="168" fill="#a6e3a1" font-weight="bold" font-size="12">Contiguous Native Working Buffer (66,016 Bytes Total)</text>
+
+      <!-- Tail slice -->
+      <rect x="45" y="178" width="80" height="26" fill="#f38ba8" rx="3"/>
+      <text x="50" y="195" fill="#11111b" font-weight="bold" font-size="10.5">Tail (480 B)</text>
+
+      <!-- New Chunk slice -->
+      <rect x="130" y="178" width="480" height="26" fill="#89b4fa" rx="3"/>
+      <text x="280" y="195" fill="#11111b" font-weight="bold" font-size="11">New Chunk N Data (65,536 Bytes)</text>
+
+      <!-- Saved tail for next chunk -->
+      <rect x="615" y="178" width="125" height="26" fill="#fab387" rx="3"/>
+      <text x="625" y="195" fill="#11111b" font-weight="bold" font-size="10.5">Save Next Tail (480 B)</text>
+
+      <!-- Arrow down to context -->
+      <path d="M 680 178 C 680 130, 480 130, 470 120" stroke="#fab387" stroke-width="2" stroke-dasharray="3,3" fill="none"/>
+    </svg>
+  </center>
+
+  <h3>How the Tail-Buffer Mechanics Work</h3>
+  <p>
+    Let's trace how <code>SdrScout.Native.Dsp.process_chunk/2</code> operates:
+  </p>
+
+  <ol>
+    <li>
+      <strong>Zero-Copy Delivery:</strong> The RTL-SDR driver delivers raw bytes into an off-heap Refc binary. Elixir's GenStage pipeline routes the binary reference to the DSP worker. When calling into Zig, ERTS passes the raw memory address as a native Zig slice:
+      <pre><code>pub fn process_chunk(res: DspContext, chunk: []const u8) beam.term</code></pre>
+      No memory allocation or data copying takes place to cross the language boundary.
+    </li>
+    <li>
+      <strong>Linear Stitching:</strong> The NIF allocates a local stack/arena working buffer of size $\text{total\_bytes} = 480 + \text{chunk.len}$. It copies the 480 bytes stored from chunk $N-1$ into the head, followed by the 65,536 bytes of chunk $N$.
+    </li>
+    <li>
+      <strong>Uninterrupted SIMD Processing:</strong> The native Zig code executes <code>@Vector(16, f32)</code> AVX2/NEON instructions across the entire 66,016-byte buffer in a tight linear loop. There are no boundary checks or branches inside the inner loop.
+    </li>
+    <li>
+      <strong>Tail Preservation:</strong> Before returning, the NIF copies the final 480 bytes of chunk $N$ into the persistent <code>DspContext.overlap_buf</code> struct:
+      <pre><code>const save_start = total_bytes - 480;
+@memcpy(ctx.overlap_buf[0..480], iq_buf[save_start..total_bytes]);
+ctx.overlap_len = 480;</code></pre>
+    </li>
+  </ol>
+
+  <h3>Quantitative Overhead Analysis</h3>
+  <p>
+    What is the cost of copying 480 bytes per chunk compared to page-table double-<code>mmap</code>?
+  </p>
+  <p>
+    $$\text{Memory Overhead} = \frac{480\ \text{bytes}}{65,536\ \text{bytes}} \approx 0.00732 = \mathbf{0.73\%}$$
+  </p>
+  <p>
+    On a modern x86-64 or ARM Cortex-A72 CPU, copying 480 bytes (less than eight 64-byte cache lines) using L1 cache prefetching takes approximately <strong>12 to 18 nanoseconds</strong>.
+  </p>
+  <p>
+    In contrast, calling <code>mmap</code> and <code>munmap</code> incurs operating system kernel context switches, Translation Lookaside Buffer (TLB) shootdown inter-processor interrupts (IPIs), and page-table lock contention taking <strong>2,000 to 5,000 nanoseconds</strong>.
+  </p>
+  <div class="callout upside">
+    <div class="callout-title">The Engineering Verdict</div>
+    <p>
+      For fixed chunk-based pipelines, copying a small sub-kilobyte tail buffer inside native memory is orders of magnitude faster and vastly more memory-safe than invoking OS virtual memory system calls, while completely maintaining BEAM crash isolation and actor supervision!
+    </p>
+  </div>
+
+  <h2>6. CPU Cache Lines, False Sharing, and Cache-Coherent DMA</h2>
+
+  <p>
+    Whether you design a page-table circular buffer or a tail-buffer pipeline, real-time performance at tens of megasamples per second requires strict alignment to the CPU's memory hierarchy.
+  </p>
+
+  <h3>A. 64-Byte Cache Line Granularity</h3>
+  <p>
+    CPUs do not read or write individual bytes from system DRAM; they access memory in <strong>64-byte chunks called cache lines</strong>.
+  </p>
+  <p>
+    If an I/Q sample structure or circular buffer header is not aligned to a 64-byte boundary, a single SIMD vector instruction can span across two separate cache lines. This triggers a <strong>split-cache-line penalty</strong>, requiring two distinct L1 cache access cycles and stalling the execution pipeline.
+  </p>
+
+  <h3>B. False Sharing in SPSC Ring Buffers</h3>
+  <p>
+    In multi-threaded C/Rust pipelines or native lock-free queues connecting hardware drivers to processing threads, developers commonly use a <strong>Single-Producer Single-Consumer (SPSC)</strong> ring buffer.
+  </p>
+  <p>
+    An SPSC queue maintains two atomic tracking indices:
+  </p>
+  <ul>
+    <li><code>head</code> (or <code>write_ptr</code>): Updated exclusively by the producer thread (e.g., USB DMA interrupt).</li>
+    <li><code>tail</code> (or <code>read_ptr</code>): Updated exclusively by the consumer thread (e.g., DSP worker).</li>
+  </ul>
+
+  <p>
+    Consider this seemingly innocent struct declaration:
+  </p>
+  <pre><code>// NAIVE LAYOUT: Triggers devastating false sharing!
+struct SpscQueue {
+    head: usize, // 8 bytes
+    tail: usize, // 8 bytes
+    // ...
+};</code></pre>
+
+  <p>
+    Because both <code>head</code> and <code>tail</code> occupy adjacent 8-byte slots, they reside on the <strong>exact same 64-byte cache line</strong>!
+  </p>
+
+  <center>
+    <svg viewBox="0 0 780 160" width="100%" height="160" style="background:#1e1e2e; border-radius:8px; font-family:monospace; margin:20px 0;">
+      <!-- Title -->
+      <text x="20" y="24" fill="#cdd6f4" font-size="13" font-weight="bold">Cache Line Contention: False Sharing vs. 64-Byte Padding</text>
+
+      <!-- Unaligned line -->
+      <rect x="30" y="42" width="340" height="42" fill="#313244" stroke="#f38ba8" stroke-width="2" rx="4"/>
+      <rect x="35" y="47" width="70" height="32" fill="#f38ba8" rx="3"/>
+      <text x="45" y="67" fill="#11111b" font-weight="bold" font-size="11">head (8B)</text>
+      <rect x="115" y="47" width="70" height="32" fill="#89b4fa" rx="3"/>
+      <text x="125" y="67" fill="#11111b" font-weight="bold" font-size="11">tail (8B)</text>
+      <text x="195" y="67" fill="#a6adc8" font-size="11">Remaining 48 Bytes of Cache Line</text>
+      <text x="35" y="102" fill="#f38ba8" font-size="11">False Sharing: Cores ping-pong MESI cache line!</text>
+
+      <!-- Aligned line -->
+      <rect x="410" y="42" width="160" height="42" fill="#313244" stroke="#a6e3a1" stroke-width="2" rx="4"/>
+      <rect x="415" y="47" width="70" height="32" fill="#a6e3a1" rx="3"/>
+      <text x="425" y="67" fill="#11111b" font-weight="bold" font-size="11">head (8B)</text>
+      <text x="495" y="67" fill="#a6adc8" font-size="10">Pad (56B)</text>
+
+      <rect x="590" y="42" width="160" height="42" fill="#313244" stroke="#a6e3a1" stroke-width="2" rx="4"/>
+      <rect x="595" y="47" width="70" height="32" fill="#a6e3a1" rx="3"/>
+      <text x="605" y="67" fill="#11111b" font-weight="bold" font-size="11">tail (8B)</text>
+      <text x="675" y="67" fill="#a6adc8" font-size="10">Pad (56B)</text>
+      <text x="415" y="102" fill="#a6e3a1" font-size="11">Clean Separation: Dedicated 64B cache lines per core.</text>
+    </svg>
+  </center>
+
+  <p>
+    Under the <strong>MESI (Modified, Exclusive, Shared, Invalid)</strong> hardware cache coherence protocol:
+  </p>
+  <ol>
+    <li>Core 0 writes to <code>head</code>, marking the entire 64-byte cache line as <em>Modified (M)</em>.</li>
+    <li>Hardware bus snooping automatically forces Core 1's copy of that line into the <em>Invalid (I)</em> state.</li>
+    <li>When Core 1 reads or updates <code>tail</code>, it suffers a full L1/L2 cache miss. It must issue a bus request to flush Core 0's cache line to L3 or DRAM.</li>
+    <li>This cache line "ping-pongs" between cores across the interconnect on every single sample chunk, reducing queue throughput by up to <strong>90%</strong>!</li>
+  </ol>
+  <p>
+    The solution is explicit 64-byte alignment and padding:
+  </p>
+  <pre><code>pub const SpscQueue = struct {
+    head: usize align(64),
+    // Explicit padding guarantees tail occupies a separate cache line
+    tail: usize align(64),
+};</code></pre>
+
+  <h3>C. Cache-Coherent Direct Memory Access (DMA)</h3>
+  <p>
+    When hardware SDRs (e.g., RTL-SDR via USB 2.0/3.0, or USRP via PCIe/Gigabit Ethernet) capture radio samples, the onboard hardware DMA controller writes data directly into host physical RAM without CPU intervention.
+  </p>
+  <p>
+    Modern architectures maintain cache coherency via hardware interconnect snooping (PCIe Root Complex on x86, or CoreLink CCI/CCIX on ARM). However, if an SDR driver initiates DMA into an unaligned memory address:
+  </p>
+  <ul>
+    <li>The start or end of the DMA transfer shares a cache line with adjacent kernel or user variables.</li>
+    <li>If the CPU writes to an adjacent variable while the hardware DMA controller is simultaneously writing radio bytes to that same cache line, a <strong>cache-line tearing corruption</strong> occurs: either the CPU's write is discarded or incoming RF samples are permanently overwritten!</li>
+  </ul>
+  <p>
+    For this reason, high-speed SDR drivers always allocate page-aligned DMA ring buffers (using <code>posix_memalign</code> or Linux <code>dma_alloc_coherent</code>) to ensure clean separation at both the 64-byte cache line and 4096-byte MMU page levels.
+  </p>
+
+  <h2>7. Architectural Comparison Matrix</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Design Pattern</th>
+        <th>Contiguous SIMD</th>
+        <th>Memory Overhead</th>
+        <th>BEAM / GC Safety</th>
+        <th>Context Switch / OS Overhead</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Modulo Ring Buffer</strong></td>
+        <td>No (breaks at buffer end)</td>
+        <td>Zero (in-place)</td>
+        <td>High (pure Erlang or C)</td>
+        <td>None (pure user-space arithmetic)</td>
+      </tr>
+      <tr>
+        <td><strong>GNU Radio <code>vm_circbuf</code></strong></td>
+        <td>Yes (hardware MMU wrapping)</td>
+        <td>Doubled virtual space ($2B$)</td>
+        <td>Fatal (breaks BEAM heaps and slab allocators)</td>
+        <td>High at setup (2 <code>mmap</code> + 1 <code>ftruncate</code> syscalls)</td>
+      </tr>
+      <tr>
+        <td><strong>Pure Erlang Binaries</strong></td>
+        <td>No (requires binary concatenation)</td>
+        <td>Doubled heap allocations</td>
+        <td>High (native immutability)</td>
+        <td>Severe GC pressure from intermediate heap garbage</td>
+      </tr>
+      <tr>
+        <td><strong>SdrScout Tail-Buffer Hybrid</strong></td>
+        <td>Yes (stitched in native memory)</td>
+        <td>0.73% (480 B per 64 KB)</td>
+        <td>Safe (Refc binaries + <code>beam.Resource</code> GC destructor)</td>
+        <td>Zero syscalls (fast 15 ns memcpy inside native NIF)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-22-1">
+    <div class="quiz-question">
+      1. Why does GNU Radio's double-<code>mmap</code> technique allow AVX2 vector instructions to read past the end of the circular buffer without causing a segmentation fault?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The C++ compiler automatically inserts modulo instructions before every vector register load.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The MMU maps the second contiguous virtual page range to the exact same physical memory frames.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The CPU hardware ring buffer unit wraps addresses when pointers exceed the L1 cache boundary.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The operating system dynamically allocates an extra 64-byte page whenever a vector register wraps.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> In the double-<code>mmap</code> architecture, two contiguous virtual address windows $[A, A+B)$ and $[A+B, A+2B)$ point to the identical physical RAM pages in the MMU page table. When a 256-bit SIMD vector instruction reads across the $A+B$ virtual boundary, the hardware MMU automatically routes accesses back to the beginning of the physical buffer without software intervention.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-22-2">
+    <div class="quiz-question">
+      2. Why is double-<code>mmap</code> unsuitable for wrapping incoming Erlang Refc binaries directly on the BEAM?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The BEAM virtual machine strictly forbids native C and Zig libraries from calling POSIX APIs.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Reference-counted binaries in Erlang are always constrained to a maximum size of 64 bytes total.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        BEAM slabs are not page-aligned, and aliased mutable memory violates actor immutability invariants.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The Linux kernel limits POSIX shared memory allocations to a maximum of one mapping per application.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> Erlang off-heap Refc binaries are managed by internal multi-carrier slab allocators and are not guaranteed to be page-aligned or page-sized. Furthermore, double-mmap creates an aliased, mutable memory region, which violates the immutability and actor isolation guarantees of the BEAM.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-22-3">
+    <div class="quiz-question">
+      3. What physical CPU phenomenon occurs when an SPSC ring buffer's <code>head</code> and <code>tail</code> pointers share a single 64-byte cache line?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="true">
+        False sharing forces cache lines to ping-pong between cores via the MESI coherence protocol.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The hardware arithmetic logic unit triggers an immediate integer divide-by-zero hardware exception.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The memory controller locks DRAM channels, preventing DMA transfers until the queue empties.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The instruction cache invalidates all compiled SIMD vectors, forcing fallback to scalar emulation.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> When two threads on separate cores write to distinct variables located on the same 64-byte cache line, each write invalidates the other core's cache line under the MESI/MOESI cache coherence protocol. This creates severe false sharing, causing the line to repeatedly ping-pong across the inter-core bus.
+    </div>
+  </div>
+
+  <h2>Follow-up &amp; Next Steps</h2>
+  <p>
+    You now understand how high-throughput SDR pipelines manage memory across the hardware-software boundary. In subsequent investigations, we will examine how these circular streaming principles apply to <strong>Polyphase Filterbanks (PFB)</strong> and <strong>Arbitrary Resamplers</strong>, where fractional delay filters require continuous sub-sample history across chunk borders.
+  </p>
+
+  <div class="footer">
+    <span>SDR Scout Architecture Course</span>
+    <span>Lesson 0022</span>
+  </div>
+</body>
+</html>

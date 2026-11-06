@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 19: GenStage Flow Control &amp; Streaming Backpressure in SDR Pipelines</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0019</span>
+    <span class="badge badge-arch">Systems Architecture &amp; Flow Control</span>
+    <span>Reading time: 14 minutes</span>
+  </div>
+
+  <h1>GenStage Flow Control &amp; Streaming Backpressure in SDR Pipelines</h1>
+
+  <p>
+    In Software-Defined Radio (SDR), the physical world imposes an unforgiving constraint: <strong>the ADC clock never stops</strong>. Whether sampling 2.0&nbsp;MSPS from an RTL-SDR or 20&nbsp;MSPS from a HackRF, hardware delivers a relentless, continuous byte stream driven by quartz crystal oscillations.
+  </p>
+
+  <p>
+    In this lesson, we analyze how <code>SdrScout</code> reconciles the hard real-time physical clock of radio hardware with the soft real-time execution of the Erlang VM (BEAM). We dissect the demand-driven mechanics of <strong>GenStage</strong>, quantify memory and queuing limits using formal queueing models, examine zero-copy refc binary mechanics across process mailboxes, and compare BEAM actor backpressure directly with GNU Radio's virtual-memory circular buffer (<code>vm_circbuf</code>) architecture.
+  </p>
+
+  <h2>1. The Streaming Dilemma in SDR: The Inexorable Physical Clock</h2>
+
+  <p>
+    When receiving radio frequency signals, an Analog-to-Digital Converter (ADC) digitizes continuous physical voltages into discrete complex $I/Q$ baseband pairs at a constant sampling frequency $f_s$:
+  </p>
+
+  $$R_{\text{byte}} = f_s \times N_{\text{channels}} \times B_{\text{sample}}$$
+
+  <p>
+    For Mode-S / ADS-B reception at $f_s = 2.0\text{ MSPS}$ with 8-bit unsigned interleaved $I$ and $Q$ channels ($N_{\text{channels}} = 2$, $B_{\text{sample}} = 1\text{ byte}$):
+  </p>
+
+  $$R_{\text{byte}} = 2.0 \times 10^6 \text{ samples/s} \times 2 \times 1 \text{ byte} = 4{,}000{,}000 \text{ bytes/s} = 4.0\text{ MB/s}$$
+
+  <p>
+    In <code>SdrScout</code>, raw radio samples are grouped into chunks of $S_{\text{chunk}} = 65{,}536\text{ bytes}$ (64&nbsp;KB), representing exactly 32,768 complex samples. The chunk duration $T_{\text{chunk}}$ is:
+  </p>
+
+  $$T_{\text{chunk}} = \frac{N_{\text{samples}}}{f_s} = \frac{32{,}768}{2.0 \times 10^6\text{ s}^{-1}} = 16.384\text{ ms}$$
+
+  <div class="callout warning">
+    <div class="callout-title">The Fundamental Dilemma: Hard Physical Clock vs. Soft Real-Time OS</div>
+    <p>
+      Unlike a TCP socket or disk reader where flow can be paused via TCP window advertisements or blocking I/O syscalls, an antenna cannot be paused. Electromagnetic radiation impinges on the antenna regardless of CPU load. If downstream DSP processing lags incoming throughput by even 1%, an architectural crisis occurs:
+    </p>
+    <ul>
+      <li><strong>Unbounded Queues $\to$ Out-Of-Memory (OOM):</strong> If incoming rate $\lambda$ exceeds service rate $\mu$, queue growth is monotonic: $\frac{dQ(t)}{dt} = \lambda - \mu$. At a mere 1% deficit ($\lambda = 1.01\mu$), data accumulates at $40\text{ KB/s} = 2.4\text{ MB/min}$. In Erlang, process mailboxes consume RAM until the Linux kernel OOM killer abruptly terminates the VM.</li>
+      <li><strong>Naive Buffer Drops $\to$ Catastrophic Frame Corruption:</strong> If buffers drop data naively when full, time continuity is severed. In ADS-B, an extended squitter frame spans $120\text{ }\mu\text{s}$ (240 samples at 2.0&nbsp;MSPS). Dropping chunks at arbitrary boundaries fractures preambles, destroys matched filter phase coherence, and corrupts symbol timing loops (e.g. Gardner detectors).</li>
+    </ul>
+  </div>
+
+  <h2>2. GenStage Mechanics: Pull-Based Demand Contracts</h2>
+
+  <p>
+    To prevent unbounded mailbox growth while guaranteeing bounded latency, <code>SdrScout</code> employs <strong>GenStage</strong>. Rather than producers pushing data blindly downstream, GenStage inverts the control flow into a <strong>pull-based demand contract</strong>.
+  </p>
+
+  <center>
+    <svg viewBox="0 0 760 170" width="100%" height="170" style="background:#1e1e2e; border-radius:8px; font-family:monospace; margin:18px 0;">
+      <!-- Producer Box -->
+      <rect x="30" y="35" width="200" height="95" fill="#313244" stroke="#89b4fa" stroke-width="2" rx="6"/>
+      <text x="75" y="62" fill="#89b4fa" font-weight="bold" font-size="14">Producer</text>
+      <text x="45" y="85" fill="#cdd6f4" font-size="11">SdrScout.Pipeline.Producer</text>
+      <text x="45" y="105" fill="#a6adc8" font-size="11">Chunks: [64KB, 64KB, ...]</text>
+
+      <!-- Demand Arrow (Leftwards) -->
+      <path d="M 520 60 L 240 60" stroke="#f9e2af" stroke-width="2" stroke-dasharray="5,5" marker-end="url(#arrow-demand)"/>
+      <text x="320" y="50" fill="#f9e2af" font-weight="bold" font-size="12">1. Demand: ask(3 chunks)</text>
+
+      <!-- Events Arrow (Rightwards) -->
+      <path d="M 240 100 L 520 100" stroke="#a6e3a1" stroke-width="2.5"/>
+      <polygon points="515,95 528,100 515,105" fill="#a6e3a1"/>
+      <text x="290" y="120" fill="#a6e3a1" font-weight="bold" font-size="12">2. Events: [RefcBin, RefcBin, RefcBin]</text>
+
+      <!-- Consumer Box -->
+      <rect x="530" y="35" width="200" height="95" fill="#313244" stroke="#a6e3a1" stroke-width="2" rx="6"/>
+      <text x="560" y="62" fill="#a6e3a1" font-weight="bold" font-size="14">DetectorConsumer</text>
+      <text x="545" y="85" fill="#cdd6f4" font-size="11">max_demand: 4, min_demand: 1</text>
+      <text x="545" y="105" fill="#a6adc8" font-size="11">Calls Zig SIMD DSP NIF</text>
+    </svg>
+  </center>
+
+  <p>
+    In a GenStage specification:
+  </p>
+  <ul>
+    <li><code>Producer</code>: Source of events. It holds an internal demand counter <code>state.demand</code>. It is strictly forbidden from emitting events unless <code>state.demand &gt; 0</code>.</li>
+    <li><code>Consumer</code>: Sink of events. It dictates how many events it is ready to process by issuing demand tokens upstream.</li>
+    <li><code>ProducerConsumer</code>: Intermediary filter or transformer that acts as a consumer to upstream stages and a producer to downstream stages.</li>
+  </ul>
+
+  <p>
+    Let us inspect the demand fulfillment loop inside <a href="file:///home/johannes/code/sdr_scout/lib/sdr_scout/pipeline/producer.ex"><code>lib/sdr_scout/pipeline/producer.ex</code></a>:
+  </p>
+
+  <pre><code>defmodule SdrScout.Pipeline.Producer do
+  use GenStage
+
+  @impl true
+  def handle_demand(incoming_demand, state) do
+    new_demand = state.demand + incoming_demand
+    dispatch(%{state | demand: new_demand})
+  end
+
+  # Benchmark mode: greedily take up to demand chunks
+  defp dispatch(%{chunks: chunks, demand: demand, mode: :benchmark} = state) when chunks != [] and demand &gt; 0 do
+    {to_emit, remaining} = Enum.split(chunks, demand)
+    emitted_count = length(to_emit)
+
+    new_state =
+      %{state | chunks: remaining, demand: demand - emitted_count}
+      |> maybe_reply_drain_waiters()
+
+    {:noreply, to_emit, new_state}
+  end
+
+  defp dispatch(%{demand: demand} = state) when demand &lt;= 0 do
+    {:noreply, [], state}
+  end
+end</code></pre>
+
+  <p>
+    Notice how backpressure is enforced: if downstream <code>DetectorConsumer</code> is busy executing AVX2/NEON SIMD vector operations in Zig, it does not issue demand. The <code>Producer</code>'s demand counter remains 0, and <code>dispatch/1</code> returns <code>{:noreply, [], state}</code> without emitting any chunks.
+  </p>
+
+  <h2>3. Tuning the Window: The <code>max_demand: 4, min_demand: 1</code> Contract</h2>
+
+  <p>
+    In <a href="file:///home/johannes/code/sdr_scout/lib/sdr_scout/pipeline/detector_consumer.ex"><code>lib/sdr_scout/pipeline/detector_consumer.ex</code></a>, the consumer subscribes to the producer with precise demand parameters:
+  </p>
+
+  <pre><code>@impl true
+def init(opts) do
+  producer = Keyword.fetch!(opts, :producer)
+  ctx = Dsp.new_context()
+
+  state = %{ctx: ctx, airspace: airspace, collector: collector}
+
+  {:consumer, state, subscribe_to: [{producer, max_demand: 4, min_demand: 1}]}
+end</code></pre>
+
+  <p>
+    Why exactly <code>max_demand: 4</code> and <code>min_demand: 1</code>? Why not <code>max_demand: 1</code> or <code>max_demand: 100</code>?
+  </p>
+
+  <h3>A. Bounding In-Flight Memory ($M_{\text{inflight}}$)</h3>
+  <p>
+    The parameter <code>max_demand: 4</code> sets a strict upper bound on unconsumed data buffered between the producer and the consumer. Since each chunk is 64&nbsp;KB:
+  </p>
+
+  $$M_{\text{inflight\_max}} = \text{max\_demand} \times S_{\text{chunk}} = 4 \times 65{,}536\text{ bytes} = 262{,}144\text{ bytes} = 256\text{ KiB}$$
+
+  <p>
+    256&nbsp;KiB fits comfortably inside modern CPU L2/L3 caches (modern x86 L2 cache is typically 512&nbsp;KB to 1&nbsp;MB per core; Apple Silicon M-series L2 is 4&nbsp;MB to 16&nbsp;MB). By capping unconsumed chunks to 256&nbsp;KiB, chunks remain in CPU cache hierarchy without evicting active working sets to main RAM!
+  </p>
+
+  <h3>B. Eliminating Pipeline Bubbles via <code>min_demand: 1</code></h3>
+  <p>
+    If we had set <code>max_demand: 1, min_demand: 0</code> (a stop-and-wait protocol):
+  </p>
+  <ol>
+    <li>Consumer asks for 1 chunk.</li>
+    <li>Producer sends 1 chunk (IPC latency $\tau_{\text{ipc}}$).</li>
+    <li>Consumer processes chunk (DSP computation time $\tau_{\text{dsp}}$).</li>
+    <li>Consumer asks for next chunk (IPC latency $\tau_{\text{ipc}}$).</li>
+  </ol>
+  <p>
+    The CPU core executing DSP math sits <strong>completely idle</strong> for $2 \times \tau_{\text{ipc}}$ between every chunk! This idle window is known as a <em>pipeline bubble</em>.
+  </p>
+
+  <p>
+    With <code>max_demand: 4, min_demand: 1</code>, GenStage uses an automatic replenishment watermark:
+  </p>
+
+  $$\Delta D = \text{max\_demand} - \text{min\_demand} = 4 - 1 = 3$$
+
+  <ol>
+    <li>Upon initialization, the consumer immediately asks for 4 chunks.</li>
+    <li>The producer delivers all 4 chunks. The consumer begins crunching Chunk 1.</li>
+    <li>As the consumer finishes Chunk 3 (having processed $\Delta D = 3$ chunks), GenStage automatically dispatches a new demand request for 3 additional chunks <em>in the background</em>.</li>
+    <li>While the consumer is processing Chunk 4, the producer receives the demand and delivers Chunks 5, 6, and 7 into the consumer's mailbox.</li>
+    <li>When the consumer finishes Chunk 4, Chunk 5 is already waiting in the mailbox. <strong>Pipeline starvation is mathematically eliminated.</strong></li>
+  </ol>
+
+  <h2>4. Zero-Copy Flow Across BEAM Mailboxes</h2>
+
+  <p>
+    A common critique of actor-model systems for high-performance computing is the cost of inter-process message passing. In classic actor runtimes, sending a message between processes requires serializing and deep-copying memory from the sender's heap to the receiver's heap.
+  </p>
+
+  <p>
+    In the BEAM, binary storage is split into two distinct tiers:
+  </p>
+
+  <table style="width:100%; border-collapse: collapse; margin: 1.5rem 0;">
+    <thead>
+      <tr>
+        <th>Binary Type</th>
+        <th>Size Threshold</th>
+        <th>Allocation Arena</th>
+        <th>Mailbox Transfer Cost</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Heap Binary</strong></td>
+        <td>$\le 64\text{ bytes}$</td>
+        <td>Process-private heap</td>
+        <td>Full deep copy of byte payload</td>
+      </tr>
+      <tr>
+        <td><strong>Refc Binary</strong> (Reference-Counted)</td>
+        <td>$&gt; 64\text{ bytes}$</td>
+        <td>Shared global off-heap memory</td>
+        <td><strong>Zero payload copy</strong>; copies 24-byte <code>ProcBin</code> pointer</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Because each SDR chunk in <code>SdrScout</code> is $65{,}536\text{ bytes} \gg 64\text{ bytes}$, it is allocated as a <strong>Refc binary</strong>. When <code>Producer</code> sends <code>to_emit</code> chunks to <code>DetectorConsumer</code>:
+  </p>
+
+  <pre><code># Inside the BEAM:
+# Only the 24-byte ProcBin descriptor is copied into DetectorConsumer's heap!
+{:events, [refc_bin_1, refc_bin_2, refc_bin_3]}</code></pre>
+
+  <p>
+    The 64&nbsp;KB radio buffer remains static in off-heap memory. Its atomic reference counter is incremented by 1.
+  </p>
+
+  <p>
+    When <code>DetectorConsumer.handle_events/3</code> calls Zigler:
+  </p>
+
+  <pre><code># DetectorConsumer.ex
+for chunk &lt;- chunks do
+  frames = Dsp.process_chunk(state.ctx, chunk)
+  ...
+end</code></pre>
+
+  <p>
+    ERTS passes the memory pointer from the <code>ProcBin</code> directly to the Zig NIF as a native slice:
+  </p>
+
+  <pre><code>// dsp.ex (~Z native Zig code)
+pub fn process_chunk(res: DspContext, chunk: []const u8) beam.term {
+    // chunk.ptr points directly to the 64 KB off-heap buffer in RAM!
+    // chunk.len is 65536.
+    // Zero allocations. Zero memory copies.
+}</code></pre>
+
+  <p>
+    The raw radio bytes flow from SDR hardware DMA buffers directly into the CPU's AVX2/NEON SIMD vector registers without a single <code>memcpy</code> operation.
+  </p>
+
+  <h2>5. Deterministic Drain vs. Realtime Streaming</h2>
+
+  <p>
+    In production SDR systems, testing and benchmarking streaming pipelines is notoriously difficult because developers often resort to flaky <code>Process.sleep(...)</code> statements to "wait for data to process".
+  </p>
+
+  <p>
+    <code>SdrScout</code> solves this with two explicit operational modes coordinated via <a href="file:///home/johannes/code/sdr_scout/lib/sdr_scout/pipeline.ex"><code>lib/sdr_scout/pipeline.ex</code></a>:
+  </p>
+
+  <h3>A. Realtime Paced Mode (Production Radio Reception)</h3>
+  <p>
+    In <code>:realtime</code> mode, the producer simulates or ingests hardware clocking. It releases 1 chunk every $T_{\text{chunk}} = 16.384\text{ ms}$:
+  </p>
+  <pre><code>@chunk_interval_ms div(@chunk_size * 1000, @bytes_per_second) # 16 ms
+
+defp dispatch(%{chunks: [chunk | rest], demand: demand, mode: :realtime, timer_active: false} = state) do
+  Process.send_after(self(), :tick, @chunk_interval_ms)
+  new_state = %{state | chunks: rest, demand: demand - 1, timer_active: true}
+  {:noreply, [chunk], new_state}
+end</code></pre>
+
+  <h3>B. Deterministic Drain Mode (Microbenchmarks &amp; Unit Tests)</h3>
+  <p>
+    In <code>:benchmark</code> mode, we process datasets at maximum CPU throughput (often &gt;100&nbsp;MSPS) with <strong>zero sleep calls</strong>. To know exactly when the DSP pipeline has processed the final sample, <code>Pipeline.drain/2</code> implements a two-phase barrier synchronization:
+  </p>
+
+  <pre><code># lib/sdr_scout/pipeline.ex
+@impl true
+def handle_call({:drain, timeout}, _from, state) do
+  with :ok &lt;- Producer.drain(state.producer, timeout),
+       :ok &lt;- DetectorConsumer.sync(state.consumer, timeout) do
+    {:reply, :ok, state}
+  else
+    error -&gt; {:reply, error, state}
+  end
+end</code></pre>
+
+  <ol>
+    <li><strong>Phase 1: <code>Producer.drain/2</code>:</strong> The producer receives <code>:await_drain</code>. If chunks remain in its queue, it stores the caller in <code>state.drain_waiters</code>. The moment the final chunk is emitted in response to demand, it replies <code>:ok</code>.</li>
+    <li><strong>Phase 2: <code>DetectorConsumer.sync/2</code>:</strong> The consumer receives <code>:sync</code> via <code>GenStage.call/3</code>. Because Erlang mailboxes strictly preserve FIFO ordering, the <code>:sync</code> message sits behind all preceding <code>{:events, chunks}</code> batches. When <code>handle_call(:sync, ...)</code> executes, every single prior I/Q chunk is guaranteed to have finished native Zig SIMD detection!</li>
+  </ol>
+
+  <h2>6. Architectural Showdown: GenStage vs. GNU Radio Flow Control</h2>
+
+  <p>
+    To appreciate why BEAM actor backpressure is uniquely suited for multi-channel SDR systems, let us compare it directly to <strong>GNU Radio</strong>'s flow control architecture.
+  </p>
+
+  <h3>GNU Radio's Circular Buffer (<code>vm_circbuf</code>)</h3>
+  <p>
+    In GNU Radio (C++), each signal processing block runs in its own dedicated POSIX OS thread (<code>pthread</code>). Data flows through circular ring buffers connecting upstream block outputs to downstream block inputs.
+  </p>
+
+  <p>
+    To allow blocks to read contiguous memory without checking for buffer wrap-around, GNU Radio uses an operating system memory management trick: <strong>double-mapped virtual memory</strong>. It uses <code>mmap</code> or <code>shm_open</code> to map the same physical memory buffer into two contiguous virtual address regions:
+  </p>
+
+  $$\text{Virtual Range A: } [0, S_{\text{buf}}) \longrightarrow \text{Physical RAM Buffer}$$
+  $$\text{Virtual Range B: } [S_{\text{buf}}, 2S_{\text{buf}}) \longrightarrow \text{Same Physical RAM Buffer}$$
+
+  <p>
+    While this makes DSP loop pointer arithmetic fast, its flow control relies on POSIX synchronization:
+  </p>
+  <ul>
+    <li>When an upstream block's output buffer is full, its <code>pthread</code> blocks on a POSIX condition variable (<code>pthread_cond_wait</code>).</li>
+    <li>When a downstream block's input buffer is empty, its <code>pthread</code> blocks waiting for signal wakeups.</li>
+    <li>If 50 blocks exist in a flowgraph, 50 OS threads contend for CPU cores, causing frequent OS kernel context switches, cache line invalidations, and TLB shootdowns.</li>
+  </ul>
+
+  <h3>Direct Architectural Comparison</h3>
+
+  <table style="width:100%; border-collapse: collapse; margin: 1.5rem 0;">
+    <thead>
+      <tr>
+        <th>Dimension</th>
+        <th>GNU Radio (C++ / POSIX)</th>
+        <th>SdrScout (Elixir / GenStage + Zig)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Flow Control Model</strong></td>
+        <td>Push with blocking backpressure (POSIX condition variables)</td>
+        <td><strong>Pull-based reactive demand</strong> (asynchronous actor signaling)</td>
+      </tr>
+      <tr>
+        <td><strong>Threading Model</strong></td>
+        <td>1 OS thread (<code>pthread</code>) per block</td>
+        <td>Lightweight BEAM processes scheduled onto $N$ CPU core schedulers</td>
+      </tr>
+      <tr>
+        <td><strong>Buffer Architecture</strong></td>
+        <td><code>vm_circbuf</code> double-mapped virtual pages (OS page table tricks)</td>
+        <td>Refc binaries off-heap ($&gt;64\text{ B}$) + persistent <code>beam.Resource</code> overlap tail</td>
+      </tr>
+      <tr>
+        <td><strong>Context Switch Overhead</strong></td>
+        <td>High: Kernel-level OS thread context switches</td>
+        <td><strong>Sub-microsecond</strong>: Userspace BEAM process reductions</td>
+      </tr>
+      <tr>
+        <td><strong>Buffer Sizing Penalty</strong></td>
+        <td>Too small $\to$ thread thrashing; Too large $\to$ latency bufferbloat</td>
+        <td>Bounded dynamically by <code>max_demand: 4</code> (256&nbsp;KiB L2/L3 cache footprint)</td>
+      </tr>
+      <tr>
+        <td><strong>Fault Isolation</strong></td>
+        <td>Fragile: A single segmentation fault crashes the entire process</td>
+        <td><strong>Supervised</strong>: Isolated process crash restarts without dropping node</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-19-1">
+    <div class="quiz-question">
+      1. In SdrScout's DetectorConsumer, under what exact conditions does GenStage emit new demand upstream to the Producer?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">Only after all 4 chunks are processed and consumer mailbox is completely empty.</li>
+      <li class="quiz-option" data-correct="false">Continuously on every clock cycle regardless of pending chunks or mailbox load.</li>
+      <li class="quiz-option" data-correct="true">As soon as 3 chunks have been processed, replenishing pending demand back to 4.</li>
+      <li class="quiz-option" data-correct="false">Whenever the OS kernel issues a SIGIO interrupt indicating full socket buffers.</li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> In GenStage, when unfulfilled demand drops to <code>min_demand</code> (meaning <code>max_demand - min_demand = 4 - 1 = 3</code> events have been processed), GenStage automatically issues a demand of 3 events upstream. This concurrent replenishment ensures the producer delivers the next batch while the consumer finishes the 4th chunk, eliminating pipeline starvation bubbles.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-19-2">
+    <div class="quiz-question">
+      2. Why does passing a 64 KB I/Q chunk from Producer to DetectorConsumer avoid BEAM GC pauses?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">The BEAM compiler rewrites the pipeline into an inlined C for-loop during compilation.</li>
+      <li class="quiz-option" data-correct="true">Binaries over 64 bytes are reference-counted off-heap, copying only a 24-byte pointer.</li>
+      <li class="quiz-option" data-correct="false">Erlang processes share identical OS thread stacks and bypass heap isolation entirely.</li>
+      <li class="quiz-option" data-correct="false">The operating system maps the binary directly into CPU L1 cache using hardware DMA.</li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> In the BEAM runtime, binaries strictly larger than 64 bytes are allocated off-heap as reference-counted (refc) binaries. Passing a 64 KB chunk across an actor mailbox copies only a lightweight 24-byte <code>ProcBin</code> pointer descriptor onto the receiver process heap. The 64 KB payload stays in shared memory, incurring zero memory copy overhead and zero GC churn.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-19-3">
+    <div class="quiz-question">
+      3. How does GenStage flow control differ fundamentally from GNU Radio's buffer management?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">GenStage relies on hardware interrupts, whereas GNU Radio uses userspace green threads.</li>
+      <li class="quiz-option" data-correct="false">GenStage drops packets non-deterministically, while GNU Radio guarantees zero frame drops.</li>
+      <li class="quiz-option" data-correct="false">GenStage requires double virtual memory page mapping, whereas GNU Radio uses actor queues.</li>
+      <li class="quiz-option" data-correct="true">GenStage uses reactive message demand tokens, while GNU Radio blocks POSIX threads on ring buffers.</li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> GNU Radio blocks dedicated OS <code>pthreads</code> using POSIX mutexes and condition variables when its double-mapped circular buffers are full or empty. GenStage relies on asynchronous reactive demand messaging, where downstream consumers explicitly pull discrete batches on BEAM user-space schedulers without blocking OS kernel threads.
+    </div>
+  </div>
+
+  <h2>Follow-up &amp; Next Steps</h2>
+  <p>
+    You have mastered how reactive backpressure bridges continuous RF physical time with discrete asynchronous actor scheduling.
+  </p>
+  <p>
+    Examine the reference implementation in <a href="file:///home/johannes/code/sdr_scout/lib/sdr_scout/pipeline.ex"><code>lib/sdr_scout/pipeline.ex</code></a>, <a href="file:///home/johannes/code/sdr_scout/lib/sdr_scout/pipeline/producer.ex"><code>lib/sdr_scout/pipeline/producer.ex</code></a>, and <a href="file:///home/johannes/code/sdr_scout/lib/sdr_scout/pipeline/detector_consumer.ex"><code>lib/sdr_scout/pipeline/detector_consumer.ex</code></a> to see these flow control semantics running in live radio feeds and benchmarks.
+  </p>
+</body>
+</html>

@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 14: Compact Position Reporting (CPR) — Non-Linear Spherical Coordinates &amp; Disambiguation</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0014</span>
+    <span class="badge badge-arch">Spherical Mathematics &amp; Navigation DSP</span>
+    <span>Reading time: 12 minutes</span>
+  </div>
+
+  <h1>Compact Position Reporting (CPR): Non-Linear Spherical Coordinates &amp; Disambiguation</h1>
+
+  <p>
+    When transmitting aircraft coordinates over a 1090 MHz Mode-S radio link, RF spectrum constraints force brutal trade-offs. An ADS-B <em>Extended Squitter</em> packet allocates exactly <strong>34 bits</strong> for geographical coordinates: 17 bits for latitude and 17 bits for longitude.
+  </p>
+
+  <p>
+    Yet commercial aviation demands sub-5-meter positional resolution for precision runway approach, ADS-B Out surveillance, and TCAS collision avoidance. How does aviation achieve meter-scale accuracy across a global sphere inside a 34-bit budget without sending 64-bit IEEE-754 floating-point coordinates?
+  </p>
+
+  <p>
+    The answer is <strong>Compact Position Reporting (CPR)</strong> (ICAO Annex 10, RTCA DO-260B). CPR is an elegant fusion of spherical geometry, non-linear meridian compression, and the <strong>Vernier principle</strong> (discrete modulo disambiguation). In this lesson, we break down the spherical mathematics of CPR and analyze its concrete implementation in <a href="file:///home/johannes/code/sdr_scout/lib/sdr_scout/mode_s/cpr.ex"><code>lib/sdr_scout/mode_s/cpr.ex</code></a>.
+  </p>
+
+  <h2>1. The 34-Bit RF Budget: Why Floats and Linear Fixed-Point Fail</h2>
+
+  <p>
+    In an ADS-B DF17 frame, the 56-bit Message Extended (<code>ME</code>) field contains type-specific data. For Airborne Position messages (Type Codes 9 through 18), the bit allocation is strictly partitioned:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Field</th>
+        <th>Bit Width</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>TC</code> (Type Code)</td>
+        <td>5 bits</td>
+        <td>Airborne Position category and barometric/GNSS altitude type</td>
+      </tr>
+      <tr>
+        <td><code>SS</code> (Surveillance Status)</td>
+        <td>2 bits</td>
+        <td>No condition, permanent alert, temporary alert, SPI</td>
+      </tr>
+      <tr>
+        <td><code>NIC_sb</code> / <code>SAF</code></td>
+        <td>1 bit</td>
+        <td>Single antenna flag / navigation integrity supplement</td>
+      </tr>
+      <tr>
+        <td><code>ALT</code> (Altitude)</td>
+        <td>12 bits</td>
+        <td>25-foot or 100-foot resolution altitude encoding</td>
+      </tr>
+      <tr>
+        <td><code>T</code> (Time)</td>
+        <td>1 bit</td>
+        <td>UTC synchronization status flag (0 = unsynchronized)</td>
+      </tr>
+      <tr>
+        <td><code>F</code> (CPR Format)</td>
+        <td>1 bit</td>
+        <td><strong>0 = Even frame, 1 = Odd frame</strong></td>
+      </tr>
+      <tr>
+        <td><code>LAT-CPR</code></td>
+        <td>17 bits</td>
+        <td>Raw encoded latitude fractional coordinate</td>
+      </tr>
+      <tr>
+        <td><code>LON-CPR</code></td>
+        <td>17 bits</td>
+        <td>Raw encoded longitude fractional coordinate</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Notice the constraint: exactly <strong>17 bits</strong> each for latitude and longitude ($2^{17} = 131,072$ discrete states).
+  </p>
+
+  <h3>The Failure of Linear Fixed-Point Quantization</h3>
+
+  <p>
+    Suppose an engineer attempted a naive linear fixed-point mapping across the globe:
+  </p>
+
+  <ul>
+    <li>
+      <strong>Latitude:</strong> Spanning $[-90^\circ, +90^\circ]$ ($180^\circ$ total).
+      $$\Delta\text{Lat}_{\text{linear}} = \frac{180^\circ}{131,072} \approx 0.001373^\circ \approx 152.7\text{ meters } (501\text{ ft})$$
+    </li>
+    <li>
+      <strong>Longitude:</strong> Spanning $[-180^\circ, +180^\circ]$ ($360^\circ$ total).
+      $$\Delta\text{Lon}_{\text{linear}} = \frac{360^\circ}{131,072} \approx 0.002747^\circ \approx 305.4\text{ meters at equator } (1,002\text{ ft})$$
+    </li>
+  </ul>
+
+  <p>
+    A positional quantization error of $\pm 150$ to $300$ meters is catastrophic for terminal airspace separation. Two aircraft on parallel runways 750 feet apart would be indistinguishable!
+  </p>
+
+  <div class="callout upside">
+    <div class="callout-title">The CPR Insight: Separate Zone from Fraction</div>
+    <p>
+      Instead of encoding global absolute position in 17 bits, CPR divides the globe into <strong>discrete geographic zones</strong>. The 17-bit integer does <em>not</em> encode an absolute coordinate; it encodes the <strong>high-resolution fractional position inside a zone</strong>.
+    </p>
+    <p>
+      Because a latitude zone is only $6^\circ$ wide, the resolution is:
+      $$\text{Resolution}_{\text{CPR}} = \frac{6^\circ}{131,072} \approx 0.00004578^\circ \approx 5.09\text{ meters } (16.7\text{ ft})$$
+    </p>
+    <p>
+      This delivers a <strong>30&times; to 60&times; resolution improvement</strong> using the exact same 17-bit register. The challenge then becomes: <em>How does the receiver know which zone the aircraft is in?</em>
+    </p>
+  </div>
+
+  <h2>2. Spherical Geometry &amp; The Vernier Latitude Grids</h2>
+
+  <p>
+    To resolve zone ambiguity without increasing packet size, CPR uses <strong>two alternating, coprime spatial grids</strong>, designated <strong>Even ($F=0$)</strong> and <strong>Odd ($F=1$)</strong>. The aircraft transponder alternates between transmitting an Even frame and an Odd frame (typically every 0.5 seconds).
+  </p>
+
+  <p>
+    Latitude is partitioned into equal-width bands between the poles. The system defines 15 primary quadrants per hemisphere, producing:
+  </p>
+
+  <ul>
+    <li><strong>Even Grid ($i = 0$):</strong> $N_B = 60$ latitude zones ($4 \times 15$). Zone width:
+      $$\Delta\text{Lat}_0 = \frac{360^\circ}{60} = 6.0^\circ$$
+    </li>
+    <li><strong>Odd Grid ($i = 1$):</strong> $N_B - 1 = 59$ latitude zones ($4 \times 15 - 1$). Zone width:
+      $$\Delta\text{Lat}_1 = \frac{360^\circ}{59} \approx 6.1016949^\circ$$
+    </li>
+  </ul>
+
+  <p>
+    Notice that $\gcd(60, 59) = 1$. The number of zones is coprime!
+  </p>
+
+  <h3>The Mechanical Analogy: The Vernier Caliper</h3>
+
+  <p>
+    In a physical Vernier caliper, a fixed main scale with $1.0\text{ mm}$ graduations is paired with a sliding scale with $0.9\text{ mm}$ graduations. The difference ($0.1\text{ mm}$) creates a phase shift that uniquely identifies sub-millimeter displacement across the entire measurement range.
+  </p>
+
+  <p>
+    CPR applies this identical principle to the Earth's sphere. Over a full $360^\circ$ great circle, the Even grid contains exactly 60 zones, while the Odd grid contains exactly 59 zones:
+  </p>
+
+  $$60 \cdot \Delta\text{Lat}_0 = 59 \cdot \Delta\text{Lat}_1 = 360^\circ$$
+
+  <p>
+    Because the grids slip out of phase by exactly $\Delta\text{Lat}_1 - \Delta\text{Lat}_0$ per zone, <strong>every latitude on Earth has a unique phase difference between its Even and Odd fractional coordinates</strong>.
+  </p>
+
+  <h3>Global Latitude Disambiguation Formula</h3>
+
+  <p>
+    When an SDR receiver captures both an Even frame and an Odd frame from an aircraft, it extracts the 17-bit integers and normalizes them to the interval $[0, 1)$:
+  </p>
+
+  $$y_0 = \frac{\text{LAT\_CPR}_{\text{even}}}{131,072}, \qquad y_1 = \frac{\text{LAT\_CPR}_{\text{odd}}}{131,072}$$
+
+  <p>
+    The unique global latitude zone index $j$ is extracted analytically via integer rounding:
+  </p>
+
+  $$j = \left\lfloor 59 \cdot y_0 - 60 \cdot y_1 + \frac{1}{2} \right\rfloor$$
+
+  <p>
+    Once the integer zone index $j$ is recovered, the receiver computes the reconstructed latitude for both frames:
+  </p>
+
+  $$R_{\text{lat}, 0} = \Delta\text{Lat}_0 \cdot \left( (j \bmod 60) + y_0 \right)$$
+  $$R_{\text{lat}, 1} = \Delta\text{Lat}_1 \cdot \left( (j \bmod 59) + y_1 \right)$$
+
+  <p>
+    Because latitudes are conventionally referenced to the equator ($[-90^\circ, +90^\circ]$) rather than $[0^\circ, 360^\circ)$, values in the southern hemisphere wrap around $360^\circ$:
+  </p>
+
+  $$\text{Lat} = \begin{cases} R_{\text{lat}} - 360^\circ & \text{if } R_{\text{lat}} \ge 270^\circ \\ R_{\text{lat}} & \text{otherwise} \end{cases}$$
+
+  <h2>3. Meridian Convergence &amp; The Non-Linear Longitude Function $NL(\text{lat})$</h2>
+
+  <p>
+    On a flat plane, dividing longitude into equal angular wedges would suffice. But Earth is a sphere. The physical distance $\Delta x$ along a parallel of latitude $\phi$ contracts with the cosine of latitude:
+  </p>
+
+  $$\Delta x = R_{\text{earth}} \cdot \cos(\phi) \cdot \Delta\lambda$$
+
+  <p>
+    At the equator ($\phi = 0^\circ$), $1^\circ$ of longitude is approximately $111.3\text{ km}$. At London or Frankfurt ($\phi \approx 51^\circ$), $1^\circ$ shrinks to $70\text{ km}$. At Svalbard ($\phi = 78^\circ$), it contracts to $23\text{ km}$. At the North Pole ($\phi = 90^\circ$), all meridians converge to a singular point of width zero.
+  </p>
+
+  <p>
+    If ADS-B used a fixed number of longitude zones worldwide, zone widths near the poles would shrink to centimeters, wasting bit capacity and causing mathematical instability during division.
+  </p>
+
+  <div class="callout">
+    <div class="callout-title">Adaptive Longitudinal Mesh: $NL(\text{lat})$</div>
+    <p>
+      CPR maintains a roughly constant physical zone width (~$360\text{ NM} \approx 666.7\text{ km}$) across all latitudes by dynamically reducing the number of longitude zones as latitude increases.
+    </p>
+    <p>
+      The number of longitude zones is given by the non-linear transition function $NL(\text{lat})$:
+      $$NL(\text{lat}) = \left\lfloor \frac{2\pi}{\arccos\left( 1 - \frac{1 - \cos(\pi / (2 \cdot 15))}{\cos^2(\text{lat})} \right)} \right\rfloor$$
+    </p>
+  </div>
+
+  <p>
+    Evaluating $NL(\text{lat})$ yields a discrete step function:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Latitude Range</th>
+        <th>$NL(\text{lat})$ (Even Zones)</th>
+        <th>$NL(\text{lat}) - 1$ (Odd Zones)</th>
+        <th>Angular Zone Width $\Delta\text{Lon}_0$</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>$0.0^\circ$ (Equator)</td>
+        <td>59</td>
+        <td>58</td>
+        <td>$360^\circ / 59 \approx 6.10^\circ$</td>
+      </tr>
+      <tr>
+        <td>$35.0^\circ$ (Mediterranean / Tokyo)</td>
+        <td>48</td>
+        <td>47</td>
+        <td>$360^\circ / 48 = 7.50^\circ$</td>
+      </tr>
+      <tr>
+        <td>$52.0^\circ$ (Berlin / London / Amsterdam)</td>
+        <td>36</td>
+        <td>35</td>
+        <td>$360^\circ / 36 = 10.00^\circ$</td>
+      </tr>
+      <tr>
+        <td>$70.0^\circ$ (Troms&oslash; / Northern Alaska)</td>
+        <td>20</td>
+        <td>19</td>
+        <td>$360^\circ / 20 = 18.00^\circ$</td>
+      </tr>
+      <tr>
+        <td>$\ge 87.0^\circ$ (Polar Cap)</td>
+        <td>1</td>
+        <td>1</td>
+        <td>$360^\circ / 1 = 360.00^\circ$</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Global Longitude Disambiguation</h3>
+
+  <p>
+    Once latitude has been reconstructed, the receiver computes $NL(\text{lat})$. For global decoding to be valid, <strong>both the Even and Odd frames must evaluate to the same $NL(\text{lat})$</strong>:
+  </p>
+
+  $$NL(R_{\text{lat}, 0}) \stackrel{?}{=} NL(R_{\text{lat}, 1})$$
+
+  <p>
+    If the two numbers differ, the aircraft crossed an $NL$ latitude boundary between the Even and Odd squitters. This condition is called a <strong>latitude zone straddle</strong>, and the receiver must discard the pair and wait for the next frame.
+  </p>
+
+  <p>
+    Assuming $NL$ is consistent:
+  </p>
+  <ul>
+    <li>For the Even frame, the number of longitude zones is $n_0 = \max(NL(\text{lat}), 1)$.</li>
+    <li>For the Odd frame, the number of longitude zones is $n_1 = \max(NL(\text{lat}) - 1, 1)$.</li>
+  </ul>
+
+  <p>
+    With normalized longitude fractions $x_0 = \frac{\text{LON\_CPR}_{\text{even}}}{131,072}$ and $x_1 = \frac{\text{LON\_CPR}_{\text{odd}}}{131,072}$, the global longitude zone index $m$ is:
+  </p>
+
+  $$m = \left\lfloor x_0 \cdot (NL - 1) - x_1 \cdot NL + \frac{1}{2} \right\rfloor$$
+
+  <p>
+    The reconstructed longitude corresponding to the newest received frame (e.g., if Even is newer) is:
+  </p>
+
+  $$\Delta\text{Lon} = \frac{360^\circ}{n_0}$$
+  $$\text{Lon} = \Delta\text{Lon} \cdot \left( (m \bmod n_0) + x_0 \right)$$
+
+  <p>
+    Finally, $\text{Lon}$ is normalized to $[-180^\circ, +180^\circ]$.
+  </p>
+
+  <h2>4. Global vs. Local Decoding: Bootstrapping vs. Tracking</h2>
+
+  <p>
+    An SDR receiver operates in two distinct CPR operational modes:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Attribute</th>
+        <th>Global CPR Decoding</th>
+        <th>Local CPR Decoding</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Prerequisites</strong></td>
+        <td>Two alternating frames (1 Even + 1 Odd)</td>
+        <td><strong>Single frame</strong> (Even OR Odd) + known reference position</td>
+      </tr>
+      <tr>
+        <td><strong>Time Window</strong></td>
+        <td>Strictly $\le 10$ seconds apart</td>
+        <td>Continuous tracking (reference updated every few seconds)</td>
+      </tr>
+      <tr>
+        <td><strong>Use Case</strong></td>
+        <td>Initial target acquisition / cold start</td>
+        <td>High-rate position stream tracking (1–2 Hz)</td>
+      </tr>
+      <tr>
+        <td><strong>Ambiguity Window</strong></td>
+        <td>Worldwide ($360^\circ \times 180^\circ$)</td>
+        <td>Local radius within $\pm \frac{1}{2}\Delta\text{Lat} \approx 180\text{ NM}$</td>
+      </tr>
+      <tr>
+        <td><strong>Failure Mode</strong></td>
+        <td>Packet drop delays fix; zone straddle rejection</td>
+        <td>Zone slip if aircraft position jumps &gt; 180 NM without fix</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Why Does Global Decoding Require $\le 10$ Seconds?</h3>
+
+  <p>
+    An airliner at cruising speed travels at approximately 500 knots ($260\text{ m/s}$ or $\approx 0.93\text{ km/h}$). In 10 seconds, the aircraft travels at most $2.6\text{ km}$ ($1.4\text{ NM}$).
+  </p>
+
+  <p>
+    The mathematical tolerance of CPR allows for up to $\frac{1}{2} \Delta\text{Lat} \approx 3.0^\circ$ ($180\text{ NM}$) of displacement before the Vernier phase difference slips into an adjacent zone index. Enforcing a strict 10-second reception window guarantees that physical displacement during the transmission interval cannot induce an off-by-one zone error ($j \pm 1$).
+  </p>
+
+  <h3>How Local Decoding Works (Dead Reckoning)</h3>
+
+  <p>
+    Once an aircraft has been globally acquired, waiting for alternating Even/Odd pairs would cut the effective tracking update rate in half and make tracking vulnerable to packet drops.
+  </p>
+
+  <p>
+    In <strong>Local Decoding</strong>, the receiver uses its own known ground station coordinates (or the aircraft's previously decoded position) as a reference $(\text{Lat}_{\text{ref}}, \text{Lon}_{\text{ref}})$. Because the receiver already knows which coarse $6^\circ$ zone the aircraft resides in, a <strong>single 17-bit report</strong> (either Even or Odd) provides the exact 5-meter sub-zone offset:
+  </p>
+
+  $$j = \left\lfloor \frac{\text{Lat}_{\text{ref}}}{\Delta\text{Lat}} \right\rfloor + \left\lfloor \frac{\text{Lat}_{\text{ref}} \bmod \Delta\text{Lat}}{\Delta\text{Lat}} - y + \frac{1}{2} \right\rfloor$$
+  $$\text{Lat} = \Delta\text{Lat} \cdot (j + y)$$
+
+  <p>
+    This allows an SDR pipeline to emit immediate position updates for every single valid airborne position packet received.
+  </p>
+
+  <h2>5. Codebase Deep Dive: <code>SdrScout.ModeS.CPR</code></h2>
+
+  <p>
+    Now let's inspect the actual implementation in <a href="file:///home/johannes/code/sdr_scout/lib/sdr_scout/mode_s/cpr.ex"><code>lib/sdr_scout/mode_s/cpr.ex</code></a>.
+  </p>
+
+  <pre><code>defmodule SdrScout.ModeS.CPR do
+  @d_lat_even 360.0 / 60.0  # 6.0 degrees
+  @d_lat_odd 360.0 / 59.0   # 6.1016949... degrees
+
+  def decode_global(even, odd) do
+    # 17-bit CPR coordinates normalized to [0, 1)
+    yz_0 = even.lat_cpr / 131_072.0
+    yz_1 = odd.lat_cpr / 131_072.0
+    xz_0 = even.lon_cpr / 131_072.0
+    xz_1 = odd.lon_cpr / 131_072.0
+
+    # 1. Compute latitude index j
+    j = floor(59.0 * yz_0 - 60.0 * yz_1 + 0.5)
+
+    r_lat_even = @d_lat_even * (rem_floor(j, 60) + yz_0)
+    r_lat_odd = @d_lat_odd * (rem_floor(j, 59) + yz_1)
+
+    r_lat_even = if r_lat_even >= 270.0, do: r_lat_even - 360.0, else: r_lat_even
+    r_lat_odd = if r_lat_odd >= 270.0, do: r_lat_odd - 360.0, else: r_lat_odd
+
+    # Check which message is newer
+    {lat, nl, is_even_newer} =
+      if even.time >= odd.time do
+        {r_lat_even, nl(r_lat_even), true}
+      else
+        {r_lat_odd, nl(r_lat_odd), false}
+      end
+
+    if nl(r_lat_even) != nl(r_lat_odd) do
+      {:error, :cpr_transition_straddle}
+    else
+      # 2. Compute longitude
+      lon =
+        if is_even_newer do
+          ni = max(nl, 1)
+          d_lon = 360.0 / ni
+          m = floor(xz_0 * (nl - 1) - xz_1 * nl + 0.5)
+          normalize_lon(d_lon * (rem_floor(m, ni) + xz_0))
+        else
+          ni = max(nl - 1, 1)
+          d_lon = 360.0 / ni
+          m = floor(xz_0 * (nl - 1) - xz_1 * nl + 0.5)
+          normalize_lon(d_lon * (rem_floor(m, ni) + xz_1))
+        end
+
+      {:ok, {Float.round(lat, 5), Float.round(lon, 5)}}
+    end
+  end</code></pre>
+
+  <h3>The Systems Trap: Truncated Remainder vs. Floored Modulo</h3>
+
+  <p>
+    Look closely at line 115 in <code>cpr.ex</code>:
+  </p>
+
+  <pre><code>defp rem_floor(a, b) do
+  a - b * floor(a / b)
+end</code></pre>
+
+  <div class="callout warning">
+    <div class="callout-title">The C / Rust / Elixir Modulo Pitfall</div>
+    <p>
+      In C (<code>%</code>), Rust (<code>%</code>), and Elixir (<code>rem/2</code>), the remainder operator is <strong>truncated towards zero</strong>, not floored towards negative infinity!
+    </p>
+    <p>
+      If $a = -1$ and $b = 60$:
+      <ul>
+        <li>Truncated remainder (C/Rust <code>-1 % 60</code>): evaluates to <code>-1</code>.</li>
+        <li>Floored modulo (CPR requirement $\text{mod}(a, b)$): evaluates to <code>+59</code>.</li>
+      </ul>
+    </p>
+    <p>
+      When an aircraft flies near the equator or south of $0^\circ$ latitude, $j$ can be negative. Using standard <code>rem(j, 60)</code> causes the reconstructed latitude to leap by hundreds of miles! In C or Rust, you must write <code>((a % b) + b) % b</code> or <code>a.rem_euclid(b)</code>. In Elixir, <code>cpr.ex</code> implements true floored modulo via <code>rem_floor/2</code>.
+    </p>
+  </div>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-14-1">
+    <div class="quiz-question">
+      1. Why does CPR use two coprime grids (60 zones for Even, 59 zones for Odd) instead of transmitting absolute coordinates?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="true">It enables sub-5-meter precision across 17 bits via Vernier phase disambiguation.</li>
+      <li class="quiz-option" data-correct="false">It prevents radar spoofing by encrypting geographical coordinates in prime fields.</li>
+      <li class="quiz-option" data-correct="false">It compresses coordinate values through standard Huffman variable-length bit packing.</li>
+      <li class="quiz-option" data-correct="false">It allows binary floating-point mantissas to align cleanly with 64-bit CPU registers.</li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> Rather than quantizing the entire globe into 17 bits (which yields a coarse ~150-meter step), CPR encodes high-precision fractional positions within $6^\circ$ local zones. Pairing coprime zone counts (60 and 59) allows the receiver to recover the global zone index analytically via the Vernier phase difference.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-14-2">
+    <div class="quiz-question">
+      2. Why does the longitude zone function $NL(\text{lat})$ transition from 59 zones at the equator down to 1 zone at the poles?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="true">It compensates for latitude meridian convergence to preserve uniform physical zone widths.</li>
+      <li class="quiz-option" data-correct="false">It minimizes magnetic declination distortions caused by high-latitude solar wind flux.</li>
+      <li class="quiz-option" data-correct="false">It eliminates floating-point roundoff errors during planar Mercator conformal projection.</li>
+      <li class="quiz-option" data-correct="false">It matches aircraft cruising speeds which decrease significantly in polar jet streams.</li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> On a sphere, parallels of latitude contract proportional to $\cos(\phi)$. If the number of longitude zones remained fixed at 59, zone widths would collapse toward zero at the poles. The non-linear function $NL(\text{lat})$ dynamically reduces zone counts to keep physical zone width roughly constant (~360 NM) globally.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-14-3">
+    <div class="quiz-question">
+      3. Why does global CPR disambiguation fail if an Even and Odd pair are received more than 10 seconds apart?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="true">High-speed aircraft displacement exceeds zone ambiguity boundaries during transit.</li>
+      <li class="quiz-option" data-correct="false">Erlang process garbage collection automatically expires stale binary heap references.</li>
+      <li class="quiz-option" data-correct="false">Mode-S transponder clocks drift out of Phase-Locked Loop carrier synchronization.</li>
+      <li class="quiz-option" data-correct="false">Doppler shift at transponder frequencies induces bit errors in the CRC-24 parity.</li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> Global disambiguation assumes both frames represent virtually identical spatial coordinates. If excessive time elapses between frames, an aircraft traveling at 500+ knots moves far enough to introduce phase distortion into the Vernier calculation, risking an off-by-one zone misclassification.
+    </div>
+  </div>
+
+  <h2>Summary &amp; Engineering Takeaways</h2>
+
+  <ul>
+    <li><strong>Bit Budgeting:</strong> 34 bits is insufficient for linear global coordinates at navigation precision ($< 10\text{ m}$), but ample when encoding fractional offsets within localized modular zones.</li>
+    <li><strong>Vernier Geometry:</strong> Coprime zone divisions ($60$ vs. $59$) provide global uniqueness without central coordinates.</li>
+    <li><strong>Spherical Metric:</strong> Meridian convergence ($\cos\phi$) necessitates non-linear zone reduction ($NL(\text{lat})$) to prevent polar singularities.</li>
+    <li><strong>Systems Modulo:</strong> Always verify truncated remainder vs. floored modulo semantics when porting mathematical algorithms to C, Rust, or BEAM bytecode.</li>
+  </ul>
+
+  <div class="footer">
+    <span>Questions on CPR spherical mathematics, Vernier disambiguation, or DO-260B codecs? Ask your tutor agent!</span>
+    <span><a href="0013-zigler-in-sdr-architecture.html">&larr; Lesson 0013</a> | Lesson 0014</span>
+  </div>
+</body>
+</html>

@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 17: Pulse Shaping, Intersymbol Interference, and Root-Raised Cosine (RRC)</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0017</span>
+    <span class="badge badge-arch">Baseband DSP &amp; Modulation</span>
+    <span>Reading time: 12 minutes</span>
+  </div>
+
+  <h1>Pulse Shaping, Intersymbol Interference, and Root-Raised Cosine</h1>
+
+  <p>
+    In textbook digital logic, bits are crisp, instantaneous square transitions: a high voltage represents $1$, and a low voltage represents $0$. We imagine sending a sequence of rectangular pulses through the ether and sampling them cleanly at the receiver.
+  </p>
+
+  <p>
+    If you attempt this on the airwaves, two physical realities immediately destroy your link:
+  </p>
+  <ol>
+    <li><strong>Spectral Splatter:</strong> The sharp corners of rectangular pulses generate infinite high-frequency harmonics ($\text{sinc}$ sidelobes) that spill into neighboring frequencies, creating severe Adjacent-Channel Interference (ACI) and violating regulatory emission masks.</li>
+    <li><strong>Intersymbol Interference (ISI):</strong> When you pass those pulses through physical bandlimited filters or dispersive multipath channels, the pulses smear and stretch in time. The energy of previous and future symbols bleeds directly into the sampling instant of the current symbol.</li>
+  </ol>
+
+  <p>
+    This lesson explores the mathematics and systems engineering of <strong>Pulse Shaping</strong>: how Harry Nyquist's 1928 zero-ISI criterion and the <strong>Root-Raised Cosine (RRC)</strong> filter solve both problems simultaneously while maximizing receiver Signal-to-Noise Ratio (SNR).
+  </p>
+
+  <h2>1. The Physics of Rectangular Pulses: Spectral Catastrophe</h2>
+
+  <p>
+    Consider an unshaped baseband symbol stream transmitting symbols $a_k \in \{-1, +1\}$ at a symbol rate $R_s = 1/T_s$ baud. Each symbol is held for duration $T_s$, modeled by the continuous rectangular pulse:
+  </p>
+
+  $$p_{\text{rect}}(t) = \Pi\left(\frac{t}{T_s}\right) = \begin{cases} 1, & |t| \le \frac{T_s}{2} \\ 0, & |t| > \frac{T_s}{2} \end{cases}$$
+
+  <p>
+    Taking the continuous-time Fourier transform reveals the frequency-domain spectrum $P(f)$:
+  </p>
+
+  $$P(f) = \int_{-\infty}^{\infty} \Pi\left(\frac{t}{T_s}\right) e^{-j 2\pi f t} dt = T_s \frac{\sin(\pi f T_s)}{\pi f T_s} = T_s \text{sinc}(f T_s)$$
+
+  <p>
+    The Power Spectral Density (PSD) is proportional to $|P(f)|^2 = T_s^2 \text{sinc}^2(f T_s)$. This mathematical function carries severe physical consequences:
+  </p>
+
+  <div class="callout warning">
+    <div class="callout-title">The -20 dB/Decade Disaster &amp; Key Clicks</div>
+    <p>
+      While the main lobe nulls fall at integer multiples of the symbol rate $f = \pm 1/T_s$, the envelope of the sidelobes decays only as:
+    </p>
+    $$|P(f)| \propto \frac{1}{\pi |f| T_s} \implies |P(f)|^2 \propto \frac{1}{f^2} \quad (-20\text{ dB per decade})$$
+    <p>
+      In amateur radio, this is the classic phenomenon of <strong>key clicks</strong> in continuous wave (CW) Morse transmission. Hard-switching an RF carrier on and off generates broadband clicks hundreds of kilohertz away from your operating frequency.
+    </p>
+    <p>
+      Under <strong>FCC Part 97 (§97.307)</strong> and ITU-R spectral regulations, transmitters must constrain emissions within tight spectral masks. A raw rectangular pulse requires infinite RF bandwidth; transmitting it at legal power levels immediately pollutes adjacent channels.
+    </p>
+  </div>
+
+  <h2>2. The Bandlimiting Trap: Intersymbol Interference (ISI)</h2>
+
+  <p>
+    To satisfy spectral masks, an intuitive reaction is to insert a sharp lowpass filter (e.g., an 8th-order Butterworth or elliptic filter) at the transmitter output.
+  </p>
+
+  <p>
+    However, Fourier duality dictates that <em>sharp truncation in frequency creates infinite ringing in time</em>. The impulse response of a brick-wall lowpass filter of bandwidth $B$ is a continuous $\text{sinc}(2Bt)$ function whose ripples extend out to $t = \pm \infty$.
+  </p>
+
+  <p>
+    When a stream of symbols $a_k$ is transmitted through an arbitrary bandlimited channel $p(t)$, the continuous received baseband waveform before noise is:
+  </p>
+
+  $$r(t) = \sum_{k=-\infty}^{\infty} a_k p(t - k T_s)$$
+
+  <p>
+    At the receiver, the demodulator samples $r(t)$ at periodic strobe instants $t = m T_s + t_0$. Assuming optimal clock alignment ($t_0 = 0$):
+  </p>
+
+  $$r(m T_s) = a_m p(0) + \sum_{\substack{k=-\infty \\ k \ne m}}^{\infty} a_k p\big((m - k) T_s\big)$$
+
+  <table style="margin: 1.5rem 0;">
+    <thead>
+      <tr>
+        <th style="width: 25%;">Term</th>
+        <th style="width: 35%;">Expression</th>
+        <th style="width: 40%;">Physical Meaning</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Desired Symbol</strong></td>
+        <td>$a_m p(0)$</td>
+        <td>The target bit/symbol at the current sampling instant $m$.</td>
+      </tr>
+      <tr>
+        <td><strong>Intersymbol Interference (ISI)</strong></td>
+        <td>$\sum_{k \ne m} a_k p((m - k) T_s)$</td>
+        <td>Ringing tails of all preceding and succeeding symbols decaying into sample $m$.</td>
+      </tr>
+      <tr>
+        <td><strong>Noise Sample</strong></td>
+        <td>$n(m T_s)$</td>
+        <td>Thermal noise and receiver frontend distortion.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    If $p((m - k) T_s) \ne 0$ for $k \ne m$, the sum of interfering tails can easily exceed the magnitude of $a_m p(0)$. When $a_m = +1$, a sequence of neighboring $-1$ symbols will push the sampled voltage below the decision threshold, causing an unrecoverable bit error—even in a noiseless channel ($n(t) = 0$).
+  </p>
+
+  <h2>3. Nyquist's First Criterion for Zero ISI</h2>
+
+  <p>
+    In his landmark 1928 paper <em>"Certain Topics in Telegraph Transmission Theory"</em>, Harry Nyquist proved that we do not need the pulse $p(t)$ to be zero outside the symbol interval $[0, T_s]$. We only require that the pulse passes through zero at every non-zero integer multiple of the symbol period:
+  </p>
+
+  $$\boxed{p(k T_s) = \begin{cases} 1, & k = 0 \\ 0, & k \ne 0 \quad (k \in \mathbb{Z}) \end{cases}}$$
+
+  <p>
+    What does this condition require in the frequency domain? Sampling $p(t)$ at uniform rate $1/T_s$ generates periodic spectral replicas spaced by the symbol rate $R_s = 1/T_s$. Nyquist proved that the time-domain zero-crossing condition is mathematically equivalent to:
+  </p>
+
+  $$\boxed{\sum_{k=-\infty}^{\infty} P\left(f - \frac{k}{T_s}\right) = T_s \quad \text{for all } f}$$
+
+  <p>
+    The shifted spectral replicas of the pulse must sum to a flat constant across all frequencies.
+  </p>
+
+  <h3>The Minimum Bandwidth Solution: The Ideal Sinc Pulse</h3>
+  <p>
+    The absolute minimum continuous bandwidth that can satisfy Nyquist's criterion is a brick-wall lowpass filter extending from $-R_s/2$ to $+R_s/2$:
+  </p>
+
+  $$P_{\min}(f) = \begin{cases} T_s, & |f| \le \frac{1}{2 T_s} \\ 0, & |f| > \frac{1}{2 T_s} \end{cases}$$
+
+  <p>
+    This theoretical boundary is the <strong>Nyquist Bandwidth</strong>:
+  </p>
+  $$B_{\min} = \frac{R_s}{2} = \frac{1}{2 T_s}\text{ Hz}$$
+
+  <p>
+    Taking the inverse Fourier transform yields the ideal Nyquist pulse in the time domain:
+  </p>
+
+  $$p(t) = \text{sinc}\left(\frac{t}{T_s}\right) = \frac{\sin(\pi t / T_s)}{\pi t / T_s}$$
+
+  <div class="callout warning">
+    <div class="callout-title">Why the Ideal Sinc Pulse is Unusable in Real Systems</div>
+    <p>
+      Every digital communications textbook introduces the sinc pulse as the theoretical optimum. In practical SDR implementations, it is catastrophic:
+    </p>
+    <ul>
+      <li><strong>Non-Causality &amp; Truncation Ringing:</strong> A sinc pulse extends from $-\infty$ to $+\infty$. Truncating it to a practical FIR filter length introduces severe Gibbs ripple that destroys the exact zero-crossings.</li>
+      <li><strong>Fragility to Timing Jitter ($1/t$ Decay):</strong> Sinc tails decay extremely slowly, proportional to $1/t$. If the receiver clock suffers from a minute timing error $\Delta t$, the sampled ISI evaluates to:
+        $$\text{ISI} \approx \sum_{k \ne 0} a_k \frac{\sin(\pi (k + \Delta t / T_s))}{\pi (k + \Delta t / T_s)} \approx \frac{\sin(\pi \Delta t / T_s)}{\pi} \sum_{k \ne 0} \frac{(-1)^k a_k}{k}$$
+        Because the harmonic series $\sum 1/k$ diverges, an alternating sequence of symbols ($+1, -1, +1, -1\dots$) causes the accumulated ISI to diverge to infinity! A 1% clock phase error can close the receiver eye completely.
+      </li>
+    </ul>
+  </div>
+
+  <h2>4. The Raised Cosine (RC) Filter &amp; Excess Bandwidth</h2>
+
+  <p>
+    To eliminate the catastrophic $1/t$ decay while preserving Nyquist's zero-ISI property, we introduce <strong>excess bandwidth</strong> beyond the Nyquist minimum $B_0 = 1/(2T_s)$.
+  </p>
+
+  <p>
+    Instead of a sharp rectangular brick wall in frequency, we roll off the transition band smoothly using a raised cosine function that possesses <em>odd symmetry</em> around the Nyquist frequency $f_N = 1/(2T_s)$:
+  </p>
+
+  $$H_{RC}(f) = \begin{cases}
+  T_s, & 0 \le |f| \le \frac{1-\alpha}{2T_s} \\
+  \frac{T_s}{2} \left[ 1 + \cos\left( \frac{\pi T_s}{\alpha} \left( |f| - \frac{1-\alpha}{2T_s} \right) \right) \right], & \frac{1-\alpha}{2T_s} < |f| \le \frac{1+\alpha}{2T_s} \\
+  0, & |f| > \frac{1+\alpha}{2T_s}
+  \end{cases}$$
+
+  <p>
+    The parameter $\alpha \in [0, 1]$ is the <strong>roll-off factor</strong> (also called the <strong>excess bandwidth parameter</strong>):
+  </p>
+  <ul>
+    <li>$\alpha = 0$: Reverts to the ideal brick-wall sinc filter with minimum bandwidth $B = R_s / 2$.</li>
+    <li>$\alpha = 1.0$: Full 100% excess bandwidth; the spectrum extends to $B = R_s$.</li>
+    <li>The total occupied single-sided RF baseband bandwidth is:
+      $$\boxed{B_{RC} = \frac{R_s}{2}(1 + \alpha)}$$
+    </li>
+  </ul>
+
+  <h3>Impulse Response and the Fast $1/t^3$ Decay</h3>
+  <p>
+    Computing the inverse Fourier transform of $H_{RC}(f)$ yields:
+  </p>
+
+  $$\boxed{h_{RC}(t) = \text{sinc}\left(\frac{t}{T_s}\right) \cdot \frac{\cos\left(\frac{\pi \alpha t}{T_s}\right)}{1 - \left(\frac{2\alpha t}{T_s}\right)^2}}$$
+
+  <p>
+    Notice the two factors in $h_{RC}(t)$:
+  </p>
+  <ol>
+    <li>$\text{sinc}(t/T_s)$: Guarantees exact zero-crossings at every integer symbol instant $t = k T_s$ ($k \ne 0$), satisfying Nyquist's First Criterion.</li>
+    <li>$\frac{\cos(\pi \alpha t / T_s)}{1 - (2\alpha t / T_s)^2}$: Introduces an asymptotic decay factor of $1/t^2$. Combined with the $1/t$ decay of the sinc function, the overall impulse response decays as:
+      $$|h_{RC}(t)| \propto \frac{1}{t^3} \quad \text{for } |t| \gg T_s$$
+    </li>
+  </ol>
+
+  <div class="callout upside">
+    <div class="callout-title">Why $1/t^3$ Decay Saves Practical SDRs</div>
+    <p>
+      Because $\sum_{k=1}^{\infty} \frac{1}{k^3} = \zeta(3) \approx 1.202$ converges rapidly, any residual timing offset $\Delta t$ produces strictly bounded, negligible ISI. Truncating the FIR filter to just 6 or 8 symbol periods captures over 99.99% of the total pulse energy without generating observable spectral splatter.
+    </p>
+  </div>
+
+  <h2>5. The Root-Raised Cosine (RRC) Split</h2>
+
+  <p>
+    If the Raised Cosine filter provides zero ISI, why don't we simply apply $H_{RC}(f)$ as an FIR pulse-shaping filter at the transmitter and use a wideband lowpass filter at the receiver?
+  </p>
+
+  <p>
+    The answer lies in the fundamental theorem of digital communications: the <strong>Matched Filter Theorem</strong> (established in Lesson 4).
+  </p>
+
+  <h3>The Matched Filter Dilemma</h3>
+  <p>
+    In an Additive White Gaussian Noise (AWGN) channel, the receiver filter $H_{RX}(f)$ that maximizes the output Signal-to-Noise Ratio (SNR) at the sampling instant must be the complex conjugate of the received pulse shape:
+  </p>
+
+  $$H_{RX}(f) = H_{TX}^*(f)$$
+
+  <p>
+    Now observe the contradiction:
+  </p>
+  <ul>
+    <li>If we place the full Raised Cosine filter at the transmitter ($H_{TX}(f) = H_{RC}(f)$), then a matched receiver must also apply $H_{RX}(f) = H_{RC}(f)$. The end-to-end composite channel response would be:
+      $$H_{\text{total}}(f) = H_{TX}(f) \cdot H_{RX}(f) = H_{RC}^2(f) \ne H_{RC}(f)$$
+      $H_{RC}^2(f)$ does <em>not</em> satisfy the Nyquist zero-ISI criterion! The squared cosine roll-off destroys the odd symmetry around $f_N$, introducing severe self-ISI.
+    </li>
+    <li>If instead the receiver uses a wideband flat filter to avoid altering $H_{RC}(f)$, it admits out-of-band noise, drastically reducing the receiver SNR and wasting link margin.</li>
+  </ul>
+
+  <h3>The Geometric Split: Root-Raised Cosine</h3>
+  <p>
+    To satisfy <strong>both</strong> the Matched Filter Theorem (optimal SNR) and Nyquist's First Criterion (zero ISI), we split the frequency response equally between transmitter and receiver:
+  </p>
+
+  $$\boxed{H_{TX}(f) = \sqrt{H_{RC}(f)} \equiv H_{RRC}(f)}$$
+  $$\boxed{H_{RX}(f) = \sqrt{H_{RC}(f)} \equiv H_{RRC}(f)}$$
+
+  <p>
+    Under this symmetric architecture:
+  </p>
+  $$H_{\text{total}}(f) = H_{TX}(f) \cdot H_{channel}(f) \cdot H_{RX}(f) = \sqrt{H_{RC}(f)} \cdot 1 \cdot \sqrt{H_{RC}(f)} = H_{RC}(f)$$
+
+  <pre><code>[Transmitter]                                      [Channel]                  [Receiver]
+Symbols a[k] ──► [Upsampler ↑L] ──► [RRC Filter] ──────► [AWGN Channel] ──────► [RRC Matched Filter] ──► [Sampler t=kTs] ──► a^[k]
+                                     H_TX(f)=√H_RC                              H_RX(f)=√H_RC
+                                                                         Overall Cascade = H_RC(f) (Zero ISI!)</code></pre>
+
+  <div class="callout warning">
+    <div class="callout-title">Vital Subtlety: RRC Alone Has Non-Zero ISI!</div>
+    <p>
+      An isolated Root-Raised Cosine pulse $h_{RRC}(t)$ <strong>does not satisfy Nyquist's zero-ISI criterion</strong>. If you probe the output of the transmitter RRC filter directly on an oscilloscope, you will see significant intersymbol interference at integer multiples of $T_s$.
+    </p>
+    <p>
+      Zero ISI is achieved <em>only</em> after the received signal has passed through the receiver's matched RRC filter:
+    </p>
+    $$h_{\text{composite}}(t) = h_{RRC}(t) * h_{RRC}(t) = h_{RC}(t)$$
+  </div>
+
+  <h3>Continuous RRC Impulse Response Equation</h3>
+  <p>
+    The analytical impulse response $h_{RRC}(t)$ of a Root-Raised Cosine filter is given by:
+  </p>
+
+  $$\boxed{h_{RRC}(t) = \frac{1}{\sqrt{T_s}} \frac{\sin\left(\pi \frac{t}{T_s}(1-\alpha)\right) + 4\alpha \frac{t}{T_s}\cos\left(\pi \frac{t}{T_s}(1+\alpha)\right)}{\pi \frac{t}{T_s} \left(1 - \left(4\alpha \frac{t}{T_s}\right)^2\right)}}$$
+
+  <p>
+    When implementing this equation in C, Rust, or Zig, notice the two removable singularities:
+  </p>
+  <ul>
+    <li>At the pulse center $t = 0$:
+      $$h_{RRC}(0) = \frac{1}{\sqrt{T_s}} \left( 1 - \alpha + \frac{4\alpha}{\pi} \right)$$
+    </li>
+    <li>At $t = \pm \frac{T_s}{4\alpha}$ (where the denominator evaluates to zero): applying L'Hôpital's rule yields:
+      $$h_{RRC}\left(\pm \frac{T_s}{4\alpha}\right) = \frac{\alpha}{\sqrt{2 T_s}} \left[ \left(1 + \frac{2}{\pi}\right)\sin\left(\frac{\pi}{4\alpha}\right) + \left(1 - \frac{2}{\pi}\right)\cos\left(\frac{\pi}{4\alpha}\right) \right]$$
+    </li>
+  </ul>
+
+  <h2>6. Reading the Eye Diagram: Signal Integrity &amp; Jitter Margin</h2>
+
+  <p>
+    An <strong>Eye Diagram</strong> is created by overlaying time-domain segments of the demodulated baseband signal synchronized to the symbol clock period $T_s$. The resulting display provides an instant diagnostic of link quality:
+  </p>
+
+  <pre><code>   Voltage
+     ▲
++1.0 ┼───────······╭──────────────╮······───────   &lt;-- Peak Signal Level (+1)
+     │            /                \
+     │           /   Eye Height     \
+     │          /   (Noise Margin)   \
+ 0.0 ┼─────────X──────────────────────X─────────   &lt;-- Decision Threshold / Zero Crossing
+     │          \                    /
+     │           \  |◄-Eye Width-►| /
+     │            \ (Jitter Margin)/
+-1.0 ┼───────······╰──────────────╯······───────   &lt;-- Peak Signal Level (-1)
+     └─────────────┬──────────────────┬─────────► Time
+                t = -Ts/2           t = +Ts/2
+                   ▲                  ▲
+             Zero Crossing       Optimal Strobe
+                Jitter              Instant</code></pre>
+
+  <table style="margin: 1.5rem 0;">
+    <thead>
+      <tr>
+        <th style="width: 25%;">Eye Parameter</th>
+        <th style="width: 35%;">Physical Cause</th>
+        <th style="width: 40%;">DSP / Receiver Impact</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Eye Height (Vertical Aperture)</strong></td>
+        <td>Total signal amplitude minus accumulated ISI at optimal sampling instant $t = k T_s$.</td>
+        <td>Direct measure of <strong>noise margin</strong>. A smaller eye height requires higher SNR to maintain a target Bit Error Rate (BER).</td>
+      </tr>
+      <tr>
+        <td><strong>Eye Width (Horizontal Aperture)</strong></td>
+        <td>Duration over which the signal can be sampled without polarity error from ISI.</td>
+        <td>Direct measure of <strong>timing jitter tolerance</strong>. Quantifies allowable phase drift in the symbol timing recovery loop (e.g., Gardner detector).</td>
+      </tr>
+      <tr>
+        <td><strong>Zero-Crossing Jitter</strong></td>
+        <td>Dispersion of transition trajectories across the zero axis.</td>
+        <td>Introduces phase noise into zero-crossing timing detectors and clock-recovery phase-locked loops (PLLs).</td>
+      </tr>
+      <tr>
+        <td><strong>Transition Slope ($dV/dt$)</strong></td>
+        <td>Filter roll-off factor $\alpha$ and channel cutoff steepness.</td>
+        <td>Steeper slopes increase sensitivity to timing errors: a minute clock shift produces a large voltage error.</td>
+      </tr>
+      <tr>
+        <td><strong>Peak-to-Average Power Ratio (PAPR)</strong></td>
+        <td>Overshoot of the pulse shaping filter beyond nominal constellation points.</td>
+        <td>Requires larger transmitter power amplifier (PA) back-off to prevent non-linear compression and spectral regrowth.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Visualizing the Trade-off: $\alpha = 0.2$ vs. $\alpha = 0.5$ vs. $\alpha = 1.0$</h3>
+
+  <p>
+    Choosing $\alpha$ is a fundamental engineering compromise between spectral density and implementation margin:
+  </p>
+
+  <ul>
+    <li><strong>$\alpha = 0.2$ (Tight Spectrum):</strong> High spectral efficiency ($B = 1.2 \times R_s / 2$). However, the eye diagram has a narrower opening, substantial overshoot (ringing tails), and steep transition slopes. Requires high-precision timing recovery and linear PAs. Used in satellite communications (DVB-S2) and amateur QO-100 DATV.</li>
+    <li><strong>$\alpha = 0.35 - 0.5$ (Balanced):</strong> Moderate excess bandwidth ($35\text{–}50\%$). Broad eye opening, low timing sensitivity, moderate overshoot. Standard in terrestrial digital radio, cellular (3G/LTE), and amateur digital voice (DMR $\alpha = 0.36$).</li>
+    <li><strong>$\alpha = 1.0$ (Wide Eye):</strong> Consumes double the Nyquist bandwidth ($B = R_s$), but provides the maximum possible eye height and width. Zero-crossings are rock solid, making clock recovery trivial.</li>
+  </ul>
+
+  <h2>7. Systems Architecture: Implementing Discrete RRC Filtering</h2>
+
+  <p>
+    In an SDR baseband pipeline (such as GNU Radio, a C/Rust DSP engine, or an Elixir/Zigler NIF), pulse shaping is implemented using discrete multirate filtering.
+  </p>
+
+  <p>
+    To shape digital symbols into a continuous-like baseband waveform, the symbol stream must first be upsampled to an intermediate sample rate $f_s = L \cdot R_s$, where $L$ is the number of <strong>samples per symbol</strong> (typically $L = 4, 8$, or $16$):
+  </p>
+
+  <ol>
+    <li><strong>Zero-Stuffing (Upsampling by $L$):</strong> Insert $L - 1$ zeros between consecutive symbols $a[k]$:
+      $$x[m] = \begin{cases} a[m / L], & m \bmod L = 0 \\ 0, & m \bmod L \ne 0 \end{cases}$$
+    </li>
+    <li><strong>FIR Convolution:</strong> Convolve the zero-stuffed stream with a discrete truncated RRC filter $h[n]$:
+      $$y[m] = \sum_{n=-N}^{N} x[m - n] \cdot h[n]$$
+    </li>
+  </ol>
+
+  <h3>Filter Truncation &amp; Filter Span</h3>
+  <p>
+    A discrete RRC filter is parameterized by its <strong>symbol span</strong> $N_{\text{span}}$ (the number of symbol periods spanned by the filter on each side of the center tap). The total number of FIR filter taps is:
+  </p>
+
+  $$N_{\text{taps}} = 2 \cdot N_{\text{span}} \cdot L + 1$$
+
+  <p>
+    For example, with $N_{\text{span}} = 6$ and $L = 4$ samples/symbol, $N_{\text{taps}} = 2 \times 6 \times 4 + 1 = 49$ taps. Choosing $N_{\text{span}} \ge 6$ ensures that the out-of-band spectral attenuation exceeds $60\text{ dB}$, satisfying emission masks.
+  </p>
+
+  <h3>The Polyphase Decomposition Breakthrough</h3>
+  <p>
+    Notice a massive computational inefficiency in direct convolution: because $x[m]$ was formed by zero-stuffing, <strong>$(L - 1)$ out of every $L$ samples in the buffer are zero</strong>! A naive FIR filter spends $75\%$ (for $L=4$) to $87.5\%$ (for $L=8$) of its CPU cycles multiplying filter coefficients by zero!
+  </p>
+
+  <div class="callout upside">
+    <div class="callout-title">The Polyphase Interpolator Architecture</div>
+    <p>
+      By decomposing the $N_{\text{taps}}$-length prototype filter $h[n]$ into $L$ smaller sub-filters (phases) $p_\ell[k] = h[k L + \ell]$ for $\ell \in \{0, 1, \dots, L - 1\}$, we commute decimation before multiplication:
+    </p>
+    <pre><code>                 ┌──► [Sub-filter p_0[k]] ──► y[m*L + 0]
+                 ├──► [Sub-filter p_1[k]] ──► y[m*L + 1]
+Symbols a[k] ────┼──► [Sub-filter p_2[k]] ──► y[m*L + 2]
+                 └──► [Sub-filter p_3[k]] ──► y[m*L + 3]
+                 (Each sub-filter has only 2*N_span + 1 taps!)</code></pre>
+    <p>
+      Every input symbol $a[k]$ is passed into the sub-filters without inserting a single zero. For each input symbol, the polyphase engine outputs $L$ continuous baseband samples. This eliminates 100% of the useless zero-multiplications and maps directly to SIMD vector registers (AVX2/NEON FMA instructions).
+    </p>
+  </div>
+
+  <h2>8. HAM Radio &amp; Commercial Standards Comparison</h2>
+
+  <p>
+    Different radio protocols choose pulse shaping parameters based on their channel constraints:
+  </p>
+
+  <table style="margin: 1.5rem 0;">
+    <thead>
+      <tr>
+        <th style="width: 20%;">Standard / Mode</th>
+        <th style="width: 25%;">Modulation Scheme</th>
+        <th style="width: 25%;">Pulse Shaping Filter</th>
+        <th style="width: 30%;">Operational Reason</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>DMR (Digital Mobile Radio)</strong></td>
+        <td>4FSK (4800 baud / 9600 bps)</td>
+        <td>Root-Raised Cosine ($\alpha = 0.36$)</td>
+        <td>Strict $12.5\text{ kHz}$ channel spacing; RRC frequency shaping prevents ACI while maintaining low jitter for FM discriminators.</td>
+      </tr>
+      <tr>
+        <td><strong>P25 Phase 2</strong></td>
+        <td>H-CPM / CQPSK (6000 baud)</td>
+        <td>Root-Raised Cosine ($\alpha = 0.2$)</td>
+        <td>Narrow $6.25\text{ kHz}$ equivalent bandwidth for public safety repeaters; requires high spectral containment.</td>
+      </tr>
+      <tr>
+        <td><strong>QO-100 DATV (DVB-S2)</strong></td>
+        <td>QPSK / 8PSK / 16APSK</td>
+        <td>Root-Raised Cosine ($\alpha = 0.20, 0.25, 0.35$)</td>
+        <td>Transponder bandwidth is precious; low $\alpha$ maximizes raw bit rate through satellite transponders.</td>
+      </tr>
+      <tr>
+        <td><strong>APRS / Packet Radio</strong></td>
+        <td>1200 baud AFSK (Bell 202)</td>
+        <td>Unshaped audio tones (Analog LPF)</td>
+        <td>Legacy 1980s standard; relies on audio bandpass filtering rather than digital pulse shaping. Causes broad sideband splatter.</td>
+      </tr>
+      <tr>
+        <td><strong>FT8 / WSPR (WSJT-X)</strong></td>
+        <td>Continuous Phase FSK (8-GFSK / 4-GFSK)</td>
+        <td>Gaussian Pulse Shaping ($BT = 2.0$)</td>
+        <td>Gaussian filtering maintains a strictly continuous RF phase envelope (constant modulus), allowing non-linear Class-C PAs with zero AM-to-PM distortion.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-17-1">
+    <div class="quiz-question">
+      1. Why does an isolated Root-Raised Cosine (RRC) filter at the transmitter output fail to exhibit zero Intersymbol Interference (ISI)?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The transmitter power amplifier non-linearity clips the sidelobes, creating odd-harmonic phase distortion.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Only the combined cascade of transmit and receive RRC filters produces the full Raised Cosine zero-ISI response.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Digital baseband upsamplers introduce spectral aliases that cannot be removed without analog SAW filtering.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The discrete Fourier transform of an RRC pulse does not possess continuous frequency-domain derivatives.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> An RRC frequency response is the square root of a Raised Cosine response ($H_{RRC}(f) = \sqrt{H_{RC}(f)}$). In the time domain, $h_{RRC}(t)$ does not have zero-crossings at $t = k T_s$. Zero ISI is achieved only when the signal passes through the matched RRC filter at the receiver: $\sqrt{H_{RC}(f)} \cdot \sqrt{H_{RC}(f)} = H_{RC}(f)$.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-17-2">
+    <div class="quiz-question">
+      2. What is the fundamental trade-off when decreasing the excess bandwidth parameter $\alpha$ from 0.8 to 0.2?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Total RF bandwidth decreases by 60%, but the receiver requires double the number of bits per ADC sample.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The signal becomes immune to Doppler shift, but the transmitter power amplifier operates at lower efficiency.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        RF occupied bandwidth is compressed, but the eye aperture narrows and sensitivity to timing jitter increases.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Quadrature modulation error vectors cancel out, but the minimum required FIR filter taps increases to infinity.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> Lowering $\alpha$ narrows the occupied bandwidth ($B = \frac{R_s}{2}(1 + \alpha)$), achieving higher spectral efficiency. However, the time-domain pulse tails decay more slowly, narrowing the open eye margin and dramatically increasing the receiver's sensitivity to clock timing jitter and phase noise.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-17-3">
+    <div class="quiz-question">
+      3. Why does polyphase decomposition yield a multi-fold speedup when implementing an upsampling RRC FIR filter in discrete baseband DSP?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        It converts the time-domain convolution into a single scalar multiply in the discrete frequency domain.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        It partitions filter taps into sub-filters, eliminating all multiplications by the inserted zero samples.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It rounds floating-point filter coefficients to 8-bit integers that execute on microcontroller hardware.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It distributes consecutive signal samples across multiple CPU cores via asynchronous message passing.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> Standard upsampling by $L$ inserts $L - 1$ zeros between adjacent symbols. Direct FIR convolution wastefully multiplies these zeros. Polyphase decomposition restructures the filter into $L$ parallel sub-filters operating directly on the non-zero symbols, completely eliminating the $L-1$ zero-multiplications.
+    </div>
+  </div>
+
+  <h2>Recommended Primary Sources</h2>
+  <p>
+    To deepen your mathematical and RF intuition on pulse shaping:
+  </p>
+  <ul>
+    <li>
+      <a href="https://pysdr.org/content/pulse_shaping.html" target="_blank" rel="noopener"><strong>PySDR: Pulse Shaping &amp; Raised Cosine Filters</strong> by Dr. Marc Lichtman</a> — Visual Python walkthrough of impulse responses, spectral containment, and eye diagrams.
+    </li>
+    <li>
+      <strong>"Certain Topics in Telegraph Transmission Theory"</strong> (Harry Nyquist, 1928, <em>AIEE Transactions</em>) — The original foundational paper deriving the minimum bandwidth and zero-ISI conditions.
+    </li>
+    <li>
+      Review our canonical terminology in <a href="../GLOSSARY.md">GLOSSARY.md</a> and reference architectures in <a href="../reference/sdr-architecture-comparison.html">SDR Architecture Comparison</a>.
+    </li>
+  </ul>
+
+  <div class="footer">
+    <span>Questions on roll-off factors, polyphase sub-filters, or eye diagrams? Ask your tutor agent!</span>
+    <span><a href="0013-zigler-in-sdr-architecture.html">&larr; Lesson 0013</a> | Lesson 0017</span>
+  </div>
+</body>
+</html>

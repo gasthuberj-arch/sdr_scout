@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 20: Phased Array Beamforming — Delay-and-Sum, Steering Vectors, &amp; Adaptive Spatial Nulling</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0020</span>
+    <span class="badge badge-arch">Phased Arrays &amp; Spatial Filtering</span>
+    <span>Reading time: 14 minutes</span>
+  </div>
+
+  <h1>Phased Array Beamforming: Delay-and-Sum, Steering Vectors, &amp; Adaptive Spatial Nulling</h1>
+
+  <p>
+    Up to this point in our SDR journey, our DSP architectures have operated along two classical dimensions: <strong>time</strong> and <strong>frequency</strong>. We designed FIR/IIR lowpass filters to carve out spectral bands, polyphase filterbanks to channelize wideband spectrum, and matched filters to maximize SNR against temporal waveforms.
+  </p>
+
+  <p>
+    However, consider a scenario every electronic warfare engineer and amateur radio operator eventually faces:
+  </p>
+  <blockquote>
+    A high-power co-channel interferer or deliberate jammer arrives at <strong>the exact same carrier frequency</strong>, occupies <strong>the exact same bandwidth</strong>, and transmits during <strong>the exact same time window</strong> as your weak Signal of Interest (SOI).
+  </blockquote>
+
+  <p>
+    In the 1D temporal/spectral domain, the SOI and the jammer are completely entangled. No scalar bandpass filter or time gate can separate them without destroying the SOI itself. To break this impasse, we must expand our DSP into a brand-new degree of freedom: <strong>spatial aperture</strong>.
+  </p>
+
+  <h2>1. Beyond Single Antennas: The Physics of Spatial Filtering</h2>
+
+  <p>
+    Radio waves propagate as transverse electromagnetic fields $\vec{E}(\vec{r}, t)$ in three-dimensional space. An antenna array is a spatial sampling device: by placing $M$ distinct antenna elements at precise physical coordinates $\vec{r}_0, \vec{r}_1, \dots, \vec{r}_{M-1}$, we sample the incoming wavefront across space as well as time.
+  </p>
+
+  <p>
+    Because electromagnetic waves propagate at finite speed ($c \approx 3 \times 10^8\text{ m/s}$), an incident planar wavefront strikes different antennas at slightly different instants. This propagation delay translates directly into a <strong>phase gradient</strong> across the array elements:
+  </p>
+
+  $$\mathbf{x}[n] = \begin{bmatrix} x_0[n] \\ x_1[n] \\ \vdots \\ x_{M-1}[n] \end{bmatrix} \in \mathbb{C}^M$$
+
+  <p>
+    By applying complex weights $\mathbf{w} = [w_0, w_1, \dots, w_{M-1}]^T$ to these discrete antenna feeds and summing the results, we construct a <strong>spatial FIR filter</strong>. Just as a temporal FIR filter reinforces desired frequency components and notches out unwanted frequencies, a spatial filter reinforces signals arriving from a desired <strong>Angle of Arrival (AoA)</strong> while steering deep destructive nulls toward interferers.
+  </p>
+
+  <h2>2. Uniform Linear Array (ULA) Geometry &amp; The Spatial Nyquist Limit</h2>
+
+  <p>
+    The simplest and most widely deployed array geometry is the <strong>Uniform Linear Array (ULA)</strong>: $M$ identical, omnidirectional antenna elements arranged in a straight line along the $x$-axis with constant inter-element distance $d$.
+  </p>
+
+  <p>
+    Assume an incident plane wave arrives in the far field (Fraunhofer region, distance $R > \frac{2 D^2}{\lambda}$, where $D = (M-1)d$ is the total physical array aperture). Let the Angle of Arrival be $\theta$, defined relative to the array broadside ($\theta = 0^\circ$ perpendicular to the line of elements; $\theta = \pm 90^\circ$ along the array axis, known as endfire).
+  </p>
+
+  <h3>Phase Shift as a Function of Angle of Arrival (AoA)</h3>
+  <p>
+    Taking element $0$ at the origin as our phase reference, the wave travels an extra geometric path distance $\Delta l_m$ to reach element $m$:
+  </p>
+
+  $$\Delta l_m = m \cdot d \cdot \sin\theta, \quad m \in \{0, 1, \dots, M-1\}$$
+
+  <p>
+    The propagation delay between element $0$ and element $m$ is $\tau_m = \frac{\Delta l_m}{c} = \frac{m d \sin\theta}{c}$. For a carrier wavelength $\lambda = \frac{c}{f_c}$, this spatial delay manifests as an electrical phase shift:
+  </p>
+
+  $$\Delta \psi = 2\pi f_c \tau_m = \frac{2\pi f_c}{c} (m d \sin\theta) = m \cdot \left( \frac{2\pi d}{\lambda} \sin\theta \right)$$
+
+  <p>
+    We define the fundamental inter-element spatial phase difference as:
+  </p>
+
+  $$\psi(\theta) = \frac{2\pi d}{\lambda}\sin\theta = k \cdot d \cdot \sin\theta$$
+
+  <p>
+    where $k = \frac{2\pi}{\lambda}$ is the electromagnetic wavenumber.
+  </p>
+
+  <div class="callout">
+    <div class="callout-title">The Narrowband Array Assumption</div>
+    <p>
+      Replacing a pure time delay $\tau_m$ with a single scalar phase rotation $e^{-j 2\pi f_c \tau_m}$ requires that the complex baseband modulation envelope $s(t)$ does not change appreciably while the wavefront traverses the entire array aperture $D$:
+    </p>
+    $$B \ll \frac{c}{(M-1)d} \implies \tau_{\text{transit}} \ll \frac{1}{B}$$
+    <p>
+      For a 4-element 2.4 GHz WiFi array ($d = 6.25\text{ cm}$, total aperture $18.75\text{ cm}$), the transit time is $0.625\text{ ns}$. As long as signal bandwidth $B \ll 1.6\text{ GHz}$, the narrowband phase-rotation model holds rigorously.
+    </p>
+  </div>
+
+  <h3>The Spatial Nyquist Criterion: Why $d = \lambda / 2$</h3>
+  <p>
+    In discrete time sampling, the Nyquist-Shannon theorem dictates that $f_s \ge 2 f_{\max}$ (or $T_s \le \frac{1}{2 f_{\max}}$) to prevent spectral aliasing. An identical physical law governs spatial sampling.
+  </p>
+
+  <p>
+    The physical spatial frequency across the array line is the projected wavenumber:
+  </p>
+  $$\nu_x = \frac{\sin\theta}{\lambda}$$
+
+  <p>
+    Because the physical angle of arrival $\theta$ is restricted to real space $[-\pi/2, +\pi/2]$, the sine term spans the "visible region":
+  </p>
+  $$-1 \le \sin\theta \le +1 \implies \Delta \nu_x = \frac{2}{\lambda}$$
+
+  <p>
+    The array samples this continuous spatial wavefield at spatial intervals of $d$ meters (spatial sampling rate $f_{s,\text{spatial}} = \frac{1}{d}\text{ cycles/meter}$). To prevent spatial frequency aliasing:
+  </p>
+
+  $$f_{s,\text{spatial}} \ge \Delta \nu_x \implies \frac{1}{d} \ge \frac{2}{\lambda} \implies \mathbf{d \le \frac{\lambda}{2}}$$
+
+  <div class="callout warning">
+    <div class="callout-title">The Danger of Spatial Grating Lobes ($d > \lambda / 2$)</div>
+    <p>
+      If elements are spaced wider than half a wavelength (e.g., $d = \lambda$ or $1.5\lambda$), the phase difference between adjacent elements exceeds $2\pi$:
+    </p>
+    $$\psi(\theta) = \frac{2\pi (\lambda)}{\lambda} \sin\theta = 2\pi \sin\theta$$
+    <p>
+      A wave arriving from broadside ($\theta = 0^\circ \implies \psi = 0$) produces <strong>identical phase measurements</strong> to a wave arriving from $\theta = \pm 90^\circ$ ($\psi = \pm 2\pi \equiv 0 \pmod{2\pi}$).
+    </p>
+    <p>
+      The beampattern develops <strong>grating lobes</strong>: duplicate main beams with full $0\text{ dB}$ gain pointing in completely wrong directions! Any out-of-band noise or jammer located inside a grating lobe enters the receiver completely unattenuated.
+    </p>
+  </div>
+
+  <p>
+    Conversely, if $d < \lambda / 2$, grating lobes are avoided, but the total physical aperture $(M-1)d$ shrinks, yielding a broader main beam. Furthermore, electromagnetic mutual coupling (near-field reactive mutual impedance between adjacent metallic antennas) escalates sharply, degrading the receiver noise figure and distorting calibration. Hence, <strong>$d = \lambda / 2$</strong> is the universal baseline spacing in phased array design.
+  </p>
+
+  <h2>3. Delay-and-Sum Beamforming &amp; The Array Steering Vector</h2>
+
+  <p>
+    Consider an $M$-element ULA receiving a signal $s[n]$ arriving from angle $\theta$, corrupted by additive channel noise $\mathbf{n}[n] = [n_0[n], \dots, n_{M-1}[n]]^T$:
+  </p>
+
+  $$\mathbf{x}[n] = \mathbf{a}(\theta) s[n] + \mathbf{n}[n]$$
+
+  <p>
+    The $M \times 1$ complex vector $\mathbf{a}(\theta)$ is the <strong>array manifold vector</strong> (or <strong>steering vector</strong>):
+  </p>
+
+  $$\mathbf{a}(\theta) = \begin{bmatrix} 1 \\ e^{-j \frac{2\pi d}{\lambda}\sin\theta} \\ e^{-j 2\frac{2\pi d}{\lambda}\sin\theta} \\ \vdots \\ e^{-j (M-1)\frac{2\pi d}{\lambda}\sin\theta} \end{bmatrix} = \begin{bmatrix} 1 \\ e^{-j \psi(\theta)} \\ e^{-j 2\psi(\theta)} \\ \vdots \\ e^{-j (M-1)\psi(\theta)} \end{bmatrix} \in \mathbb{C}^M$$
+
+  <p>
+    In classical <strong>Delay-and-Sum</strong> (also called the Bartlett beamformer), our objective is to steer the array's maximum sensitivity toward a target angle $\theta_0$. We define a complex weight vector $\mathbf{w} \in \mathbb{C}^M$ and compute the beamformer scalar output $y[n]$ via the complex inner product:
+  </p>
+
+  $$y[n] = \mathbf{w}^H \mathbf{x}[n] = \sum_{m=0}^{M-1} w_m^* x_m[n]$$
+
+  <p>
+    where $(\cdot)^H$ denotes the conjugate transpose (Hermitian). To constructively align all $M$ channel outputs at angle $\theta_0$, we choose weights that match the conjugate of the steering vector, normalized by $M$:
+  </p>
+
+  $$\mathbf{w}_{\text{Bartlett}} = \frac{1}{M} \mathbf{a}(\theta_0) = \frac{1}{M} \begin{bmatrix} 1 \\ e^{-j \psi_0} \\ e^{-j 2\psi_0} \\ \vdots \\ e^{-j (M-1)\psi_0} \end{bmatrix}$$
+
+  <p>
+    When a wavefront arrives exactly from $\theta_0$, the inner product evaluates to:
+  </p>
+
+  $$y[n] = \mathbf{w}^H \mathbf{x}[n] = \left( \frac{1}{M} \sum_{m=0}^{M-1} (e^{-j m \psi_0})^* e^{-j m \psi_0} \right) s[n] + \mathbf{w}^H \mathbf{n}[n] = \left( \frac{1}{M} \cdot M \right) s[n] + \mathbf{w}^H \mathbf{n}[n] = s[n] + \tilde{n}[n]$$
+
+  <p>
+    The phase rotations perfectly cancel the propagation phase lags. All $M$ channels sum in-phase (coherently), leaving the desired signal completely unattenuated with unity gain.
+  </p>
+
+  <h2>4. Array Factor $AF(\theta)$ &amp; Directivity SNR Gain</h2>
+
+  <h3>Deriving the $M \times$ Coherent SNR Gain</h3>
+  <p>
+    Why build an $M$-element phased array instead of using a single antenna? Let's analyze the output Signal-to-Noise Ratio (SNR).
+  </p>
+
+  <p>
+    Suppose the channel noise across the $M$ SDR receiver channels is spatially white, zero-mean Gaussian noise with variance $\sigma^2$, uncorrelated from antenna to antenna:
+  </p>
+  $$\mathbb{E}[\mathbf{n}[n]\mathbf{n}^H[n]] = \sigma^2 \mathbf{I}_M$$
+
+  <p>
+    The output signal power is:
+  </p>
+  $$P_{\text{signal, out}} = |s[n]|^2$$
+
+  <p>
+    The output noise variance $\sigma_y^2$ is:
+  </p>
+  $$\sigma_y^2 = \mathbb{E}[|\mathbf{w}^H \mathbf{n}[n]|^2] = \mathbf{w}^H \mathbb{E}[\mathbf{n}\mathbf{n}^H] \mathbf{w} = \sigma^2 \|\mathbf{w}\|^2 = \sigma^2 \sum_{m=0}^{M-1} \left| \frac{1}{M} e^{-j m \psi_0} \right|^2 = \sigma^2 \cdot M \cdot \frac{1}{M^2} = \frac{\sigma^2}{M}$$
+
+  <p>
+    The resulting beamformed output SNR is:
+  </p>
+
+  $$\text{SNR}_{\text{out}} = \frac{P_{\text{signal, out}}}{\sigma_y^2} = \frac{|s[n]|^2}{\frac{\sigma^2}{M}} = M \cdot \left( \frac{|s[n]|^2}{\sigma^2} \right) = \mathbf{M \cdot \text{SNR}_{\text{single}}}$$
+
+  <div class="callout upside">
+    <div class="callout-title">The Coherent Summation Miracle</div>
+    <p>
+      Notice the scaling disparity:
+    </p>
+    <ul>
+      <li><strong>Signal amplitudes</strong> add <em>coherently</em> (in voltage): $V_{\text{out}} = \sum_{m=0}^{M-1} V_{\text{in}} = M \cdot V_{\text{in}} \implies \text{Power} \propto M^2$.</li>
+      <li><strong>Uncorrelated noise powers</strong> add <em>incoherently</em>: $\sigma_{\text{out}}^2 = \sum_{m=0}^{M-1} \sigma_{\text{in}}^2 = M \cdot \sigma_{\text{in}}^2 \implies \text{Power} \propto M$.</li>
+    </ul>
+    <p>
+      The ratio yields an exact <strong>$M$-fold linear power gain</strong>:
+    </p>
+    $$\text{Gain}_{\text{SNR}}(\text{dB}) = 10 \log_{10}(M)$$
+    <p>
+      A 4-channel receiver (e.g. KrakenSDR) delivers a <strong>+6.02 dB</strong> SNR boost; a 16-element array delivers <strong>+12.04 dB</strong>; a 64-element 5G massive-MIMO panel delivers <strong>+18.06 dB</strong>!
+    </p>
+  </div>
+
+  <h3>Deriving the Array Factor $AF(\theta)$</h3>
+  <p>
+    What is the spatial response of the array when a signal arrives from an arbitrary angle $\theta \ne \theta_0$? The spatial frequency transfer function is called the <strong>Array Factor</strong> $AF(\theta)$:
+  </p>
+
+  $$AF(\theta) = \mathbf{w}^H \mathbf{a}(\theta) = \frac{1}{M} \sum_{m=0}^{M-1} e^{+j m \psi_0} e^{-j m \psi(\theta)} = \frac{1}{M} \sum_{m=0}^{M-1} e^{-j m (\psi(\theta) - \psi_0)}$$
+
+  <p>
+    Define the phase error term $\Delta \psi = \psi(\theta) - \psi_0 = \frac{2\pi d}{\lambda}(\sin\theta - \sin\theta_0)$. This is a finite geometric series:
+  </p>
+
+  $$\sum_{m=0}^{M-1} q^m = \frac{1 - q^M}{1 - q}, \quad \text{where } q = e^{-j \Delta\psi}$$
+
+  <p>
+    Factoring out half-angles from the numerator and denominator:
+  </p>
+
+  $$AF(\theta) = \frac{1}{M} \frac{1 - e^{-j M \Delta\psi}}{1 - e^{-j \Delta\psi}} = \frac{1}{M} \frac{e^{-j \frac{M\Delta\psi}{2}} \left( e^{j \frac{M\Delta\psi}{2}} - e^{-j \frac{M\Delta\psi}{2}} \right)}{e^{-j \frac{\Delta\psi}{2}} \left( e^{j \frac{\Delta\psi}{2}} - e^{-j \frac{\Delta\psi}{2}} \right)} = \frac{1}{M} e^{-j \frac{(M-1)\Delta\psi}{2}} \frac{\sin\left(\frac{M \Delta\psi}{2}\right)}{\sin\left(\frac{\Delta\psi}{2}\right)}$$
+
+  <p>
+    Discarding the linear phase term $e^{-j \frac{(M-1)\Delta\psi}{2}}$ (which simply reflects the geometric center of the array), the magnitude response is the famous <strong>Dirichlet kernel</strong> (periodic sinc function):
+  </p>
+
+  $$|AF(\theta)| = \frac{1}{M} \left| \frac{\sin\left(\frac{M \pi d}{\lambda}(\sin\theta - \sin\theta_0)\right)}{\sin\left(\frac{\pi d}{\lambda}(\sin\theta - \sin\theta_0)\right)} \right|$$
+
+  <h3>Array Beamwidth &amp; Sidelobe Limitations</h3>
+  <ul>
+    <li><strong>Main Lobe Peak:</strong> Occurs when $\sin\theta = \sin\theta_0 \implies |AF| = 1$ ($0\text{ dB}$).</li>
+    <li><strong>First Nulls:</strong> Occur when the numerator sine reaches $\pm \pi$:
+      $$\frac{M \pi d}{\lambda}\Delta(\sin\theta) = \pm \pi \implies \Delta(\sin\theta)_{\text{null-to-null}} = \frac{2}{M (d/\lambda)}$$
+      For $d = \lambda / 2$, $\Delta(\sin\theta) = \frac{4}{M}$. As $M$ increases, beamwidth sharpens proportionally to $1/M$.
+    </li>
+    <li><strong>First Sidelobe Level:</strong> For large $M$, the first sidelobe peak occurs at $\frac{M \Delta\psi}{2} \approx \frac{3\pi}{2}$, yielding $|AF| \approx \frac{1}{M \sin(3\pi / 2M)} \approx \frac{2}{3\pi} \approx 0.212 \implies \mathbf{-13.46\text{ dB}}$.</li>
+  </ul>
+
+  <p>
+    This brings us to the fatal vulnerability of classical Delay-and-Sum: <strong>fixed sidelobes</strong>. If a +40 dB interferer sits at a sidelobe angle $\theta_{\text{int}}$, the $-13.5\text{ dB}$ attenuation is grossly insufficient. The interferer bleeds through with $+26.5\text{ dB}$ of excess power, utterly obliterating your target signal.
+  </p>
+
+  <h2>5. Adaptive Spatial Nulling: MVDR (Capon's Beamformer)</h2>
+
+  <p>
+    Delay-and-Sum is a <em>data-independent</em> beamformer: it calculates weights based solely on the target geometry $\theta_0$, blind to the actual electromagnetic environment.
+  </p>
+
+  <p>
+    To eliminate high-power interferers, we turn to <strong>adaptive beamforming</strong>. Instead of accepting fixed sidelobes, we dynamically calculate weight vector $\mathbf{w}$ to solve an optimization problem:
+  </p>
+  <blockquote>
+    <strong>Minimum Variance Distortionless Response (MVDR / Capon's Beamformer):</strong><br>
+    Minimize the total output power (variance) of the array, subject to the strict constraint that signals arriving from target look direction $\theta_0$ pass with exactly unity gain ($0\text{ dB}$, zero distortion).
+  </blockquote>
+
+  <h3>Mathematical Derivation of the MVDR Weights</h3>
+  <p>
+    Let $\mathbf{R}_{xx} \in \mathbb{C}^{M \times M}$ be the spatial covariance matrix of the array snapshots:
+  </p>
+
+  $$\mathbf{R}_{xx} = \mathbb{E}\left[ \mathbf{x}[n] \mathbf{x}^H[n] \right]$$
+
+  <p>
+    The total average output power of the beamformer is:
+  </p>
+
+  $$P_{\text{out}} = \mathbb{E}\left[ |y[n]|^2 \right] = \mathbb{E}\left[ (\mathbf{w}^H \mathbf{x}) (\mathbf{x}^H \mathbf{w}) \right] = \mathbf{w}^H \mathbb{E}\left[ \mathbf{x}\mathbf{x}^H \right] \mathbf{w} = \mathbf{w}^H \mathbf{R}_{xx} \mathbf{w}$$
+
+  <p>
+    Our constrained optimization problem is formulated as:
+  </p>
+
+  $$\min_{\mathbf{w}} \mathbf{w}^H \mathbf{R}_{xx} \mathbf{w} \quad \text{subject to} \quad \mathbf{w}^H \mathbf{a}(\theta_0) = 1$$
+
+  <p>
+    We solve this using the method of complex Lagrange multipliers. Define the Lagrangian cost function $\mathcal{L}(\mathbf{w}, \mu)$:
+  </p>
+
+  $$\mathcal{L}(\mathbf{w}, \mu) = \mathbf{w}^H \mathbf{R}_{xx} \mathbf{w} + \mu \left( 1 - \mathbf{w}^H \mathbf{a}(\theta_0) \right)$$
+
+  <p>
+    Taking the complex gradient with respect to $\mathbf{w}^H$ and setting it to zero:
+  </p>
+
+  $$\nabla_{\mathbf{w}^H} \mathcal{L} = \mathbf{R}_{xx} \mathbf{w} - \mu \mathbf{a}(\theta_0) = \mathbf{0} \implies \mathbf{w} = \mu \mathbf{R}_{xx}^{-1} \mathbf{a}(\theta_0)$$
+
+  <p>
+    Now we apply the distortionless constraint $\mathbf{w}^H \mathbf{a}(\theta_0) = 1$ to solve for scalar multiplier $\mu$:
+  </p>
+
+  $$\mathbf{w}^H \mathbf{a}(\theta_0) = \left( \mu \mathbf{R}_{xx}^{-1} \mathbf{a}(\theta_0) \right)^H \mathbf{a}(\theta_0) = \mu^* \mathbf{a}^H(\theta_0) \mathbf{R}_{xx}^{-1} \mathbf{a}(\theta_0) = 1$$
+
+  $$\mu = \frac{1}{\mathbf{a}^H(\theta_0) \mathbf{R}_{xx}^{-1} \mathbf{a}(\theta_0)}$$
+
+  <p>
+    Substituting $\mu$ back into our weight expression yields the definitive <strong>MVDR / Capon Weight Equation</strong>:
+  </p>
+
+  $$\mathbf{w}_{\text{MVDR}} = \frac{\mathbf{R}_{xx}^{-1} \mathbf{a}(\theta_0)}{\mathbf{a}^H(\theta_0) \mathbf{R}_{xx}^{-1} \mathbf{a}(\theta_0)}$$
+
+  <h3>Why MVDR Synthesizes Deep Spatial Nulls</h3>
+  <p>
+    Look at the inverse covariance matrix $\mathbf{R}_{xx}^{-1}$. The spatial covariance can be decomposed via eigen-decomposition:
+  </p>
+  $$\mathbf{R}_{xx} = \sum_{i=1}^M \lambda_i \mathbf{v}_i \mathbf{v}_i^H \implies \mathbf{R}_{xx}^{-1} = \sum_{i=1}^M \frac{1}{\lambda_i} \mathbf{v}_i \mathbf{v}_i^H$$
+
+  <p>
+    Strong interferers and jammers contribute massive eigenvalues $\lambda_{\text{jam}} \gg \sigma_n^2$ aligned with their steering vectors $\mathbf{a}(\theta_{\text{jam}})$. When we invert $\mathbf{R}_{xx}$, these high-power spatial modes are scaled by $\frac{1}{\lambda_{\text{jam}}}$.
+  </p>
+  <p>
+    As a result, $\mathbf{w}_{\text{MVDR}}$ automatically places <strong>transmission zeros</strong> (spatial nulls) directly onto the arrival angles of all interfering sources. While Delay-and-Sum only provides $-13.5\text{ dB}$ of sidelobe suppression, MVDR routinely delivers <strong>$-50\text{ dB}$ to $-80\text{ dB}$ deep nulls</strong> directly onto active jammers, driving their received power down into the thermal noise floor!
+  </p>
+
+  <h3>Sample Covariance Estimation &amp; Diagonal Loading</h3>
+  <p>
+    In practice, the true ensemble covariance $\mathbf{R}_{xx}$ is unknown. We estimate it over $N$ discrete time snapshots:
+  </p>
+  $$\hat{\mathbf{R}}_{xx} = \frac{1}{N} \sum_{n=0}^{N-1} \mathbf{x}[n] \mathbf{x}^H[n]$$
+
+  <p>
+    By the <strong>Reed-Mallett-Brennan (RMB) rule</strong>, achieving an output SNR within 3 dB of optimum requires at least $N \ge 2M$ independent snapshots.
+  </p>
+
+  <div class="callout warning">
+    <div class="callout-title">Signal Self-Cancellation &amp; Diagonal Loading</div>
+    <p>
+      If the estimated steering vector $\mathbf{a}(\theta_0)$ has even a $0.5^\circ$ calibration error, or if snapshot count $N$ is small, MVDR can treat the target SOI itself as an "unwanted signal" and place a spatial null directly on it! This catastrophic phenomenon is called <strong>signal self-cancellation</strong>.
+    </p>
+    <p>
+      To prevent this, production SDR systems apply <strong>Diagonal Loading (Tikhonov Regularization)</strong>:
+    </p>
+    $$\mathbf{R}_{\text{DL}} = \hat{\mathbf{R}}_{xx} + \epsilon \mathbf{I}_M$$
+    <p>
+      where $\epsilon \approx 10 \cdot \sigma_n^2$. Diagonal loading injects virtual isotropic noise, bounding the condition number of the matrix, preventing numerical instability during inversion, and robustly preserving the main beam.
+    </p>
+  </div>
+
+  <h2>6. Computational Architecture: SIMD Inner Products across SDR Channels</h2>
+
+  <p>
+    Let's bridge the theory to concrete systems code. Suppose you have an 8-channel coherent SDR (such as two synchronized USRPs or an 8-channel Kerberos/Kraken derivative) streaming complex baseband samples at $20\text{ MSPS}$ per channel.
+  </p>
+
+  <h3>Hardware Synchronization &amp; Phase Calibration</h3>
+  <p>
+    To perform phased array beamforming, the RF front-ends must be <strong>phase-coherent</strong>:
+  </p>
+  <ul>
+    <li>All tuner mixers must share a common <strong>Local Oscillator (LO)</strong> or lock their Phase-Locked Loops (PLLs) to a shared $10\text{ MHz}$ reference clock.</li>
+    <li>All ADCs must trigger on a shared <strong>Pulse-Per-Second (PPS)</strong> interrupt so sample $n$ is captured at the exact same physical instant across all channels.</li>
+    <li>Inter-channel cable delays, PCB trace variances, and temperature drift cause static phase offsets $\phi_{\text{cal}, m}$. These are calibrated out by injecting a common broadband noise source across all antenna inputs via an RF switch matrix.</li>
+  </ul>
+
+  <h3>Memory Layout: Planar vs. Interleaved</h3>
+  <p>
+    How should multi-channel I/Q data be arranged in memory for maximum cache locality and SIMD execution?
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Layout Format</th>
+        <th>Memory Organization</th>
+        <th>Cache &amp; SIMD Trade-off</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Interleaved (Chunky)</strong></td>
+        <td><code>[I0, Q0, I1, Q1, ..., I7, Q7]</code> per sample $n$</td>
+        <td>Ideal for single-sample inner products; poor when channels are filtered individually by temporal polyphase FIRs.</td>
+      </tr>
+      <tr>
+        <td><strong>Planar (Channel Buffers)</strong></td>
+        <td>$M$ separate contiguous arrays: <code>ch[m] = [I0, Q0, I1, Q1, ...]</code></td>
+        <td>Optimal for SIMD vectorization across time; allows streaming 8 samples at once per channel using vector registers.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>SIMD Vectorization of the Beamforming Inner Product</h3>
+  <p>
+    For a fixed weight vector $\mathbf{w}$, the beamformer output at time $n$ is:
+  </p>
+  $$y[n] = \sum_{m=0}^{M-1} w_m^* \cdot x_m[n]$$
+
+  <p>
+    Recall that complex multiplication $(w_r - j w_i)(x_r + j x_i)$ expands to:
+  </p>
+  $$\text{Re}(y[n]) = w_r x_r + w_i x_i, \quad \text{Im}(y[n]) = w_r x_i - w_i x_r$$
+
+  <p>
+    In high-performance C or Zig, we don't compute this sample-by-sample with scalar loops. Using modern vector extensions (AVX2, AVX-512, or ARM NEON), we load 8 consecutive complex samples ($16 \times \text{float32}$) into a 512-bit SIMD register, broadcast the scalar weight $w_m$, and accumulate with a single-cycle <strong>Fused Multiply-Add (FMA)</strong> instruction.
+  </p>
+
+  <pre><code>// High-performance multi-channel beamformer inner product in Zig
+const std = @import("std");
+
+pub const Complex32 = struct {
+    re: f32,
+    im: f32,
+};
+
+// Vectorized across 8 time samples simultaneously using 512-bit SIMD
+pub fn beamformBlock(
+    channels: []const []const Complex32, // [M][N] planar channel samples
+    weights: []const Complex32,          // [M] complex steering weights
+    output: []Complex32,                 // [N] beamformed output samples
+) void {
+    const M = channels.len;
+    const N = output.len;
+
+    // Zero-fill output accumulator
+    @memset(output, Complex32{ .re = 0.0, .im = 0.0 });
+
+    var m: usize = 0;
+    while (m &lt; M) : (m += 1) {
+        const wr = weights[m].re;
+        const wi = weights[m].im;
+        const ch = channels[m];
+
+        // Process 8 complex samples per SIMD iteration (AVX2 / AVX-512)
+        var i: usize = 0;
+        while (i + 8 &lt;= N) : (i += 8) {
+            inline for (0..8) |k| {
+                const xr = ch[i + k].re;
+                const xi = ch[i + k].im;
+                // w* * x = (wr*xr + wi*xi) + j(wr*xi - wi*xr)
+                output[i + k].re += (wr * xr + wi * xi);
+                output[i + k].im += (wr * xi - wi * xr);
+            }
+        }
+
+        // Handle remainder
+        while (i &lt; N) : (i += 1) {
+            const xr = ch[i].re;
+            const xi = ch[i].im;
+            output[i].re += (wr * xr + wi * xi);
+            output[i].im += (wr * xi - wi * xr);
+        }
+    }
+}
+</code></pre>
+
+  <h3>Throughput &amp; Memory Bus Arithmetic Intensity</h3>
+  <p>
+    Let's run the engineering numbers for an 8-channel array running at $20\text{ MSPS}$ (each complex sample = 8 bytes):
+  </p>
+  <ul>
+    <li><strong>Raw Ingestion Bandwidth:</strong> $8\text{ channels} \times 20\times 10^6\text{ samples/s} \times 8\text{ bytes} = \mathbf{1.28\text{ GB/s}}$.</li>
+    <li><strong>Beamformed Output Stream:</strong> $1\text{ channel} \times 20\text{ MSPS} \times 8\text{ bytes} = \mathbf{160\text{ MB/s}}$.</li>
+    <li><strong>Computational Arithmetic:</strong> $8\text{ channels} \times 8\text{ FLOPs per complex MAC} = 64\text{ FLOPs per output sample}$.
+      At $20\text{ MSPS}$, this requires $64 \times 20\text{ M} = \mathbf{1.28\text{ GFLOP/s}}$.
+    </li>
+  </ul>
+  <p>
+    $1.28\text{ GFLOP/s}$ is trivial—it represents less than <strong>2% of a single modern x86/ARM CPU core</strong>. The bottleneck in real-time beamforming is <strong>memory throughput and cache hierarchy</strong>. By keeping the working chunks aligned to 64-byte cache line boundaries and fitting within L1/L2 cache ($32\text{ KB} - 512\text{ KB}$), the DSP engine operates at line rate without dropping samples.
+  </p>
+
+  <h2>7. Interactive Knowledge Checks</h2>
+
+  <div class="quiz-container" id="quiz-20-1">
+    <div class="quiz-question">
+      1. In a Uniform Linear Array, what physical breakdown occurs if the element spacing $d$ is set to $1.2 \lambda$?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The antenna elements enter immediate self-oscillation due to destructive mutual radiation resistance.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The central beamwidth collapses to zero degrees, preventing reception of any high-bandwidth modulation.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Spatial grating lobes appear, synthesizing duplicate $0\text{ dB}$ gain beams pointing toward ambiguous angles.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The spatial covariance matrix $\mathbf{R}_{xx}$ becomes strictly singular and cannot be inverted by MVDR.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> Just as sampling a temporal signal below the Nyquist rate ($f_s < 2f_{\max}$) causes spectral frequency aliasing, spacing array elements wider than half a wavelength ($d > \lambda / 2$) causes spatial aliasing. This creates grating lobes—secondary main beams with full $0\text{ dB}$ gain that admit out-of-beam noise and jammers into the receiver.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-20-2">
+    <div class="quiz-question">
+      2. If you increase the number of coherent SDR receiver channels from $M = 4$ to $M = 16$, what is the resulting theoretical SNR gain against spatially white noise?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The SNR increases by exactly $+3.01\text{ dB}$ because output noise power scales quadratically with $M^2$.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The SNR increases by $+6.02\text{ dB}$ because coherent signal power gains $4\times$ while noise power remains flat.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The SNR increases by $+12.04\text{ dB}$ because signal voltage scales linearly while noise is eliminated entirely.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The SNR remains completely unchanged because thermal noise increases at the exact same rate as signal power.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> The directivity SNR gain is $10 \log_{10}(M)$. For $M = 4$, the gain is $10 \log_{10}(4) \approx +6.02\text{ dB}$. For $M = 16$, the gain is $10 \log_{10}(16) \approx +12.04\text{ dB}$. Moving from 4 to 16 channels yields an incremental boost of $+12.04 - 6.02 = \mathbf{+6.02\text{ dB}}$ (a $4\times$ power improvement).
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-20-3">
+    <div class="quiz-question">
+      3. Why does Capon's MVDR beamformer vastly outperform classical Delay-and-Sum when a strong jammer is located at an off-target angle?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Delay-and-Sum completely reverses the polarity of the carrier, whereas MVDR eliminates local oscillator jitter.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        MVDR inverts the spatial covariance matrix, dynamically placing deep $\le -50\text{ dB}$ nulls on the jammer's AoA.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Delay-and-Sum requires an analog phase-shifter chip, whereas MVDR synthesizes physical parabolic dish reflectors.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        MVDR forces the Erlang VM to drop all UDP packets arriving from unauthorized network interface IP addresses.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> Delay-and-Sum uses static geometric weights with fixed sidelobes (the first sidelobe is only $-13.5\text{ dB}$ down). In contrast, MVDR minimizes total output power subject to $\mathbf{w}^H \mathbf{a}(\theta_0) = 1$. By inverting the sample covariance matrix $\mathbf{R}_{xx}^{-1}$, it automatically places high-attenuation transmission zeros ($\le -50\text{ dB}$) directly onto the arrival angles of all active jammers.
+    </div>
+  </div>
+
+  <h2>Primary Sources &amp; Foundational Literature</h2>
+  <ul>
+    <li>
+      <a href="https://ieeexplore.ieee.org/document/1449208" target="_blank" rel="noopener"><strong>Capon, J.: High-Resolution Frequency-Wavenumber Spectrum Analysis (Proc. IEEE, 1969)</strong></a> — The landmark paper introducing the Minimum Variance Distortionless Response (MVDR) beamformer.
+    </li>
+    <li>
+      <a href="https://ieeexplore.ieee.org/document/4102484" target="_blank" rel="noopener"><strong>Reed, I. S., Mallett, J. D., &amp; Brennan, L. E.: Rapid Convergence Rate in Adaptive Arrays (IEEE Trans. AES, 1974)</strong></a> — Derives the RMB rule: proving that $N \ge 2M$ snapshots achieve within 3 dB of optimal output SNR.
+    </li>
+    <li>
+      <strong>Van Trees, Harry L.: Optimum Array Processing (Detection, Estimation, and Modulation Theory, Part IV, Wiley 2002)</strong> — The definitive graduate-level treatise on sensor array signal processing and spatial filtering.
+    </li>
+  </ul>
+
+  <div class="footer">
+    <span>Questions on spatial nulling, steering vectors, or SIMD vectorization? Ask your tutor agent!</span>
+    <span><a href="0013-zigler-in-sdr-architecture.html">&larr; Lesson 0013</a> | Lesson 0020</span>
+  </div>
+</body>
+</html>

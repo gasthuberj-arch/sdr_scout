@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 18: Weak-Signal DSP — FT8, Costas Arrays, and Demodulation at -24 dB SNR</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0018</span>
+    <span class="badge badge-arch">Weak-Signal DSP &amp; Information Theory</span>
+    <span>Reading time: 12 minutes</span>
+  </div>
+
+  <h1>Weak-Signal DSP: FT8, Costas Arrays, and Coherent Demodulation at -24 dB SNR</h1>
+
+  <p>
+    In high-speed communication systems like ADS-B, Wi-Fi, or cellular LTE, receivers operate at high Signal-to-Noise Ratios (often $+10\text{ dB}$ to $+30\text{ dB}$). Signal pulses tower over the thermal noise floor, and detection is largely an exercise in high-throughput thresholding and preamble correlation.
+  </p>
+
+  <p>
+    In weak-signal amateur radio (HAM), the physical reality is inverted. Protocols like <strong>FT8</strong> (developed by Joe Taylor, K1JT, and Steve Franke, K9AN) operate routinely at <strong>$-20\text{ dB}$ to $-24\text{ dB}$ SNR</strong>. At these levels, the signal is invisible on a conventional analog S-meter and completely inaudible to human ears—buried deep inside the Gaussian thermal noise hiss.
+  </p>
+
+  <p>
+    Yet FT8 reliably achieves near-$100\%$ error-free packet reception across trans-continental ionospheric paths with milliwatts of transmit power. How is this mathematically and computationally possible?
+  </p>
+
+  <p>
+    In this lesson, we will deconstruct the weak-signal DSP pipeline:
+  </p>
+  <ul>
+    <li><strong>The Information Theory Frontier:</strong> Shannon-Hartley capacity in the sub-zero SNR regime.</li>
+    <li><strong>Physical Layer Framing:</strong> 8-MFSK continuous-phase modulation with $6.25\text{ Hz}$ tone spacing.</li>
+    <li><strong>2D Synchronization:</strong> Algebraic Costas arrays that eliminate time-frequency ambiguity sidelobes.</li>
+    <li><strong>Discrete Spectral Demodulation:</strong> Matching observation duration to DFT bin resolution.</li>
+    <li><strong>Error Control Coding:</strong> LDPC $(174, 91)$ belief propagation on bipartite Tanner graphs.</li>
+  </ul>
+
+  <h2>1. The Shannon-Hartley Theorem and the Negative-SNR Frontier</h2>
+
+  <p>
+    A pervasive misconception in radio engineering is that communication becomes impossible once signal power drops below noise power ($\text{SNR} < 0\text{ dB}$, or $S/N < 1$). Claude Shannon's landmark 1948 channel capacity theorem proves otherwise:
+  </p>
+
+  $$C = B \log_2\left(1 + \frac{S}{N}\right) = B \log_2(1 + \text{SNR}) \quad [\text{bits/second}]$$
+
+  <p>
+    Here, $B$ is channel bandwidth in Hertz, $S$ is average received signal power in Watts, and $N = N_0 B$ is the total noise power within bandwidth $B$, with $N_0$ representing single-sided noise spectral density ($\text{W/Hz}$).
+  </p>
+
+  <h3>The Asymptotic Wideband Limit</h3>
+
+  <p>
+    When $\text{SNR} \ll 1$ (deep sub-zero decibels), we apply the first-order Taylor expansion $\ln(1 + x) \approx x$ for $x \to 0$:
+  </p>
+
+  $$\log_2(1 + \text{SNR}) = \frac{\ln(1 + \text{SNR})}{\ln 2} \approx \frac{\text{SNR}}{\ln 2} \approx 1.4427 \cdot \text{SNR}$$
+
+  <p>
+    Substituting this into the capacity equation:
+  </p>
+
+  $$C \approx B \cdot \frac{S}{N_0 B \ln 2} = \frac{S}{N_0 \ln 2}$$
+
+  <p>
+    Notice the profound consequence: <strong>channel capacity does not collapse to zero when SNR becomes negative</strong>! Capacity becomes fundamentally power-limited rather than bandwidth-limited. You can communicate reliably over any channel with negative SNR, provided you trade time and bandwidth.
+  </p>
+
+  <div class="callout upside">
+    <div class="callout-title">The Shannon Bound on Energy per Bit</div>
+    <p>
+      If we transmit at rate $R = C$ bits per second, the energy per information bit is $E_b = S / C$. Substituting $C \approx \frac{S}{N_0 \ln 2}$ yields the famous absolute Shannon limit:
+    </p>
+    $$\frac{E_b}{N_0} \ge \ln 2 \approx 0.693 \implies 10 \log_{10}(\ln 2) = \mathbf{-1.59\text{ dB}}$$
+    <p>
+      No modulation or coding scheme can achieve error-free communication below $E_b / N_0 = -1.59\text{ dB}$. Modern weak-signal protocols like FT8 operate within $1.5\text{ dB}$ to $2.5\text{ dB}$ of this theoretical limit.
+    </p>
+  </div>
+
+  <h3>The Amateur Radio SNR Metric: $B_{\text{ref}} = 2500\text{ Hz}$</h3>
+
+  <p>
+    In amateur radio protocols (WSJT-X suite), SNR is by international convention referenced to a standard Single Sideband (SSB) voice bandwidth of $B_{\text{ref}} = 2500\text{ Hz}$:
+  </p>
+
+  $$\text{SNR}_{2500} = \frac{S}{N_{2500}} = \frac{S}{N_0 \cdot 2500}$$
+
+  <p>
+    When an FT8 receiver reports an SNR of <strong>$-24\text{ dB}$</strong>, the total signal power across the channel is:
+  </p>
+
+  $$\text{SNR}_{\text{linear}} = 10^{-24 / 10} = 10^{-2.4} \approx 0.00398$$
+
+  <p>
+    The signal is over <strong>250 times weaker</strong> than the ambient thermal noise in a voice passband!
+  </p>
+
+  <h3>Processing Gain via Narrowband Bins</h3>
+
+  <p>
+    While the reference voice channel is $2500\text{ Hz}$ wide, an FT8 tone occupies a discrete bandwidth of only $\Delta f = 6.25\text{ Hz}$. When our DSP downsamples and runs a matched filter or Discrete Fourier Transform over the symbol period, we collect noise <em>only</em> within that $6.25\text{ Hz}$ sub-band.
+  </p>
+
+  <p>
+    The resulting <strong>processing gain</strong> (or bandwidth narrowing gain) is:
+  </p>
+
+  $$G_p = 10 \log_{10}\left(\frac{B_{\text{ref}}}{\Delta f}\right) = 10 \log_{10}\left(\frac{2500}{6.25}\right) = 10 \log_{10}(400) = \mathbf{+26.02\text{ dB}}$$
+
+  <p>
+    Now compute the effective SNR inside the detection bin:
+  </p>
+
+  $$\text{SNR}_{\text{bin}} = \text{SNR}_{2500} + G_p = -24.00\text{ dB} + 26.02\text{ dB} = \mathbf{+2.02\text{ dB}}$$
+
+  <p>
+    Inside the discrete $6.25\text{ Hz}$ tone bin, the signal is actually <strong>$2\text{ dB}$ above the noise floor</strong>! By stretching the transmission time to $12.64\text{ seconds}$ to convey 77 payload bits, FT8 converts an impossible wideband negative SNR into a solvable narrowband detection problem.
+  </p>
+
+  <h2>2. FT8 Physical Layer: Continuous-Phase 8-MFSK</h2>
+
+  <p>
+    FT8 uses 8-ary Multiple Frequency-Shift Keying (8-MFSK). Each transmitted symbol selects one of 8 discrete audio tones, conveying $\log_2(8) = 3$ bits per symbol.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Parameter</th>
+        <th>Physical Value</th>
+        <th>DSP / Mathematical Significance</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Tone Spacing ($\Delta f$)</strong></td>
+        <td>$6.25\text{ Hz}$</td>
+        <td>Equal to symbol baud rate; ensures non-coherent orthogonality.</td>
+      </tr>
+      <tr>
+        <td><strong>Symbol Duration ($T_s$)</strong></td>
+        <td>$0.160\text{ s}$ ($160\text{ ms}$)</td>
+        <td>$T_s = 1 / \Delta f$. Exact reciprocal of frequency spacing.</td>
+      </tr>
+      <tr>
+        <td><strong>Symbol Baud Rate ($R_s$)</strong></td>
+        <td>$6.25\text{ baud}$</td>
+        <td>Keying rate matches tone separation exactly.</td>
+      </tr>
+      <tr>
+        <td><strong>Total Transmission Symbols</strong></td>
+        <td>$79\text{ symbols}$</td>
+        <td>$21$ sync symbols $+ 58$ data symbols ($58 \times 3 = 174$ coded bits).</td>
+      </tr>
+      <tr>
+        <td><strong>Total Transmission Time ($T_{\text{tx}}$)</strong></td>
+        <td>$12.64\text{ s}$</td>
+        <td>$79 \times 0.160\text{ s} = 12.64\text{ s}$. Fits in a 15-second UTC sequence.</td>
+      </tr>
+      <tr>
+        <td><strong>Total Occupied Bandwidth</strong></td>
+        <td>$50.0\text{ Hz}$</td>
+        <td>$8 \text{ tones} \times 6.25\text{ Hz} = 50\text{ Hz}$ total span.</td>
+      </tr>
+      <tr>
+        <td><strong>Modulation Envelope</strong></td>
+        <td>Continuous Phase (CPFSK)</td>
+        <td>No phase discontinuities at symbol transitions; eliminates splatter.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Orthogonality in Non-Coherent Detection</h3>
+
+  <p>
+    Ionospheric propagation introduces unpredictable phase shifts, Doppler spread, and multipath fading. Maintaining phase coherence over 12.64 seconds across the HF spectrum is impractical. FT8 therefore relies on <strong>non-coherent detection</strong>.
+  </p>
+
+  <p>
+    Two complex tones $s_m(t) = e^{j 2\pi f_m t}$ and $s_n(t) = e^{j 2\pi f_n t}$ are mutually orthogonal over an observation window $T_s$ if their inner product vanishes for all $m \ne n$:
+  </p>
+
+  $$\langle s_m, s_n \rangle = \int_0^{T_s} e^{j 2\pi f_m t} e^{-j 2\pi f_n t} dt = \int_0^{T_s} e^{j 2\pi (f_m - f_n) t} dt$$
+
+  <p>
+    Evaluating this integral when $f_m - f_n = k \Delta f$:
+  </p>
+
+  $$\int_0^{T_s} e^{j 2\pi k \Delta f t} dt = T_s \left( \frac{e^{j 2\pi k \Delta f T_s} - 1}{j 2\pi k \Delta f T_s} \right) = T_s e^{j \pi k \Delta f T_s} \operatorname{sinc}(k \Delta f T_s)$$
+
+  <p>
+    The function $\operatorname{sinc}(x) = \frac{\sin(\pi x)}{\pi x}$ has zeros at all non-zero integers $x \in \mathbb{Z} \setminus \{0\}$. For non-coherent orthogonality regardless of initial phase:
+  </p>
+
+  $$\Delta f \cdot T_s = 1 \implies \Delta f = \frac{1}{T_s} = \frac{1}{0.160\text{ s}} = \mathbf{6.25\text{ Hz}}$$
+
+  <p>
+    This is the minimum frequency separation that guarantees zero crosstalk between adjacent tones under non-coherent envelope detection.
+  </p>
+
+  <h2>3. Synchronization with Costas Arrays</h2>
+
+  <p>
+    Before an FT8 receiver can demodulate data symbols, it must resolve two unknowns in the presence of overwhelming noise:
+  </p>
+  <ol>
+    <li><strong>Time offset ($\tau$):</strong> When did the packet start? (Transmissions align to 15-second UTC boundaries, but clock jitter and propagation delay introduce up to $\pm 1-2\text{ s}$ uncertainty).</li>
+    <li><strong>Frequency offset ($f_0$):</strong> What is the exact audio carrier frequency? (Transceivers drift by tens of Hertz).</li>
+  </ol>
+
+  <p>
+    In high-SNR systems, periodic sync preambles or single-frequency pilot tones suffice. In weak-signal systems, a single tone or periodic chirp exhibits massive sidelobes in the 2D time-frequency plane. A time shift can be mistaken for a frequency shift, causing cross-correlation false alarms.
+  </p>
+
+  <h3>What is a Costas Array?</h3>
+
+  <p>
+    A <strong>Costas array</strong> (named after John P. Costas) is an $N \times N$ permutation matrix where all displacement vectors between pairs of points are strictly unique.
+  </p>
+
+  <p>
+    Mathematically, consider a sequence of $N$ frequency tones $C = [c_0, c_1, \dots, c_{N-1}]$ where each $c_k \in \{0, 1, \dots, N-1\}$ is a permutation of the integers $0$ to $N-1$. $C$ is a Costas array if and only if:
+  </p>
+
+  $$\forall \Delta t \in \{1, 2, \dots, N-1\}, \quad \text{the differences } \Delta f_k = c_{k + \Delta t} - c_k \text{ are all distinct.}$$
+
+  <p>
+    In FT8, a 7-symbol Costas sequence is used:
+  </p>
+
+  $$\mathbf{C} = [3, 1, 4, 0, 6, 5, 2]$$
+
+  <p>
+    Let's verify the non-repeating delta property across all non-zero time shifts $\Delta t$:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Shift $\Delta t$</th>
+        <th>Pairwise Differences $\Delta f_k = c_{k+\Delta t} - c_k$</th>
+        <th>Unique?</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>$\Delta t = 1$</td>
+        <td>
+          $c_1 - c_0 = 1 - 3 = \mathbf{-2}$<br>
+          $c_2 - c_1 = 4 - 1 = \mathbf{+3}$<br>
+          $c_3 - c_2 = 0 - 4 = \mathbf{-4}$<br>
+          $c_4 - c_3 = 6 - 0 = \mathbf{+6}$<br>
+          $c_5 - c_4 = 5 - 6 = \mathbf{-1}$<br>
+          $c_6 - c_5 = 2 - 5 = \mathbf{-3}$
+        </td>
+        <td>All unique: $\{-2, +3, -4, +6, -1, -3\}$</td>
+      </tr>
+      <tr>
+        <td>$\Delta t = 2$</td>
+        <td>
+          $c_2 - c_0 = 4 - 3 = \mathbf{+1}$<br>
+          $c_3 - c_1 = 0 - 1 = \mathbf{-1}$<br>
+          $c_4 - c_2 = 6 - 4 = \mathbf{+2}$<br>
+          $c_5 - c_3 = 5 - 0 = \mathbf{+5}$<br>
+          $c_6 - c_4 = 2 - 6 = \mathbf{-4}$
+        </td>
+        <td>All unique: $\{+1, -1, +2, +5, -4\}$</td>
+      </tr>
+      <tr>
+        <td>$\Delta t = 3$</td>
+        <td>
+          $c_3 - c_0 = 0 - 3 = \mathbf{-3}$<br>
+          $c_4 - c_1 = 6 - 1 = \mathbf{+5}$<br>
+          $c_5 - c_2 = 5 - 4 = \mathbf{+1}$<br>
+          $c_6 - c_3 = 2 - 0 = \mathbf{+2}$
+        </td>
+        <td>All unique: $\{-3, +5, +1, +2\}$</td>
+      </tr>
+      <tr>
+        <td>$\Delta t = 4$</td>
+        <td>
+          $c_4 - c_0 = 6 - 3 = \mathbf{+3}$<br>
+          $c_5 - c_1 = 5 - 1 = \mathbf{+4}$<br>
+          $c_6 - c_2 = 2 - 4 = \mathbf{-2}$
+        </td>
+        <td>All unique: $\{+3, +4, -2\}$</td>
+      </tr>
+      <tr>
+        <td>$\Delta t = 5$</td>
+        <td>
+          $c_5 - c_0 = 5 - 3 = \mathbf{+2}$<br>
+          $c_6 - c_1 = 2 - 1 = \mathbf{+1}$
+        </td>
+        <td>All unique: $\{+2, +1\}$</td>
+      </tr>
+      <tr>
+        <td>$\Delta t = 6$</td>
+        <td>
+          $c_6 - c_0 = 2 - 3 = \mathbf{-1}$
+        </td>
+        <td>Unique: $\{-1\}$</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>The 2D Ambiguity Function</h3>
+
+  <p>
+    The aperiodic auto-ambiguity function between the transmitted Costas sequence and a replica shifted by time $\tau$ and frequency $\nu$ is:
+  </p>
+
+  $$\chi(\tau, \nu) = \sum_{k} \delta(C_{k+\tau}, C_k + \nu)$$
+
+  <p>
+    Because all difference vectors are distinct, for any non-zero shift $(\tau, \nu) \ne (0, 0)$, <strong>at most one single tone coincidence can ever occur</strong>:
+  </p>
+
+  $$\chi(\tau, \nu) \le 1 \quad \forall (\tau, \nu) \ne (0, 0), \qquad \chi(0, 0) = 7$$
+
+  <p>
+    The auto-correlation peak is $7$, while every cross-ambiguity sidelobe is bounded by $\le 1$. This yields a <strong>$7:1$ peak-to-sidelobe ratio ($8.45\text{ dB}$)</strong> in the 2D search grid from just 7 symbols!
+  </p>
+
+  <h3>Why Three Costas Arrays?</h3>
+
+  <p>
+    FT8 frames do not place the Costas array solely at the preamble. Instead, the 7-symbol sequence is inserted at <strong>three distinct positions</strong>:
+  </p>
+
+  <pre><code>[Costas 7] --- [Data 29] --- [Costas 7] --- [Data 29] --- [Costas 7]
+(Symbols 0..6)   (Symbols 7..35)  (Symbols 36..42)  (Symbols 43..71) (Symbols 72..78)</code></pre>
+
+  <p>
+    This tripartite distribution ($3 \times 7 = 21$ total sync symbols) serves three vital engineering goals:
+  </p>
+  <ul>
+    <li><strong>Cumulative Detection Peak:</strong> Summing the three sync blocks yields an aggregate correlation peak of $21$, pushing the combined synchronization peak well above noise at $-24\text{ dB}$ SNR.</li>
+    <li><strong>Linear Frequency Drift Tracking ($\dot{f} = df/dt$):</strong> Amateur HF signals frequently drift during the 12.64-second transmission due to crystal oscillator warm-up or Doppler shifts from moving ionospheric layers. Having sync points at $t = 0\text{ s}$, $t = 6.0\text{ s}$, and $t = 12.0\text{ s}$ allows the receiver to estimate and compensate for linear frequency drift.</li>
+    <li><strong>Sample Clock Drift Tracking ($dt/dt$):</strong> Discrepancies between the transmitter's and receiver's audio ADC sample clocks cause time-scale dilation or compression. Comparing the timing of the first and last Costas bursts reveals the exact sample clock drift rate.</li>
+  </ul>
+
+  <h2>4. Demodulation via Discrete Fourier Transform</h2>
+
+  <p>
+    In typical SDR or sound-card processing pipelines, audio baseband is sampled at $f_s = 12000\text{ Hz}$.
+  </p>
+
+  <p>
+    To demodulate FT8, the sample stream is segmented into blocks corresponding to the symbol period $T_s = 160\text{ ms}$:
+  </p>
+
+  $$N_{\text{samp}} = f_s \cdot T_s = 12000\text{ samples/sec} \times 0.160\text{ sec} = \mathbf{1920\text{ samples}}$$
+
+  <p>
+    The frequency resolution of an $N$-point Discrete Fourier Transform across 1920 samples is:
+  </p>
+
+  $$\Delta f_{\text{bin}} = \frac{f_s}{N_{\text{samp}}} = \frac{12000}{1920} = \mathbf{6.25\text{ Hz}}$$
+
+  <p>
+    Notice the perfect mathematical match: <strong>one DFT bin corresponds exactly to one FT8 tone step</strong> ($\Delta f = 6.25\text{ Hz}$).
+  </p>
+
+  <h3>Non-Coherent Energy Extraction</h3>
+
+  <p>
+    For each candidate symbol interval $k \in \{0, \dots, 78\}$, the receiver computes the magnitude-squared energy across the 8 candidate tone bins $m \in \{0, \dots, 7\}$ centered at base carrier frequency $f_0$:
+  </p>
+
+  $$E(k, m) = \left| X_k(f_0 + m \Delta f) \right|^2 = \left| \sum_{n=0}^{N_{\text{samp}}-1} x[k N_{\text{samp}} + n] \, e^{-j \frac{2\pi (f_0 + m \Delta f) n}{f_s}} \right|^2$$
+
+  <p>
+    In high-performance C or Zig implementations, computing full 1920-point FFTs across hundreds of candidate frequencies is wasteful. Receivers often use <strong>sliding FFTs</strong>, batched SIMD Goertzel filters, or polyphase filter banks to evaluate only the active $50\text{ Hz}$ passband of interest.
+  </p>
+
+  <div class="callout">
+    <div class="callout-title">Spectrogram Matrix Construction</div>
+    <p>
+      Demodulating an FT8 frame produces a $79 \times 8$ real-valued energy matrix $\mathbf{E} \in \mathbb{R}^{79 \times 8}$. Rows $0..6$, $36..42$, and $72..78$ are matched against the Costas sequence to refine $\tau$ and $f_0$. The remaining $58$ rows represent candidate data symbols.
+    </p>
+  </div>
+
+  <h2>5. Forward Error Correction: LDPC (174, 91)</h2>
+
+  <p>
+    Raw tone detection at $-24\text{ dB}$ has a symbol error rate exceeding $40\%$. No communication can occur without powerful Forward Error Correction (FEC).
+  </p>
+
+  <p>
+    FT8 uses a systematic <strong>Low-Density Parity-Check (LDPC)</strong> code, designated as $\mathbf{\text{LDPC}(174, 91)}$:
+  </p>
+  <ul>
+    <li><strong>Payload ($K$):</strong> $77$ bits of user payload (source callsign, destination callsign, grid locator or signal report) $+ 14$ bits of Cyclic Redundancy Check (CRC-14) $= \mathbf{91\text{ message bits}}$.</li>
+    <li><strong>Codeword Length ($N$):</strong> $58\text{ data symbols} \times 3\text{ bits/symbol} = \mathbf{174\text{ coded bits}}$.</li>
+    <li><strong>Parity Bits ($M = N - K$):</strong> $174 - 91 = \mathbf{83\text{ parity-check equations}}$.</li>
+    <li><strong>Code Rate ($R$):</strong> $R = 91 / 174 \approx \mathbf{0.523}$ (roughly rate $1/2$).</li>
+  </ul>
+
+  <h3>The Parity-Check Matrix $H$ and Tanner Graph</h3>
+
+  <p>
+    The code is defined by a binary parity-check matrix $\mathbf{H} \in \mathbb{F}_2^{83 \times 174}$ such that for any valid codeword $\mathbf{c} \in \{0, 1\}^{174}$:
+  </p>
+
+  $$\mathbf{H} \mathbf{c}^T = \mathbf{0} \pmod 2$$
+
+  <p>
+    The term <em>Low-Density</em> signifies that $\mathbf{H}$ is exceptionally sparse. Each row has an average of only $7$ ones (check degree $d_c \approx 7$), and each column has an average of $3$ ones (variable degree $d_v \approx 3$).
+  </p>
+
+  <p>
+    This defines a <strong>bipartite Tanner graph</strong> with two sets of vertices:
+  </p>
+  <ul>
+    <li><strong>174 Variable Nodes (VNs):</strong> Representing the transmitted code bits $v_1, \dots, v_{174}$.</li>
+    <li><strong>83 Check Nodes (CNs):</strong> Representing the parity constraint equations $c_1, \dots, c_{83}$.</li>
+    <li>An edge connects VN $v_j$ to CN $c_i$ if and only if $H_{i, j} = 1$.</li>
+  </ul>
+
+  <h3>Soft Demodulation: Bit Log-Likelihood Ratios (LLRs)</h3>
+
+  <p>
+    Before running the decoder, the demodulator converts the 8 tone energies $E(k, m)$ into soft bit probabilities.
+    Each 8-MFSK tone corresponds to a 3-bit Gray-coded symbol $(b_2, b_1, b_0)$.
+  </p>
+
+  <p>
+    The channel prior Log-Likelihood Ratio (LLR) for bit $i \in \{0, 1, 2\}$ of symbol $k$ is:
+  </p>
+
+  $$L(b_i) = \ln \left( \frac{P(b_i = 0 \mid \mathbf{Y})}{P(b_i = 1 \mid \mathbf{Y})} \right) = \ln \left( \frac{\sum_{m: b_i(m) = 0} P(E_m)}{\sum_{m: b_i(m) = 1} P(E_m)} \right)$$
+
+  <p>
+    Under the <strong>Max-Log approximation</strong> (standard in SIMD DSP implementations to avoid exponentials), this simplifies to the difference between maximum energies:
+  </p>
+
+  $$L(b_i) \approx \gamma \cdot \left( \max_{m: b_i(m) = 0} E_m - \max_{m: b_i(m) = 1} E_m \right)$$
+
+  <p>
+    where $\gamma$ is a channel reliability scaling factor proportional to the estimated $E_s / N_0$.
+  </p>
+
+  <h3>Belief Propagation: The Sum-Product Algorithm</h3>
+
+  <p>
+    The decoder operates iteratively, passing messages (beliefs) back and forth along the edges of the Tanner graph:
+  </p>
+
+  <ol>
+    <li>
+      <strong>Initialization:</strong>
+      Each variable node $v$ is initialized with its channel prior LLR: $L_v^{(0)} = L(b_v)$. Messages from variable nodes to check nodes are initialized: $q_{v \to c} = L_v^{(0)}$.
+    </li>
+    <li>
+      <strong>Check Node Update (CN $\to$ VN):</strong>
+      Each check node $c$ aggregates extrinsic beliefs from all connected variable nodes except $v$, enforcing parity:
+      $$\tanh\left(\frac{r_{c \to v}}{2}\right) = \prod_{v' \in \mathcal{N}(c) \setminus \{v\}} \tanh\left(\frac{q_{v' \to c}}{2}\right)$$
+    </li>
+    <li>
+      <strong>Variable Node Update (VN $\to$ CN):</strong>
+      Each variable node sums the incoming parity beliefs with its intrinsic channel prior:
+      $$q_{v \to c} = L_v^{(0)} + \sum_{c' \in \mathcal{N}(v) \setminus \{c\}} r_{c' \to v}$$
+    </li>
+    <li>
+      <strong>Syndrome Check and Early Termination:</strong>
+      Compute the posterior marginal LLR for each bit:
+      $$\Lambda_v = L_v^{(0)} + \sum_{c \in \mathcal{N}(v)} r_{c \to v}$$
+      Make a hard bit decision: $\hat{c}_v = 0$ if $\Lambda_v \ge 0$, else $\hat{c}_v = 1$.
+      Evaluate the syndrome vector:
+      $$\mathbf{s} = \mathbf{H} \mathbf{\hat{c}}^T \pmod 2$$
+      If $\mathbf{s} = \mathbf{0}$, a valid codeword has been discovered! The decoder verifies the 14-bit CRC. If valid, decoding terminates successfully—often in fewer than 15 iterations.
+    </li>
+  </ol>
+
+  <div class="callout upside">
+    <div class="callout-title">The Min-Sum SIMD Optimization</div>
+    <p>
+      In production C, Zig, and Rust SDR decoders, computing $\tanh$ and $\operatorname{artanh}$ across thousands of graph edges destroys CPU throughput. Modern decoders employ the <strong>Normalized Min-Sum algorithm</strong>:
+    </p>
+    $$r_{c \to v} \approx \alpha \cdot \left( \prod_{v' \in \mathcal{N}(c) \setminus \{v\}} \operatorname{sgn}(q_{v' \to c}) \right) \cdot \min_{v' \in \mathcal{N}(c) \setminus \{v\}} |q_{v' \to c}|$$
+    <p>
+      with normalization factor $\alpha \approx 0.75 - 0.85$.
+      Because this replaces transcendental math with sign multiplication and finding the minimum absolute integer, it can be vectorized using AVX2 (<code>_mm256_min_epi16</code>) or ARM NEON (<code>vminq_s16</code>), decoding an entire FT8 frame in under <strong>$200\ \mu\text{s}$</strong> on a modern CPU core!
+    </p>
+  </div>
+
+  <h2>Summary of the FT8 Pipeline Architecture</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Stage</th>
+        <th>Input Data</th>
+        <th>DSP / Algebraic Operation</th>
+        <th>Output Data</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>1. Baseband Ingestion</strong></td>
+        <td>Audio stream ($f_s = 12\text{ kHz}$)</td>
+        <td>15-second circular ring buffer windowing</td>
+        <td>180,000 complex/real audio samples</td>
+      </tr>
+      <tr>
+        <td><strong>2. Time-Frequency Search</strong></td>
+        <td>Audio samples</td>
+        <td>Sliding 1920-sample FFTs ($6.25\text{ Hz}$ resolution)</td>
+        <td>Spectrogram energy matrix $\mathbf{E}(t, f)$</td>
+      </tr>
+      <tr>
+        <td><strong>3. Costas Sync Lock</strong></td>
+        <td>Spectrogram matrix</td>
+        <td>2D cross-correlation with $[3, 1, 4, 0, 6, 5, 2]$</td>
+        <td>Candidate frames with locked $\tau, f_0, \dot{f}$</td>
+      </tr>
+      <tr>
+        <td><strong>4. Soft Metric Calculation</strong></td>
+        <td>58 data symbol energies</td>
+        <td>Max-Log tone-to-bit mapping</td>
+        <td>174 channel LLRs ($L_v^{(0)}$)</td>
+      </tr>
+      <tr>
+        <td><strong>5. LDPC Belief Propagation</strong></td>
+        <td>174 bit LLRs</td>
+        <td>Iterative Min-Sum message passing on $\mathbf{H}_{83 \times 174}$</td>
+        <td>Candidate 91-bit systematic vector</td>
+      </tr>
+      <tr>
+        <td><strong>6. CRC Verification</strong></td>
+        <td>91 message bits</td>
+        <td>Polynomial division $P(x) \pmod{g_{\text{CRC14}}(x)}$</td>
+        <td>Valid 77-bit payload (Calls, Grid)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-18-1">
+    <div class="quiz-question">
+      1. An FT8 signal is received at an SNR of -24 dB referenced to a standard 2500 Hz SSB channel. What is the effective SNR inside the matched 6.25 Hz DFT tone bin?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">Approximately -2.0 dB because narrow filtering reduces carrier amplitude.</li>
+      <li class="quiz-option" data-correct="true">Approximately +2.0 dB because narrowing bandwidth yields 26 dB gain.</li>
+      <li class="quiz-option" data-correct="false">Approximately -14.0 dB due to non-coherent energy summation losses.</li>
+      <li class="quiz-option" data-correct="false">Approximately +10.0 dB as LDPC parity checks amplify signal power.</li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> The processing gain from narrowing the observation bandwidth from $2500\text{ Hz}$ to the $6.25\text{ Hz}$ tone bin is $10\log_{10}(2500 / 6.25) = 10\log_{10}(400) \approx +26.02\text{ dB}$. Adding this to $-24\text{ dB}$ yields approximately $+2.02\text{ dB}$, lifting the tone above the noise floor in that discrete bin.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-18-2">
+    <div class="quiz-question">
+      2. Why does FT8 use a Costas array [3, 1, 4, 0, 6, 5, 2] for synchronization instead of a simple single-frequency tone?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="true">The non-repeating frequency difference property bounds cross-ambiguity sidelobes.</li>
+      <li class="quiz-option" data-correct="false">Periodic tones produce harmonic intermodulation distortion in the transmitter PA.</li>
+      <li class="quiz-option" data-correct="false">The Costas sequence injects additional pseudo-random parity bits into the LDPC.</li>
+      <li class="quiz-option" data-correct="false">Single-frequency carrier bursts trigger carrier-operated squelch gates in SDRs.</li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> Costas arrays have the unique algebraic property that for any time shift $\Delta t$, all frequency differences between tone pairs are distinct. In the 2D time-frequency ambiguity plane, no non-zero shift can yield more than one coincidental hit, strictly bounding the maximum correlation sidelobe to 1.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-18-3">
+    <div class="quiz-question">
+      3. In high-performance LDPC belief propagation decoders, why is the Min-Sum algorithm preferred over standard Sum-Product?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="true">It replaces transcendental tanh evaluations with fast SIMD sign and min operations.</li>
+      <li class="quiz-option" data-correct="false">It eliminates the requirement for parity-check matrices by decoding message bits.</li>
+      <li class="quiz-option" data-correct="false">It guarantees exact maximum-likelihood decoding without iterating on Tanner graphs.</li>
+      <li class="quiz-option" data-correct="false">It permits decoding when the channel SNR falls below the absolute Shannon bound.</li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> The Sum-Product algorithm requires evaluating non-linear $\tanh$ and $\operatorname{artanh}$ functions for every edge in the bipartite Tanner graph. Min-Sum approximates the check node update using sign multiplication and finding the minimum absolute magnitude, which compiles directly to vectorized SIMD instructions (e.g. <code>_mm256_min_epi16</code>).
+    </div>
+  </div>
+
+  <h2>Follow-up &amp; Next Steps</h2>
+  <p>
+    You now understand the complete mathematical and systems architecture of weak-signal DSP: how narrowband processing gain brings signals above the noise floor, how Costas arrays resolve 2D synchronization ambiguities, and how LDPC belief propagation corrects high channel error rates.
+  </p>
+  <p>
+    In subsequent lessons, we will explore multi-carrier FDM channels, WSPR (Weak Signal Propagation Reporter) at $-28\text{ dB}$ SNR with convolutional codes, and building high-throughput channelizers using polyphase filter banks in native Zig and Rust.
+  </p>
+</body>
+</html>

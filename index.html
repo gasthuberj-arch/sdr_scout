@@ -83,6 +83,56 @@
       <br>
       <em>How Zigler compiles native Zig directly into BEAM NIFs, zero-copy refc binary passing (the 64-byte rule), `beam.Resource` lifecycle safety without GC leaks, `@Vector(16, f32)` AVX2/NEON linear magnitude, and in-Zig CRC-24 syndrome error recovery.</em>
     </li>
+    <li>
+      <strong><a href="lessons/0014-cpr-airborne-position-decoding.html">Lesson 0014: Compact Position Reporting (CPR) — Non-Linear Spherical Coordinates &amp; Disambiguation</a></strong>
+      <br>
+      <em>How ADS-B fits global coordinates into 34 bits with 5.1m precision: the Vernier caliper principle of dual coprime latitude grids (60 even vs. 59 odd), the non-linear meridian convergence function $NL(\text{lat})$, global 10-second decoding, and single-frame dead-reckoning local tracking.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0015-polyphase-filterbanks-and-channelization-mechanics.html">Lesson 0015: Polyphase Filterbanks (PFB) — Channelization, Commutators, and Multirate DSP</a></strong>
+      <br>
+      <em>Overcoming the 800 GMACs/sec arithmetic wall: channelizing 10 MHz wideband spectrum into 100 narrowband channels, why windowed FFTs suffer from sinc spectral leakage, multirate Noble identities, and the $O(M \log M)$ polyphase commutator + IFFT architecture.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0016-costas-loops-and-carrier-phase-synchronization.html">Lesson 0016: Costas Loops &amp; Carrier Recovery — Phase Tracking in Coherent Digital Modes</a></strong>
+      <br>
+      <em>Why non-coherent detection fails for phase-keyed modulations (BPSK, QPSK, QAM), mathematical derivation of the $I \cdot Q$ product phase detector, second-order loop filters ($K_p, K_i$) eliminating Doppler offset, and NCO phase derotation.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0017-pulse-shaping-nyquist-and-root-raised-cosine.html">Lesson 0017: Pulse Shaping &amp; Intersymbol Interference (ISI) — Nyquist Criterion and Root-Raised Cosine (RRC)</a></strong>
+      <br>
+      <em>Spectral containment of rectangular pulses, Nyquist's First Criterion for Zero ISI, Raised Cosine excess bandwidth ($\alpha$), and splitting the response into Root-Raised Cosine ($H_{TX} \cdot H_{RX} = H_{RC}$) for optimal SNR and zero ISI.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0018-weak-signal-dsp-ft8-mfsk-and-ldpc.html">Lesson 0018: Weak-Signal DSP — FT8, Costas Arrays, and Coherent Demodulation at -24 dB SNR</a></strong>
+      <br>
+      <em>Operating below thermal noise via the Shannon-Hartley theorem, 8-MFSK physical layer timing (6.25 Hz bins, 160 ms symbols), Costas array ambiguity properties, and LDPC $(174, 91)$ belief propagation error correction.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0019-genstage-flow-control-and-streaming-backpressure.html">Lesson 0019: GenStage Flow Control &amp; Streaming Backpressure in SDR Pipelines</a></strong>
+      <br>
+      <em>Reconciling fixed-rate physical ADC clocks ($f_s = 2.0\text{ MSPS} \to 4\text{ MB/s}$) with variable digital processing: reactive pull-based demand contracts, tuning `max_demand: 4, min_demand: 1` to prevent buffer bloat, and zero-copy refc mailboxes.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0020-phased-array-beamforming-and-spatial-filtering.html">Lesson 0020: Phased Array Beamforming — Delay-and-Sum, Steering Vectors, and Spatial Nulling</a></strong>
+      <br>
+      <em>Moving beyond single antennas: Uniform Linear Array (ULA) geometry, spatial Nyquist spacing ($d \le \lambda / 2$), steering vectors $\mathbf{a}(\theta)$, linear directivity gain ($M\times$ power), and Capon's adaptive MVDR beamformer placing $-50\text{ dB}$ nulls on jammers.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0021-adc-dynamic-range-quantization-and-agc.html">Lesson 0021: ADC Dynamic Range, Quantization Noise, and Automatic Gain Control (AGC)</a></strong>
+      <br>
+      <em>The physics of ADC quantization: SQNR $\approx 6.02 B + 1.76\text{ dB}$, 8-bit RTL-SDR vs 12-bit HackRF vs 16-bit USRP, the near-far amateur radio blocking problem, oversampling decimation gain ($+1\text{ bit}$ per $4\times$), and digital AGC loop stabilization.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0022-zero-copy-ipc-and-circular-buffer-architectures.html">Lesson 0022: Zero-Copy IPC &amp; Circular Buffer Architectures — Page-Table Tricks vs. Refc Memory</a></strong>
+      <br>
+      <em>Solving the contiguous sliding window dilemma: GNU Radio's `vm_circbuf` double-mmap virtual page aliasing trick, why double-mmap conflicts with the BEAM garbage collector, SdrScout's 480-byte native overlap hybrid, and cache-line false sharing avoidance.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0023-fsk-afsk-demodulation-and-quadrature-discriminators.html">Lesson 0023: FSK &amp; AFSK Demodulation — Quadrature Discriminators, Delay-Line Conjugates, and Packet Radio (APRS)</a></strong>
+      <br>
+      <em>Bell 202 1200-baud packet radio on 2m VHF: extracting instantaneous frequency via delay-line conjugate multiplication ($z[n] \cdot z^*[n-1]$), fast SIMD rational arctan without trigonometric calls, parabolic noise filtering, and NRZI / HDLC bit unstuffing.</em>
+    </li>
   </ul>
 
   <h2>Reference Documents &amp; Glossaries</h2>

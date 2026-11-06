@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 16: Costas Loops &amp; Carrier Recovery — Phase Tracking in Coherent Digital Modes</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0016</span>
+    <span class="badge badge-arch">Synchronization &amp; Phase Tracking</span>
+    <span>Reading time: 14 minutes</span>
+  </div>
+
+  <h1>Costas Loops &amp; Carrier Recovery: Phase Tracking in Coherent Digital Modes</h1>
+
+  <p>
+    In Lesson 7, we solved <strong>symbol timing recovery</strong>: finding the optimal discrete sample instant within each symbol period using the Gardner detector. But for coherent digital modulations—such as BPSK, QPSK, PSK31, and high-order QAM—recovering the symbol clock is only half the battle.
+  </p>
+
+  <p>
+    Even if you sample at the exact center of the eye diagram, your receiver cannot distinguish between a $+1$ and a $-1$ symbol unless its internal local oscillator is synchronized in <strong>both frequency and absolute phase</strong> to the transmitter's carrier.
+  </p>
+
+  <p>
+    In this lesson, we explore the physics of <strong>Carrier Frequency Offset (CFO)</strong> and Doppler drift, derive the classic and decision-directed <strong>Costas Loop</strong>, synthesize a critically damped <strong>Second-Order Loop Filter</strong>, analyze false lock conditions ($180^\circ$ and $90^\circ$ phase ambiguities), and construct a zero-allocation, cache-friendly implementation in C.
+  </p>
+
+  <h2>1. Physical Reality: Why Non-Coherent Magnitude Fails</h2>
+
+  <p>
+    In our ADS-B (Mode-S) reference receiver, we decoded 1090 MHz Pulse Position Modulation (PPM) by computing the instantaneous power envelope:
+  </p>
+  $$P[n] = |s[n]|^2 = I[n]^2 + Q[n]^2$$
+
+  <p>
+    Non-coherent envelope detection is exceptionally forgiving. If the transmitter's carrier frequency is offset by $\Delta \omega$, the received complex baseband signal is multiplied by a spinning phase vector:
+  </p>
+  $$r[n] = s[n] \cdot e^{j(\Delta \omega n + \theta_0)}$$
+
+  <p>
+    Because the complex exponential has unit magnitude $|e^{j\phi}| = 1$:
+  </p>
+  $$|r[n]|^2 = |s[n]|^2 \cdot |e^{j(\Delta \omega n + \theta_0)}|^2 = |s[n]|^2 \cdot 1 = |s[n]|^2$$
+
+  <p>
+    In ADS-B, the carrier phase rotates harmlessly underneath the amplitude envelope without perturbing the pulse magnitude.
+  </p>
+
+  <div class="callout warning">
+    <div class="callout-title">The Coherent Modulation Catastrophe</div>
+    <p>
+      In coherent phase-shift keying (PSK), information is modulated directly into the carrier phase:
+    </p>
+    $$s(t) = A \sum_{k} d_k p(t - k T_s) e^{j \theta_k}$$
+    <p>
+      For Binary PSK (BPSK), $d_k \in \{+1, -1\}$, corresponding to constellation points at phase $0$ and $\pi$. If a receiver experiences an uncorrected carrier frequency offset $\Delta f$, the received constellation points do not sit stationary at $+1$ and $-1$. Instead, <strong>they spin continuously around the origin at angular velocity $\Delta \omega = 2\pi \Delta f T_s$ radians per symbol</strong>.
+    </p>
+    <p>
+      A decision slicer evaluating $\text{Re}\{r[n]\} \gtrless 0$ will alternate between valid bits, orthogonal nulls (where all energy leaks into the $Q$ axis), and inverted bits ($180^\circ$ error). The resulting Bit Error Rate (BER) asymptotically approaches <strong>50%</strong>—equivalent to pure random noise!
+    </p>
+  </div>
+
+  <h3>Origins of Carrier Frequency Offset (CFO)</h3>
+  <p>
+    CFO arises from two physical mechanisms:
+  </p>
+  <ol>
+    <li>
+      <strong>Local Oscillator (LO) Manufacturing Tolerances and Thermal Drift:</strong>
+      Every crystal oscillator exhibits frequency uncertainty measured in parts per million (ppm). If a transmitter and receiver both use $\pm 10\text{ ppm}$ crystals at an amateur UHF frequency of $f_c = 435\text{ MHz}$, the maximum mutual frequency offset is:
+      $$\Delta f_{\text{xtal}} = 2 \times 10\text{ ppm} \times 435\text{ MHz} = \pm 8.7\text{ kHz}$$
+      Even high-precision Temperature-Compensated Crystal Oscillators (TCXO) with $0.5\text{ ppm}$ stability produce $\pm 435\text{ Hz}$ of frequency drift.
+    </li>
+    <li>
+      <strong>Doppler Shift:</strong>
+      For mobile stations or satellite passes (e.g., amateur LEO CubeSats, NOAA satellites, or the ISS moving at $v \approx 7.5\text{ km/s}$):
+      $$\Delta f_{\text{Doppler}} = \frac{v_{\text{rel}}}{c} f_c = \frac{7500\text{ m/s}}{3 \times 10^8\text{ m/s}} \times 435\text{ MHz} \approx \pm 10.875\text{ kHz}$$
+      Furthermore, the line-of-sight velocity changes continuously during an overhead pass, yielding a non-zero frequency slew rate:
+      $$\frac{d f_D}{dt} \approx 50\text{ to } 100\text{ Hz/s}$$
+    </li>
+  </ol>
+
+  <p>
+    A coherent receiver cannot rely on a static tuner. It requires an active, closed-loop tracking system that estimates and cancels both the frequency offset $\Delta \omega$ and the instantaneous phase offset $\theta_0$.
+  </p>
+
+  <h2>2. The Costas Loop: Structure and Error Detectors</h2>
+
+  <p>
+    Why can't we use a standard Phase-Locked Loop (PLL) to track the carrier?
+  </p>
+
+  <p>
+    In BPSK, binary symbols $d[n] \in \{+1, -1\}$ are transmitted with zero mean ($\mathbb{E}[d[n]] = 0$). This is a <strong>suppressed-carrier</strong> modulation: all RF power resides in the modulation sidebands, leaving <strong>zero discrete spectral energy at the carrier frequency $f_c$</strong>. A basic PLL designed to lock onto an unmodulated carrier tone sees only zero-mean stochastic data.
+  </p>
+
+  <p>
+    In 1956, John P. Costas published a groundbreaking closed-loop architecture that strips modulation from suppressed-carrier signals directly at baseband using orthogonal In-Phase ($I$) and Quadrature ($Q$) mixer arms.
+  </p>
+
+  <div class="callout upside">
+    <div class="callout-title">Costas Loop Baseband Architecture</div>
+    <p>
+      The receiver downconverts incoming complex samples by mixing them with an internal complex phase estimate $e^{-j\hat{\theta}[n]}$ generated by a Numerically Controlled Oscillator (NCO):
+    </p>
+    $$y[n] = r[n] \cdot e^{-j\hat{\theta}[n]}$$
+    <p>
+      The signal is split into real ($I$) and imaginary ($Q$) arms, passed to a <strong>Phase Error Detector (PED)</strong> that strips data modulation to produce an error signal $e[n]$, filtered through a <strong>Second-Order Loop Filter</strong>, and fed back to update the NCO phase accumulator.
+    </p>
+  </div>
+
+  <h3>Mathematical Derivation: Classic Multiplier Costas Loop</h3>
+
+  <p>
+    Let the incoming baseband symbol at time index $n$ be:
+  </p>
+  $$r[n] = A d[n] e^{j \theta[n]} + w[n]$$
+
+  <p>
+    where $A$ is the signal amplitude, $d[n] \in \{+1, -1\}$ is the transmitted BPSK symbol, $\theta[n] = \Delta \omega n + \theta_0$ is the true carrier phase, and $w[n]$ is additive white Gaussian noise.
+  </p>
+
+  <p>
+    Mixing by our local phase estimate $e^{-j \hat{\theta}[n]}$ produces:
+  </p>
+  $$y[n] = r[n] e^{-j \hat{\theta}[n]} = A d[n] e^{j(\theta[n] - \hat{\theta}[n])} = A d[n] e^{j \Delta \theta[n]}$$
+
+  <p>
+    where $\Delta \theta[n] = \theta[n] - \hat{\theta}[n]$ represents the residual phase error. Expanding into $I[n]$ and $Q[n]$ components using Euler's formula:
+  </p>
+  $$I[n] = \text{Re}\{y[n]\} = A d[n] \cos(\Delta \theta[n])$$
+  $$Q[n] = \text{Im}\{y[n]\} = A d[n] \sin(\Delta \theta[n])$$
+
+  <p>
+    The classic Costas phase error detector multiplies the $I$ and $Q$ arms:
+  </p>
+  $$e[n] = I[n] \cdot Q[n] = \left( A d[n] \cos(\Delta \theta[n]) \right) \cdot \left( A d[n] \sin(\Delta \theta[n]) \right)$$
+  $$e[n] = A^2 d^2[n] \cos(\Delta \theta[n]) \sin(\Delta \theta[n])$$
+
+  <p>
+    Notice the algebraic breakthrough: because $d[n] \in \{+1, -1\}$, its square is <strong>strictly positive</strong>:
+  </p>
+  $$d^2[n] = (\pm 1)^2 \equiv 1$$
+
+  <p>
+    Applying the trigonometric double-angle identity $\sin(2\alpha) = 2 \sin\alpha \cos\alpha$:
+  </p>
+  $$e[n] = \frac{1}{2} A^2 \sin(2 \Delta \theta[n])$$
+
+  <p>
+    For small phase tracking errors ($|\Delta \theta[n]| \ll 1\text{ rad}$), we take the first-order Taylor expansion $\sin(2\Delta \theta) \approx 2\Delta \theta$:
+  </p>
+  $$e[n] \approx A^2 \Delta \theta[n]$$
+
+  <p>
+    <strong>The modulation $d[n]$ has vanished completely.</strong> The error signal $e[n]$ is directly proportional to the residual carrier phase error $\Delta \theta[n]$, independent of whether the transmitter sent a binary $0$ or $1$.
+  </p>
+
+  <h3>The Decision-Directed (Hard-Sliced) Error Detector</h3>
+
+  <p>
+    While the analog multiplier $I[n] \cdot Q[n]$ was historically necessary in continuous-time RF circuits, digital SDR implementations almost universally prefer the <strong>Decision-Directed Costas Loop</strong>:
+  </p>
+  $$e_{\text{DD}}[n] = \text{sign}(I[n]) \cdot Q[n]$$
+
+  <p>
+    Assuming low bit error rate, the slicer output accurately estimates the transmitted bit: $\text{sign}(I[n]) = d[n]$. Substituting:
+  </p>
+  $$e_{\text{DD}}[n] = d[n] \cdot \left( A d[n] \sin(\Delta \theta[n]) \right) = A d^2[n] \sin(\Delta \theta[n]) = A \sin(\Delta \theta[n])$$
+
+  <p>
+    For small phase errors:
+  </p>
+  $$e_{\text{DD}}[n] \approx A \Delta \theta[n]$$
+
+  <table>
+    <thead>
+      <tr>
+        <th>Detector Type</th>
+        <th>Mathematical Formula</th>
+        <th>Linear Tracking Range</th>
+        <th>Computational Cost</th>
+        <th>Low-SNR Noise Penalty</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Classic Multiplier</strong></td>
+        <td>$e = I \cdot Q$</td>
+        <td>$[-\pi/4, +\pi/4]$ ($45^\circ$)</td>
+        <td>1 float multiplication</td>
+        <td>High ($N \times N$ noise squaring)</td>
+      </tr>
+      <tr>
+        <td><strong>Decision-Directed</strong></td>
+        <td>$e = \text{sign}(I) \cdot Q$</td>
+        <td>$[-\pi/2, +\pi/2]$ ($90^\circ$)</td>
+        <td>1 bitwise sign copy</td>
+        <td>Low (no noise squaring)</td>
+      </tr>
+      <tr>
+        <td><strong>Normalized DD</strong></td>
+        <td>$e = Q / I$</td>
+        <td>$[-\pi/2, +\pi/2]$ ($90^\circ$)</td>
+        <td>1 float division (expensive)</td>
+        <td>Amplitude-invariant gain</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Extension to QPSK (4-Phase Costas Loop)</h3>
+  <p>
+    For Quadrature PSK, symbols carry two bits: $(\pm 1, \pm 1)$. The error detector must zero out at four symmetrical points ($0^\circ, 90^\circ, 180^\circ, 270^\circ$). The decision-directed QPSK error detector evaluates:
+  </p>
+  $$e_{\text{QPSK}}[n] = \text{sign}(I[n]) \cdot Q[n] - \text{sign}(Q[n]) \cdot I[n]$$
+
+  <h2>3. The Second-Order Loop Filter</h2>
+
+  <p>
+    The raw error detector output $e[n]$ contains high-frequency noise and double-frequency harmonics that must be filtered before updating the oscillator.
+  </p>
+
+  <h3>Why a First-Order Loop Fails under Doppler</h3>
+  <p>
+    A first-order loop adjusts phase using only a proportional term:
+  </p>
+  $$\hat{\theta}[n+1] = \hat{\theta}[n] + K_p \cdot e[n]$$
+
+  <p>
+    If the received signal has a static carrier frequency offset $\Delta \omega \ne 0$, the true phase advances as $\theta[n] = \Delta \omega \cdot n$. In steady state, the loop must generate a constant non-zero correction each step ($K_p e_{ss} = \Delta \omega$), which requires a permanent steady-state phase error:
+  </p>
+  $$\Delta \theta_{ss} = \frac{\Delta \omega}{K_p}$$
+
+  <p>
+    If $\Delta \omega$ is large, $\Delta \theta_{ss}$ rotates the constellation outside the decision boundaries, causing continual cycle slipping.
+  </p>
+
+  <h3>The Second-Order Proportional-Integral (PI) Architecture</h3>
+  <p>
+    To guarantee <strong>zero steady-state phase error</strong> in the presence of a constant frequency offset $\Delta \omega$, the loop filter must include an active integrator (a pole at $z = 1$):
+  </p>
+
+  $$\hat{\omega}[n+1] = \hat{\omega}[n] + K_i \cdot e[n] \quad \text{(Frequency Accumulator / Integrator)}$$
+  $$\hat{\theta}[n+1] = \hat{\theta}[n] + \hat{\omega}[n+1] + K_p \cdot e[n] \quad \text{(Phase Accumulator)}$$
+
+  <p>
+    Here, $\hat{\omega}[n]$ explicitly tracks and accumulates the carrier frequency offset. Once the integrator settles to $\hat{\omega} = \Delta \omega$, the error signal $e[n]$ converges to <strong>strictly zero</strong>.
+  </p>
+
+  <h3>Connecting Analog Control Theory to Digital Gains</h3>
+
+  <p>
+    In continuous control systems, a second-order closed-loop system is characterized by its <strong>natural angular frequency $\omega_n$</strong> (loop bandwidth) and <strong>damping factor $\zeta$</strong>:
+  </p>
+  $$H(s) = \frac{2\zeta \omega_n s + \omega_n^2}{s^2 + 2\zeta \omega_n s + \omega_n^2}$$
+
+  <div class="callout">
+    <div class="callout-title">Selecting the Damping Factor</div>
+    <p>
+      In virtually all communications receivers, the damping factor is chosen as:
+    </p>
+    $$\zeta = \frac{1}{\sqrt{2}} \approx 0.7071$$
+    <p>
+      This represents the <strong>critically damped / maximally flat</strong> Butterworth condition, delivering the fastest transient step response with minimal overshoot (&lt; 5%) and rapid settling time.
+    </p>
+  </div>
+
+  <p>
+    Using the bilinear transform or small-bandwidth approximations ($B_n T_s \ll 1$), we map continuous natural frequency $\omega_n$ and damping factor $\zeta$ to discrete gains $K_p$ and $K_i$:
+  </p>
+
+  $$\omega_n = \frac{8 \zeta B_n}{1 + 4 \zeta^2}$$
+  $$K_p = \frac{4 \zeta (\omega_n T_s)}{1 + 2\zeta(\omega_n T_s) + (\omega_n T_s)^2} \approx 2 \zeta \omega_n T_s$$
+  $$K_i = \frac{4 (\omega_n T_s)^2}{1 + 2\zeta(\omega_n T_s) + (\omega_n T_s)^2} \approx (\omega_n T_s)^2$$
+
+  <p>
+    where $B_n$ is the normalized single-sided loop noise bandwidth (typically configured between $0.01$ and $0.05$ of the symbol rate).
+  </p>
+
+  <h3>Bandwidth Trade-Off: Acquisition vs. Phase Noise</h3>
+  <ul>
+    <li>
+      <strong>Wide Loop Bandwidth ($B_n \uparrow$):</strong> Rapid acquisition time (fast pull-in) and robust tracking of high Doppler acceleration ($df/dt$). However, wide bandwidth admits significant out-of-band noise, increasing phase jitter variance $\sigma_{\theta}^2 \propto B_n$ and degrading receiver sensitivity.
+    </li>
+    <li>
+      <strong>Narrow Loop Bandwidth ($B_n \downarrow$):</strong> Excellent thermal noise rejection and razor-sharp constellation points. However, the pull-in capture range is small, acquisition time is slow, and abrupt frequency transients can unlock the loop.
+    </li>
+  </ul>
+
+  <h2>4. The Numerically Controlled Oscillator (NCO) &amp; DDS</h2>
+
+  <p>
+    The Numerically Controlled Oscillator (NCO)—also called a Direct Digital Synthesizer (DDS)—generates the local complex phasor $e^{-j\hat{\theta}[n]}$ that de-rotates the incoming signal.
+  </p>
+
+  <h3>Phase Accumulator and Wrapping</h3>
+  <p>
+    The instantaneous phase accumulator is maintained modulo $2\pi$:
+  </p>
+  $$\hat{\theta}[n] = \left( \hat{\theta}[n-1] + \hat{\omega}[n] \right) \pmod{2\pi}$$
+
+  <p>
+    In fixed-point systems (such as FPGA DSP slices or SIMD integers), the accumulator is represented as an unsigned 32-bit integer (`uint32_t`), where $2^{32} \equiv 2\pi\text{ rad}$. The modulo arithmetic is executed for free by natural integer overflow!
+  </p>
+
+  <h3>Complex Mixer Rotation</h3>
+  <p>
+    Multiplying the incoming complex baseband sample $x[n] = I_{\text{in}} + j Q_{\text{in}}$ by the conjugate phasor $e^{-j\hat{\theta}} = \cos\hat{\theta} - j\sin\hat{\theta}$:
+  </p>
+  $$y[n] = (I_{\text{in}} + j Q_{\text{in}}) \cdot (\cos\hat{\theta} - j \sin\hat{\theta})$$
+  $$I_{\text{out}}[n] = I_{\text{in}}[n]\cos\hat{\theta}[n] + Q_{\text{in}}[n]\sin\hat{\theta}[n]$$
+  $$Q_{\text{out}}[n] = Q_{\text{in}}[n]\cos\hat{\theta}[n] - I_{\text{in}}[n]\sin\hat{\theta}[n]$$
+
+  <div class="callout upside">
+    <div class="callout-title">Systems Optimization: Trigonometric Trigonometry vs. SIMD</div>
+    <p>
+      Calling standard C <code>cosf()</code> and <code>sinf()</code> on every single sample inside a 20 MSPS streaming loop will destroy throughput. Production SDR pipelines use three high-performance alternatives:
+    </p>
+    <ul>
+      <li><strong>Lookup Table (LUT):</strong> A 1024-entry precomputed table of quarter-wave sine values cached in L1 data cache.</li>
+      <li><strong>CORDIC Algorithm:</strong> Shift-and-add rotations requiring no hardware multipliers.</li>
+      <li><strong>Complex Phasor Multiplication:</strong> In vectorized block processing, the phase ramp is computed as $z[n+1] = z[n] \cdot e^{-j\Delta\omega}$, requiring only SIMD complex multiply-accumulate instructions.</li>
+    </ul>
+  </div>
+
+  <h2>5. Phase Ambiguity and False Lock Conditions</h2>
+
+  <p>
+    Look closely at the Costas error detector formula:
+  </p>
+  $$e[n] = \frac{1}{2} A^2 \sin(2 \Delta \theta[n])$$
+
+  <p>
+    The error detector produces $e[n] = 0$ whenever $\sin(2\Delta\theta) = 0$. Within a single rotation $[-\pi, +\pi]$, this equation has <strong>two stable equilibrium nulls</strong> with positive restoring slopes:
+  </p>
+  $$\Delta \theta = 0 \quad \text{and} \quad \Delta \theta = \pi \; (180^\circ)$$
+
+  <div class="callout warning">
+    <div class="callout-title">The Inverted Constellation Trap</div>
+    <p>
+      If the Costas Loop acquires lock at $\Delta \theta = \pi$:
+    </p>
+    $$I[n] = A d[n] \cos(\pi) = -A d[n]$$
+    <p>
+      The loop filter is in perfect, stable equilibrium. The constellation looks completely locked, but <strong>every single transmitted bit is inverted</strong> ($+1 \to -1$ and $-1 \to +1$).
+    </p>
+    <p>
+      In QPSK, the four-fold rotational symmetry creates a <strong>$90^\circ$ four-phase ambiguity</strong> ($0^\circ, 90^\circ, 180^\circ, 270^\circ$). The receiver has no way of knowing from the Costas loop alone which quadrant represents the true $(+1, +1)$ constellation point.
+    </p>
+  </div>
+
+  <h3>Resolving the Ambiguity</h3>
+
+  <p>
+    Modern digital communication protocols resolve this fundamental symmetry using one of two techniques:
+  </p>
+
+  <ol>
+    <li>
+      <strong>Differential Encoding (DBPSK / DQPSK):</strong>
+      Information is mapped not into absolute phase, but into the <em>change</em> in phase between consecutive symbols:
+      $$b_n = d_n \cdot d_{n-1}$$
+      If the Costas loop locks with a $180^\circ$ inversion ($\hat{d}_n = -d_n$), the product of consecutive inverted symbols cancels out the sign:
+      $$\hat{b}_n = (-d_n) \cdot (-d_{n-1}) = d_n \cdot d_{n-1} \equiv b_n$$
+      <em>Trade-off:</em> An isolated symbol error corrupts two consecutive decoded bits, incurring an approximate 2 dB SNR penalty.
+    </li>
+    <li>
+      <strong>Preamble / Unique Word (UW) Correlation:</strong>
+      Packet-based protocols (e.g., AX.25, CCSDS, DMR, D-STAR) prepend a known synchronization preamble (such as a 32-bit Barker or Gold sequence) to each frame. The receiver correlates against the known pattern $\mathbf{p}$:
+      $$R = \sum_{k=0}^{M-1} I[k] \cdot p[k]$$
+      <ul>
+        <li>If $R > 0$, the loop locked at $0^\circ$; proceed with normal bit decoding.</li>
+        <li>If $R < 0$, the loop locked at $180^\circ$; invert all subsequent payload bits in software.</li>
+      </ul>
+    </li>
+  </ol>
+
+  <h2>6. Concrete Native Implementation (C99 / Rust Paradigm)</h2>
+
+  <p>
+    Here is an efficient, zero-allocation C implementation of a Decision-Directed Second-Order Costas Loop designed for streaming SDR blocks:
+  </p>
+
+  <pre><code>#include &lt;math.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;stdbool.h&gt;
+
+#define TWO_PI 6.28318530717958647692f
+
+typedef struct {
+    float phase;       // Current NCO phase estimate [radians, 0 to 2*PI)
+    float freq;        // Current estimated carrier frequency offset [rad/sample]
+    float kp;          // Proportional loop gain
+    float ki;          // Integral loop gain
+    float freq_min;    // Frequency clamp limit (e.g. -0.2 rad/sample)
+    float freq_max;    // Frequency clamp limit (e.g. +0.2 rad/sample)
+} CostasLoopBPSK;
+
+/**
+ * Initializes a second-order Costas loop for BPSK.
+ * @param loop Pointer to state struct
+ * @param loop_bw Normalized loop bandwidth (Bn * Ts, typically 0.01 - 0.05)
+ * @param damping Damping factor zeta (typically 0.7071 for critical damping)
+ */
+void costas_init(CostasLoopBPSK *loop, float loop_bw, float damping) {
+    float denom = 1.0f + 2.0f * damping * loop_bw + loop_bw * loop_bw;
+    loop->phase = 0.0f;
+    loop->freq = 0.0f;
+    loop->kp = (4.0f * damping * loop_bw) / denom;
+    loop->ki = (4.0f * loop_bw * loop_bw) / denom;
+    loop->freq_min = -0.25f; // Clamps pull-in range to avoid harmonic lock
+    loop->freq_max =  0.25f;
+}
+
+/**
+ * Processes a block of complex baseband samples in-place.
+ * @param loop Costas loop state
+ * @param i_samples In-phase array (input and de-rotated output)
+ * @param q_samples Quadrature array (input and de-rotated output)
+ * @param count Number of samples
+ */
+void costas_process_block(CostasLoopBPSK *loop, float *i_samples, float *q_samples, size_t count) {
+    float phase = loop->phase;
+    float freq = loop->freq;
+    const float kp = loop->kp;
+    const float ki = loop->ki;
+
+    for (size_t n = 0; n &lt; count; ++n) {
+        float in_i = i_samples[n];
+        float in_q = q_samples[n];
+
+        // 1. NCO complex de-rotation: y = x * e^(-j * phase)
+        float cos_val = cosf(phase);
+        float sin_val = sinf(phase);
+        float out_i =  in_i * cos_val + in_q * sin_val;
+        float out_q = -in_i * sin_val + in_q * cos_val;
+
+        // 2. Decision-directed error detector: e = sign(I) * Q
+        float d_hat = (out_i >= 0.0f) ? 1.0f : -1.0f;
+        float error = d_hat * out_q;
+
+        // 3. Second-order PI loop filter updates
+        freq += ki * error;
+        // Clamp frequency to prevent runaway or false harmonic acquisition
+        if (freq &lt; loop->freq_min) freq = loop->freq_min;
+        if (freq &gt; loop->freq_max) freq = loop->freq_max;
+
+        phase += freq + kp * error;
+
+        // 4. Wrap phase into [0, 2*PI)
+        while (phase &gt;= TWO_PI) phase -= TWO_PI;
+        while (phase &lt; 0.0f)   phase += TWO_PI;
+
+        // Write de-rotated coherent samples back
+        i_samples[n] = out_i;
+        q_samples[n] = out_q;
+    }
+
+    loop->phase = phase;
+    loop->freq = freq;
+}</code></pre>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-16-1">
+    <div class="quiz-question">
+      1. Why does an uncorrected Carrier Frequency Offset (CFO) of 500 Hz cause a 50% bit error rate in BPSK, while having virtually zero effect on ADS-B PPM?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        ADS-B transponders utilize high-power traveling wave tubes that override phase rotation at the antenna aperture.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        ADS-B uses non-coherent magnitude envelope detection where phase rotation vectors have unity absolute magnitude.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        BPSK requires twice the RF channel bandwidth of Mode-S, inducing severe analog group delay distortion across filters.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Aircraft Mode-S replies are synchronized to ground radar interrogators via atomic rubidium standards on airframes.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> Mode-S / ADS-B uses pulse position modulation decoded via envelope power $|s[n]|^2 = I^2 + Q^2$. Because $|e^{j(\Delta \omega n + \theta)}| = 1$, frequency offsets rotate the phase without altering envelope magnitude. In contrast, BPSK encodes data strictly in carrier phase; CFO causes continuous rotation of the constellation, flipping bits and causing catastrophic BER.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-16-2">
+    <div class="quiz-question">
+      2. In a second-order Costas loop, why is an active integrator (PI filter) mandatory when tracking signals with a constant frequency offset?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        A proportional-only filter cannot eliminate high-frequency thermal noise produced by the receiver low-noise amplifier.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        A single-pole filter causes the complex mixer to fold negative frequencies onto positive spectrum, violating Nyquist limits.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        A first-order loop requires a permanent non-zero phase tracking error to generate a continuous frequency offset correction.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Phase accumulators in digital signal processors cannot execute floating-point modulo operations without an integral stage.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> In a first-order loop ($\hat{\theta}[n+1] = \hat{\theta}[n] + K_p e[n]$), maintaining a continuous frequency shift $\Delta \omega$ requires a permanent steady-state phase error $\Delta \theta_{ss} = \Delta \omega / K_p$. A second-order loop incorporates an integrator ($\hat{\omega}[n+1] = \hat{\omega}[n] + K_i e[n]$) that accumulates the frequency offset, driving the steady-state phase tracking error to exactly zero.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-16-3">
+    <div class="quiz-question">
+      3. What physical ambiguity is inherent to a standard BPSK Costas loop, and how is it resolved in packetized digital radio?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The loop suffers a 90° quadrature rotation ambiguity that must be resolved using Hilbert transform pre-filters.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The loop produces random 45° constellation tilts that require dynamic FIR equalizer tap weight recalculation.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The loop has stable lock points at 0° and 180°, producing inverted bits resolved by preambles or differential encoding.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The loop locks only on positive carrier frequencies, requiring a secondary Hilbert detector to invert negative offsets.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> The BPSK error detector $e = I \cdot Q \propto \sin(2\Delta\theta)$ has stable nulls at both $\Delta\theta = 0^\circ$ and $\Delta\theta = 180^\circ$. At $180^\circ$, all bits are inverted. Packet radios resolve this by correlating against a known preamble sync word (Barker/Gold code) to detect and correct packet polarity, or by using differential encoding (DBPSK).
+    </div>
+  </div>
+
+  <h2>Primary Sources &amp; Further Reading</h2>
+  <ul>
+    <li>
+      <strong>Costas, John P.</strong> (1956). <em>"Synchronous Communications"</em>. Proceedings of the IRE, 44(12), 1713–1718. (The seminal paper establishing carrier phase tracking without carrier transmission).
+    </li>
+    <li>
+      <strong>Rice, Michael.</strong> (2008). <em>Digital Communications: A Discrete-Time Approach</em>. Prentice Hall. (The definitive textbook on discrete phase-locked loops, loop filter synthesis, and carrier recovery).
+    </li>
+    <li>
+      <strong>Lichtman, Marc.</strong> <em>PySDR: A Guide to SDR and DSP using Python — Synchronization</em>. <a href="https://pysdr.org/content/sync.html" target="_blank" rel="noopener">https://pysdr.org/content/sync.html</a>.
+    </li>
+  </ul>
+
+  <p>
+    Review related architecture fundamentals in <a href="../GLOSSARY.md">GLOSSARY.md</a> and symbol synchronization in <a href="0007-symbol-timing-recovery-and-gardner-detector.html">Lesson 0007: Symbol Timing Recovery</a>.
+  </p>
+
+  <div class="footer">
+    <span>Questions on loop damping, phase jitter, or vectorizing the NCO? Ask your tutor agent!</span>
+    <span><a href="0013-zigler-in-sdr-architecture.html">&larr; Lesson 0013</a> | Lesson 0016</span>
+  </div>
+</body>
+</html>

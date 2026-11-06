@@ -6,7 +6,7 @@ function initQuiz() {
     const questions = container.querySelectorAll('.quiz-question');
 
     // If container holds multiple questions, initialize each independently
-    if (questions.length > 0) {
+    if (questions.length > 1) {
       questions.forEach(function(q) {
         setupQuizUnit(q, q);
       });

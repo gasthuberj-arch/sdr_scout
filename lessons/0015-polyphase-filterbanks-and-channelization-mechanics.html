@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 15: Polyphase Filterbanks — Channelization Mechanics, Commutators, and Multirate DSP</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0015</span>
+    <span class="badge badge-arch">Multirate DSP &amp; Systems Architecture</span>
+    <span>Reading time: 13 minutes</span>
+  </div>
+
+  <h1>Polyphase Filterbanks: Channelization Mechanics, Commutators, and Multirate DSP</h1>
+
+  <p>
+    In high-throughput Software-Defined Radio systems, one operational scenario appears constantly: an RF front-end captures a wide swath of spectrum containing dozens or hundreds of independent narrowband transmissions.
+  </p>
+
+  <p>
+    Consider monitoring amateur radio activity:
+  </p>
+  <ul>
+    <li>Ingesting a <strong>10 MHz</strong> slice of the 10-meter band (28.0 to 29.7 MHz) or VHF band to demultiplex <strong>100 independent 100 kHz channels</strong> simultaneously (FM repeaters, DMR, APRS, CW, and digital modes).</li>
+    <li>Surveillance and search-and-rescue scanners scanning entire mobile bands for emergency beacons.</li>
+    <li>Satellite ground stations receiving frequency-division multiplexed (FDM) telemetry carriers across a wide transponder passband.</li>
+  </ul>
+
+  <p>
+    How do we ingest a continuous complex baseband stream at $f_s = 10\text{ MSPS}$ and split it into 100 isolated baseband streams at $f_{\text{out}} = 100\text{ kSPS}$ without saturating CPU memory buses or stalling real-time threads?
+  </p>
+
+  <p>
+    This lesson dissects the mathematical mechanics, multirate theorems, and systems architecture of the <strong>Polyphase Filterbank (PFB) Channelizer</strong>.
+  </p>
+
+  <h2>1. The Naive DDC Bank: The Arithmetic Wall</h2>
+
+  <p>
+    The classic textbook solution deploys a bank of $M$ independent Digital Down Converters (DDCs), one for each channel $k \in \{0, 1, \dots, M-1\}$:
+  </p>
+
+  <ol>
+    <li><strong>Mixer (Frequency Shift):</strong> Multiply incoming samples $x[n]$ by a complex carrier $e^{-j 2\pi f_k n / f_s}$ to translate channel $k$ to baseband ($0\text{ Hz}$).</li>
+    <li><strong>Channel Filter:</strong> Apply a sharp low-pass FIR filter $h[n]$ with $L$ taps to reject adjacent channel energy.</li>
+    <li><strong>Decimator:</strong> Downsample by factor $M$ ($[\downarrow M]$) to match the channel's Nyquist bandwidth ($f_{\text{out}} = f_s / M$).</li>
+  </ol>
+
+  <div class="callout warning">
+    <div class="callout-title">The Absurd Arithmetic Cost</div>
+    <p>
+      To achieve adjacent-channel rejection $>80\text{ dB}$ with a sharp transition band (e.g. $10\text{ kHz}$ transition width at $f_s = 10\text{ MHz}$), the prototype FIR filter requires at least $L = 800$ taps (filter depth $K = L/M = 8$).
+    </p>
+    <p>
+      Evaluating $M = 100$ parallel FIR filters at the full input rate $f_s = 10\text{ MSPS}$:
+    </p>
+    $$\text{Workload} = M \times L \times f_s = 100 \times 800 \times 10,000,000 = \mathbf{800 \times 10^9 \text{ MACs/sec}}$$
+    <p>
+      <strong>800 Giga-MACs per second!</strong> Crucially, after computing 800 billion multiplications, the downsampler immediately <strong>throws away 99 out of every 100 computed samples</strong>. Over 99% of CPU execution cycles and SIMD vector instructions are instantly discarded.
+    </p>
+  </div>
+
+  <h2>2. Why Naive Windowed FFTs Fail: The Spectral Leakage Trap</h2>
+
+  <p>
+    A common engineering instinct is: <em>"Why run filters at all? Why not just collect $M = 100$ samples and take an $M$-point Fast Fourier Transform (FFT) repeatedly?"</em>
+  </p>
+
+  <p>
+    An $M$-point Short-Time Fourier Transform (STFT) computed on non-overlapping blocks of $M$ samples:
+  </p>
+
+  $$X_k[m] = \sum_{n=0}^{M-1} x[m M + n] e^{-j \frac{2\pi}{M} k n}$$
+
+  <p>
+    Mathematically, this is identical to passing the signal through a bank of $M$ bandpass filters whose impulse response is a <strong>rectangular window of length $M$</strong>.
+  </p>
+
+  <p>
+    The discrete-time frequency response of a length-$M$ rectangular filter is the Dirichlet sinc kernel:
+  </p>
+
+  $$H_{\text{rect}}(\omega) = e^{-j \omega \frac{M-1}{2}} \frac{\sin(\omega M / 2)}{\sin(\omega / 2)}$$
+
+  <p>
+    This reveals two catastrophic flaws for channelization:
+  </p>
+
+  <ul>
+    <li><strong>Disastrous Sidelobes (-13 dB):</strong> The first sidelobe of a rectangular window is only <strong>$-13.3\text{ dB}$</strong> below the passband peak, decaying at a sluggish $-6\text{ dB/octave}$ ($1/f$). In an amateur radio band, an S9+40 dB (+10 dBm) FM repeater will blast through the $-13\text{ dB}$ sidelobes into neighboring channels, completely obliterating weak $-115\text{ dBm}$ digital signals (e.g. FT8, APRS, or DMR).</li>
+    <li><strong>The Windowing Dilemma:</strong> Multiplying each $M$-sample block by a Hann or Blackman window reduces sidelobes (Hann gives $-31.5\text{ dB}$ peak sidelobes, Blackman gives $-58\text{ dB}$), but windowing dramatically <strong>widens the mainlobe</strong>. A Hann window doubles the mainlobe width to $4\pi / M$; a Blackman window triples it to $6\pi / M$. This causes severe passband droop and massive inter-channel crosstalk across adjacent bins.</li>
+  </ul>
+
+  <div class="callout">
+    <div class="callout-title">The Fundamental Degree-of-Freedom Limit</div>
+    <p>
+      An $M$-point FFT channelizer is fundamentally constrained to filter length <strong>$L = M$</strong>. You cannot independently control passband flatness, transition steepness, and stopband attenuation with only $M$ taps.
+    </p>
+    <p>
+      To achieve a brickwall response with $>80\text{ dB}$ attenuation and steep roll-off, a prototype filter must span <strong>$L = K \cdot M$</strong> taps, where $K \ge 8$ to $16$ is the <em>polyphase filter depth</em>.
+    </p>
+  </div>
+
+  <h2>3. The Noble Identities of Multirate DSP</h2>
+
+  <p>
+    To eliminate the 99% wasted computation of filtering before downsampling, multirate signal processing relies on the <strong>Noble Identities</strong>.
+  </p>
+
+  <p>
+    The First Noble Identity (for decimation) states that filtering by an upsampled impulse response $G(z^M)$ followed by downsampling by $M$ is mathematically identical to downsampling by $M$ <em>first</em>, followed by filtering with $G(z)$ at the decimated sample rate:
+  </p>
+
+  $$[\text{Filter } G(z^M)] \longrightarrow [\downarrow M] \quad \Longleftrightarrow \quad [\downarrow M] \longrightarrow [\text{Filter } G(z)]$$
+
+  <pre><code>(a) High-Rate Evaluation:
+x[n] ──► [ G(z^M) ] ──► [ Downsample by M ] ──► y[m]   (Runs at f_s)
+
+(b) Equivalent Low-Rate Evaluation (Noble Identity):
+x[n] ──► [ Downsample by M ] ──► [ G(z) ] ──► y[m]     (Runs at f_s / M)</code></pre>
+
+  <p>
+    To apply this identity to our arbitrary prototype low-pass FIR filter $H(z) = \sum_{n=0}^{L-1} h[n] z^{-n}$ of length $L = K \cdot M$, we partition its impulse response into $M$ interleaved subsets:
+  </p>
+
+  <h3>The Polyphase Decomposition</h3>
+
+  <p>
+    We group the tap indices $n \in \{0, \dots, L-1\}$ modulo $M$: let $n = r M + k$, where $k \in \{0, 1, \dots, M-1\}$ represents the branch index and $r \in \{0, 1, \dots, K-1\}$ represents the tap index within that branch.
+  </p>
+
+  <p>
+    The transfer function $H(z)$ decomposes into $M$ polyphase components:
+  </p>
+
+  $$H(z) = \sum_{k=0}^{M-1} z^{-k} E_k(z^M)$$
+
+  <p>
+    where each polyphase sub-filter $E_k(z)$ has only $K = L/M$ taps:
+  </p>
+
+  $$E_k(z) = \sum_{r=0}^{K-1} h[r M + k] z^{-r}$$
+
+  <p>
+    By applying the Noble Identity to each branch, the delay chain $z^{-k}$ combined with the downsampler $[\downarrow M]$ transforms into an input <strong>commutator</strong>, and each sub-filter $E_k(z)$ operates <strong>strictly at the decimated output rate $f_s / M$</strong>!
+  </p>
+
+  <h2>4. The Complete PFB Architecture</h2>
+
+  <p>
+    The Polyphase Filterbank Channelizer integrates three stages into a single pipeline:
+  </p>
+
+  <ol>
+    <li><strong>The Commutator (Spinning Input Distributor):</strong> Distributes blocks of $M$ incoming high-rate samples into $M$ branch delay lines.</li>
+    <li><strong>Sub-Filter Convolutions:</strong> $M$ parallel FIR sub-filters, each of length $K = L/M$, executing at the low rate $f_s / M$.</li>
+    <li><strong>The $M$-point IFFT Synthesis Block:</strong> Simultaneously mixes all $M$ channel outputs to baseband ($0\text{ Hz}$).</li>
+  </ol>
+
+  <div class="callout upside">
+    <div class="callout-title">Full PFB Channelizer Topology</div>
+    <pre><code>Incoming Stream x[n] (Rate f_s = 10 MSPS)
+            │
+            ▼
+┌───────────────────────┐
+│ Commutator Distributor│
+│ (Circular Delay Line) │
+└───────┬───────────────┘
+        │   Branch 0: x[mM]       ──► [ E_0(z)  (K taps) ] ──► v_0[m] ──┐
+        ├── Branch 1: x[mM - 1]   ──► [ E_1(z)  (K taps) ] ──► v_1[m] ──┤
+        ├── Branch 2: x[mM - 2]   ──► [ E_2(z)  (K taps) ] ──► v_2[m] ──┼──► [ M-point IFFT ]
+        ├── ...                                                         │           │
+        └── Branch M-1: x[mM-M+1] ──► [ E_{M-1}(z)(K taps)] ──► v_{M-1}─┘           ▼
+                                                                           M Channels Out!
+                                                                     (Each at f_s / M = 100 kSPS)</code></pre>
+  </div>
+
+  <h3>Why the IFFT Acts as a Universal Parallel Mixer</h3>
+
+  <p>
+    Let $v_k[m]$ be the scalar output produced by branch sub-filter $E_k(z)$ at decimated time step $m$. To translate each channel $p \in \{0, \dots, M-1\}$ from its center frequency to $0\text{ Hz}$, the multirate derivation requires applying a discrete phase rotation $e^{j 2\pi p k / M}$.
+  </p>
+
+  <p>
+    Computing channel $p$'s output $Y_p[m]$:
+  </p>
+
+  $$Y_p[m] = \sum_{k=0}^{M-1} v_k[m] \, e^{j \frac{2\pi}{M} p k}$$
+
+  <p>
+    This equation is the definition of the <strong>$M$-point Inverse Discrete Fourier Transform (IDFT)</strong> of the sub-filter output vector $\mathbf{v}[m]$.
+  </p>
+
+  <p>
+    Instead of calculating $M$ independent complex mixers and filters, a single $M$-point Inverse Fast Fourier Transform synthesizes all $M$ channelized baseband streams simultaneously!
+  </p>
+
+  <h2>5. Computational Complexity Proof: $O(M \log M)$ vs $O(M^2)$</h2>
+
+  <p>
+    Let us evaluate the computational complexity per output epoch (one output sample per channel, produced every $M$ incoming samples):
+  </p>
+
+  <h3>Naive DDC Complexity</h3>
+  <ul>
+    <li><strong>Mixers:</strong> $M$ channels $\times M$ samples $= M^2$ complex multiplications.</li>
+    <li><strong>FIR Filtering:</strong> If evaluated after downsampling (polyphase evaluation without FFT): $M$ channels $\times L$ taps $= M \times (K \cdot M) = K M^2$ real-complex MACs.</li>
+    <li><strong>Total Naive Operations:</strong> $\mathcal{O}(K M^2)$ per output block.</li>
+  </ul>
+
+  <h3>PFB Channelizer Complexity</h3>
+  <ul>
+    <li><strong>Commutator:</strong> Circular buffer pointer decrement $\implies \mathcal{O}(1)$ pointer operations per sample ($\mathcal{O}(M)$ per block).</li>
+    <li><strong>Sub-Filters:</strong> $M$ sub-filters, each computing $K$ MACs $\implies M \cdot K$ MACs per block.</li>
+    <li><strong>Synthesis IFFT:</strong> An $M$-point radix-2 Cooley-Tukey IFFT requires $\frac{M}{2} \log_2 M$ complex multiplications per block.</li>
+    <li><strong>Total PFB Operations:</strong> $K M + \frac{M}{2} \log_2 M = M \left( K + \frac{1}{2} \log_2 M \right)$ operations per block.</li>
+  </ul>
+
+  <p>
+    Normalizing per channel per output sample:
+  </p>
+
+  $$\text{Cost}_{\text{naive}} = K \cdot M \quad \text{vs} \quad \text{Cost}_{\text{PFB}} = K + \frac{1}{2} \log_2 M$$
+
+  <h3>Concrete Benchmark Comparison ($M = 128$ channels, $K = 8$ taps, $f_s = 10\text{ MSPS}$)</h3>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Processing Stage</th>
+        <th>Naive DDC Bank</th>
+        <th>Polyphase Filterbank (PFB)</th>
+        <th>Algorithmic Speedup</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Channel Filtering</strong></td>
+        <td>$128^2 \times 8 = 131,072$ MACs</td>
+        <td>$128 \times 8 = 1,024$ MACs</td>
+        <td><strong>128&times; reduction</strong></td>
+      </tr>
+      <tr>
+        <td><strong>Frequency Mixing</strong></td>
+        <td>$128^2 = 16,384$ complex mults</td>
+        <td>$\frac{128}{2} \log_2(128) = 448$ mults</td>
+        <td><strong>36.5&times; reduction</strong></td>
+      </tr>
+      <tr>
+        <td><strong>Total Work / Block</strong></td>
+        <td><strong>~147,456 Ops</strong></td>
+        <td><strong>~1,472 Ops</strong></td>
+        <td><strong>100.2&times; Speedup</strong></td>
+      </tr>
+      <tr>
+        <td><strong>Instruction Rate @ 10 MSPS</strong></td>
+        <td><strong>11.5 GMACs/sec</strong></td>
+        <td><strong>115 MMACs/sec</strong></td>
+        <td><strong>Fits in single CPU core (&lt;2% load)</strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>6. Systems Architecture: Memory Layout, Cache Locality, and SIMD</h2>
+
+  <p>
+    An algorithm's theoretical $\mathcal{O}(M \log M)$ complexity can be completely degraded by cache misses and pipeline stalls if the memory layout is poorly structured.
+  </p>
+
+  <h3>The Strided Memory Anti-Pattern</h3>
+  <p>
+    In a naive C/Rust implementation, prototype filter taps are stored in sequential memory:
+  </p>
+  <pre><code>// NAIVE: Prototype filter taps stored in linear order h[0], h[1], ...
+float prototype_taps[K * M];
+
+// Accessing tap r of branch k requires stride M:
+float tap = prototype_taps[r * M + k]; // STRIDED MEMORY ACCESS!</code></pre>
+
+  <p>
+    With $M = 1024$ channels (4096 bytes of <code>float</code>), a stride of $M$ causes each tap load to cross a 4 KB memory page boundary or multiple 64-byte L1 cache lines. The CPU cache prefetcher fails completely, stalling execution on memory latency.
+  </p>
+
+  <h3>Cache-Aligned Polyphase Matrix Layout</h3>
+  <p>
+    In high-performance SDR engines (and native Zig/Rust modules), polyphase sub-filter coefficients must be reorganized into a contiguous 2D matrix:
+  </p>
+
+  <pre><code>// CACHE-OPTIMAL: Transposed polyphase tap matrix
+// taps[r][k] stores tap index r across all M channels contiguously!
+alignas(64) float pfb_taps[K][M];
+alignas(64) float delay_line[K][M];</code></pre>
+
+  <p>
+    Why is the <code>[K][M]</code> layout optimal?
+  </p>
+  <ul>
+    <li><strong>SIMD Fused Multiply-Add (FMA):</strong> For each filter tap $r \in \{0, \dots, K-1\}$, vector registers can load 8 (AVX2 <code>ymm</code>) or 16 (AVX-512 <code>zmm</code>) contiguous channel coefficients and data samples in a single unaligned/aligned instruction:
+      <pre><code>// AVX-512 inner branch loop (16 channels per instruction)
+for (size_t k = 0; k &lt; M; k += 16) {
+    __m512 v_acc = _mm512_setzero_ps();
+    for (size_t r = 0; r &lt; K; ++r) {
+        __m512 v_taps = _mm512_load_ps(&amp;pfb_taps[r][k]);
+        __m512 v_data = _mm512_load_ps(&amp;delay_line[r][k]);
+        v_acc = _mm512_fmadd_ps(v_taps, v_data, v_acc);
+    }
+    _mm512_store_ps(&amp;ifft_input[k], v_acc);
+}</code></pre>
+    </li>
+    <li><strong>L1 Cache Residency:</strong> For $M = 128$ channels and $K = 8$ taps, the entire polyphase tap table consumes only $8 \times 128 \times 4\text{ bytes} = \mathbf{4\text{ KB}}$, fitting entirely inside the CPU's 32 KB L1 data cache.</li>
+    <li><strong>Zero-Copy Commutator via Virtual Memory Mirroring:</strong> By allocating circular buffers with mirrored virtual memory pages (using Linux <code>mmap</code> double-mapping, as in GNU Radio's <code>vm_circbuf</code>), the commutator writes incoming $M$-sample chunks contiguously without pointer wrapping branches or modulo operations.</li>
+  </ul>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-15-1">
+    <div class="quiz-question">
+      1. Why is an M-point windowed FFT inadequate for channelizing wideband SDR spectrum compared to a Polyphase Filterbank?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The discrete Fourier transform cannot process complex baseband I/Q values without converting them to polar coordinates.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The windowed FFT introduces non-linear phase distortions that prevent digital carrier recovery in phase-shift keying.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The FFT filter length is constrained to M taps, causing high sidelobe leakage (-13 to -32 dB) or severe mainlobe broadening.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The fast Fourier transform algorithm requires radix-2 block sizes that cannot be mapped onto physical SDR antenna feeds.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> An $M$-point FFT channelizer is fundamentally locked to a prototype filter of length $L = M$. Rectangular windows suffer from $-13.3\text{ dB}$ sidelobes, while tapering windows (Hann/Blackman) double or triple the mainlobe width, causing passband droop and adjacent channel crosstalk. A PFB decouples the channel count from filter length by choosing $L = K \cdot M$ ($K \ge 8$).
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-15-2">
+    <div class="quiz-question">
+      2. According to the First Noble Identity of multirate DSP, what transformation allows the PFB sub-filters to execute at the decimated rate?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Filtering by H(z) before downsampling can be replaced by taking the continuous Hilbert transform of the analog RF signal.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Filtering by G(z^M) followed by decimation by M is algebraically identical to downsampling by M before filtering by G(z).
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Decimating by factor M preserves all high-frequency spectral components without requiring anti-aliasing low-pass filters.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Computing the complex autocorrelation of the input sequence commutes with time-domain linear convolution across all taps.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> The First Noble Identity proves that an upsampled filter $G(z^M)$ followed by a factor-$M$ downsampler is mathematically identical to downsampling first by $M$ and then filtering with $G(z)$ at the reduced sample rate $f_s / M$, eliminating 100% of discarded computations.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-15-3">
+    <div class="quiz-question">
+      3. In an optimized C or Zig PFB implementation, why is the transposed polyphase coefficient matrix [K][M] preferred over strided access [K*M]?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        It reduces the total number of floating-point arithmetic additions required by the Cooley-Tukey butterfly stages.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It eliminates the need for 64-byte memory alignment when loading vectors into AVX-512 floating-point registers.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It guarantees that all channel output samples are written directly to disk without passing through the operating system.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        It places coefficients for the same tap index across channels contiguously in memory, maximizing SIMD FMA throughput.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> Storing polyphase taps in a transposed $[K][M]$ matrix ensures that tap index $r$ across channels $k, k+1, \dots, k+15$ is contiguous in memory. This enables vector load instructions and Fused Multiply-Add (FMA) execution across channels without strided cache misses.
+    </div>
+  </div>
+
+  <h2>Primary Sources &amp; Further Reading</h2>
+  <ul>
+    <li>
+      <strong>fredric j. harris</strong>, <em>Multirate Signal Processing for Communication Systems</em> (Prentice Hall). Chapter 5 &amp; 9: Polyphase Filter Banks and Digital Down-Converters. The authoritative text on commutator topologies and multirate identities.
+    </li>
+    <li>
+      <strong>P. P. Vaidyanathan</strong>, <em>Multirate Systems and Filter Banks</em> (Prentice Hall). The classic mathematical foundation of polyphase matrices and perfect reconstruction filterbanks.
+    </li>
+    <li>
+      Review our system-level glossary entries on <a href="../GLOSSARY.md">GLOSSARY.md</a> for <em>Polyphase Filterbank</em>, <em>Commutator</em>, and <em>Noble Identities</em>.
+    </li>
+  </ul>
+
+  <div class="footer">
+    <span>Next: High-Throughput Stream Framing &amp; Channel Orchestration</span>
+    <span><a href="0013-zigler-in-sdr-architecture.html">&larr; Lesson 0013</a> | Lesson 0015</span>
+  </div>
+</body>
+</html>

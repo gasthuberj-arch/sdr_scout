@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 23: FSK &amp; AFSK Demodulation — Quadrature Discriminators, Delay-Line Conjugates, and Packet Radio (APRS)</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0023</span>
+    <span class="badge badge-arch">Demodulation &amp; Packet Radio</span>
+    <span>Reading time: 14 minutes</span>
+  </div>
+
+  <h1>FSK &amp; AFSK Demodulation: Quadrature Discriminators, Delay-Line Conjugates, and Packet Radio (APRS)</h1>
+
+  <p>
+    In previous lessons, we examined amplitude-keyed pulsed systems such as ADS-B Mode-S PPM in <a href="file:///home/johannes/code/sdr_scout/lib/sdr_scout/synth/modulator.ex"><code>SdrScout.Synth.Modulator</code></a>. While pulse position modulation relies on scalar envelope power $|z[n]|^2$, the backbone of amateur radio digital telemetry—including the global <strong>Automatic Packet Reporting System (APRS)</strong> on 144.390 MHz VHF—relies on frequency-modulated bitstreams: <strong>Continuous Phase Frequency Shift Keying (CPFSK)</strong> and <strong>Audio Frequency Shift Keying (AFSK)</strong>.
+  </p>
+
+  <p>
+    To demodulate frequency shift keying at line rate without drowning the CPU in transcendental function evaluations or messy phase unwrapping branches, high-performance software-defined radio pipelines use the <strong>delay-line conjugate quadrature discriminator</strong>. This lesson explores the mathematics, SIMD vectorization, and packet recovery mechanics of this foundational DSP construct.
+  </p>
+
+  <h2>1. FSK &amp; AFSK in Amateur Radio: The Bell 202 Standard</h2>
+
+  <p>
+    The amateur packet radio standard AX.25 was built atop the vintage <strong>Bell 202</strong> modem physical layer. On VHF 2 meters (144.390 MHz in North America, 144.800 MHz in Europe), APRS transceivers broadcast positioning telemetry, weather beacons, and tactical messages using this modulation.
+  </p>
+
+  <ul>
+    <li><strong>Symbol Rate (Baud):</strong> $R = 1200\text{ baud}$ ($T_b = \frac{1}{1200} \approx 833.33\,\mu\text{s}$ per bit).</li>
+    <li><strong>Mark Frequency ($f_{\text{mark}}$):</strong> $1200\text{ Hz}$ (Binary 1 in classical FSK conventions).</li>
+    <li><strong>Space Frequency ($f_{\text{space}}$):</strong> $2200\text{ Hz}$ (Binary 0 in classical FSK conventions).</li>
+    <li><strong>Center Frequency ($f_c$):</strong> $1700\text{ Hz}$.</li>
+    <li><strong>Frequency Deviation ($\Delta f$):</strong> $\pm 500\text{ Hz}$ relative to the subcarrier center ($f_{\text{shift}} = 1000\text{ Hz}$).</li>
+  </ul>
+
+  <p>
+    The modulation index $h$ governs the spectral bandwidth and orthogonality of the tones:
+  </p>
+
+  $$h = \frac{|f_{\text{space}} - f_{\text{mark}}|}{R} = \frac{1000\text{ Hz}}{1200\text{ baud}} = \frac{5}{6} \approx 0.833$$
+
+  <div class="callout upside">
+    <div class="callout-title">CPFSK vs. Discontinuous FSK</div>
+    <p>
+      In <strong>Continuous Phase FSK (CPFSK)</strong>, the oscillator never abruptly resets its phase accumulator when switching frequencies. Abrupt phase discontinuities introduce high-frequency step functions whose spectral sidelobes decay as $O(1/f^2)$ ($-20\text{ dB/decade}$). By forcing the phase trajectory $\phi(t)$ to remain continuous $\mathcal{C}^0$, spectral sidelobes decay as $O(1/f^4)$ ($-40\text{ dB/decade}$), preventing adjacent channel interference across narrow 12.5 kHz / 25 kHz VHF channel allocations.
+    </p>
+  </div>
+
+  <p>
+    In traditional analog rigs, <strong>AFSK</strong> generates the 1200/2200 Hz audio tones first, feeding them into the microphone audio input of a standard FM voice transceiver (Frequency Modulation of an Audio Frequency Shift Keyed carrier). In a pure SDR receiver, the RF signal is digitized directly to complex baseband $I/Q$. The pipeline must either perform FM demodulation to audio baseband followed by AFSK tone discrimination, or directly discriminate the RF phase derivative if receiving native FSK.
+  </p>
+
+  <h2>2. Frequency as the Time Derivative of Phase</h2>
+
+  <p>
+    A complex analytic baseband signal $z(t)$ represents instantaneous amplitude $A(t)$ and instantaneous phase $\phi(t)$:
+  </p>
+
+  $$z(t) = I(t) + j Q(t) = A(t) e^{j\phi(t)}$$
+
+  <p>
+    By fundamental physical definition, <strong>instantaneous angular frequency</strong> $\omega(t)$ is the first time derivative of instantaneous phase:
+  </p>
+
+  $$\omega(t) = \frac{d\phi(t)}{dt} = 2\pi f(t) \quad \implies \quad f(t) = \frac{1}{2\pi} \frac{d\phi(t)}{dt}$$
+
+  <p>
+    In a discrete-time receiver sampled at uniform interval $T_s = 1/f_s$, the phase change over one sample period is the finite difference:
+  </p>
+
+  $$\Delta\phi[n] = \phi[n] - \phi[n-1] = \int_{(n-1)T_s}^{nT_s} \omega(t)\,dt \approx 2\pi f[n] T_s$$
+
+  <p>
+    Solving for instantaneous frequency yields:
+  </p>
+
+  $$f[n] \approx \frac{\Delta\phi[n]}{2\pi T_s} = \frac{f_s}{2\pi} \Delta\phi[n]$$
+
+  <h3>The Naive Approach (And Why It Fails in High-Throughput DSP)</h3>
+
+  <p>
+    A programmer approaching this for the first time might write:
+  </p>
+
+  <pre><code>// NAIVE, SLOW, FRAGILE IMPLEMENTATION
+float phi_now  = atan2f(Q[n], I[n]);
+float phi_prev = atan2f(Q[n-1], I[n-1]);
+float delta_phi = phi_now - phi_prev;
+
+// Branchy phase unwrapping required!
+if (delta_phi > M_PI)  delta_phi -= 2.0f * M_PI;
+if (delta_phi < -M_PI) delta_phi += 2.0f * M_PI;
+
+float freq = (fs / (2.0f * M_PI)) * delta_phi;</code></pre>
+
+  <p>
+    This naive algorithm exhibits catastrophic architectural shortcomings:
+  </p>
+
+  <ol>
+    <li><strong>Two Transcendental Calls per Sample:</strong> Computing <code>atan2f</code> twice requires 80–140 CPU cycles per sample pair, crippling line-rate SDR pipelines.</li>
+    <li><strong>Branch Misprediction Hazards:</strong> The conditional phase-unwrapping branches ($> \pi$ and $< -\pi$) disrupt pipelined CPU instruction flows whenever the phase vector hovers near the negative real axis ($-\pi \equiv +\pi$). Noise-induced boundary crossing generates frequent branch mispredictions.</li>
+    <li><strong>SIMD Vectorization Incompatibility:</strong> Standard SIMD vector units cannot easily vectorize branchy phase unwrapping without complex masking and lane shuffling.</li>
+  </ol>
+
+  <h2>3. The Delay-Line Conjugate Quadrature Discriminator</h2>
+
+  <p>
+    Instead of converting to polar coordinates and differentiating, the <strong>quadrature discriminator</strong> operates entirely on complex numbers in Cartesian space using complex conjugate multiplication:
+  </p>
+
+  $$d[n] = z[n] \cdot z^*[n-1]$$
+
+  <p>
+    Let us evaluate this identity analytically in polar form:
+  </p>
+
+  $$z[n] = |z[n]| e^{j\phi[n]}, \qquad z^*[n-1] = |z[n-1]| e^{-j\phi[n-1]}$$
+
+  $$d[n] = \left( |z[n]| e^{j\phi[n]} \right) \cdot \left( |z[n-1]| e^{-j\phi[n-1]} \right) = |z[n]|\,|z[n-1]|\, e^{j(\phi[n] - \phi[n-1])}$$
+
+  $$d[n] = |z[n]|\,|z[n-1]|\, e^{j\Delta\phi[n]}$$
+
+  <p>
+    The phase angle of the product $d[n]$ is <em>identically</em> the phase differential $\Delta\phi[n]$:
+  </p>
+
+  $$\text{Arg}(d[n]) = \Delta\phi[n] \approx 2\pi f[n] T_s$$
+
+  <h3>Cartesian Algebraic Expansion</h3>
+
+  <p>
+    Let $z[n] = I_n + j Q_n$ and $z[n-1] = I_{n-1} + j Q_{n-1}$. The complex conjugate of the delayed sample is $z^*[n-1] = I_{n-1} - j Q_{n-1}$. Expanding the product:
+  </p>
+
+  $$d[n] = (I_n + j Q_n)(I_{n-1} - j Q_{n-1}) = (I_n I_{n-1} + Q_n Q_{n-1}) + j (Q_n I_{n-1} - I_n Q_{n-1})$$
+
+  <p>
+    Defining the real and imaginary components:
+  </p>
+
+  $$\text{Re}(d[n]) = I_n I_{n-1} + Q_n Q_{n-1}$$
+
+  $$\text{Im}(d[n]) = Q_n I_{n-1} - I_n Q_{n-1}$$
+
+  <div class="callout upside">
+    <div class="callout-title">Geometric Intuition: Dot and Cross Products</div>
+    <p>
+      Look closely at the components of $d[n]$:
+      <br>
+      $\text{Re}(d[n]) = \mathbf{z}[n] \cdot \mathbf{z}[n-1]$ is the standard 2D <strong>dot product</strong> (proportional to $\cos \Delta\phi$).
+      <br>
+      $\text{Im}(d[n]) = \mathbf{z}[n] \times \mathbf{z}[n-1]$ is the 2D <strong>cross product</strong> (proportional to $\sin \Delta\phi$).
+      <br>
+      Conjugate multiplication rotates $z[n]$ backward by the phase of $z[n-1]$. The resulting vector points directly along the positive real axis when $\Delta\phi = 0$. Because $\Delta\phi$ is small between adjacent samples in an oversampled system ($|\Delta\phi| \ll \pi$), the vector $d[n]$ lives squarely in the right half-plane ($x > 0$), <strong>completely eliminating phase unwrapping</strong>!
+    </p>
+  </div>
+
+  <h2>4. High-Performance SIMD Vectorization &amp; Fast Angle Approximation</h2>
+
+  <p>
+    Once $d[n] = X_n + j Y_n$ is formed via four multiplications and two additions, we need to extract $\Delta\phi[n] = \text{atan2}(Y_n, X_n)$. In native SIMD kernels (such as Zig or C with AVX2/NEON), calling standard <code>atan2f</code> per lane defeats vectorization.
+  </p>
+
+  <h3>Small-Angle Cross-Product Discriminator</h3>
+
+  <p>
+    If the signal has passed through an automatic gain control (AGC) or hard limiter such that $|z[n]| \approx 1$, and sampling rate $f_s$ is sufficiently high ($f_s \ge 8 R$), the phase step per sample is small ($|\Delta\phi| \ll 1\text{ rad}$). Using the small-angle Taylor expansion $\sin(\Delta\phi) \approx \Delta\phi$:
+  </p>
+
+  $$\Delta\phi[n] \approx \sin(\Delta\phi[n]) = \frac{\text{Im}(d[n])}{|z[n]||z[n-1]|} = \frac{Q_n I_{n-1} - I_n Q_{n-1}}{I_n^2 + Q_n^2}$$
+
+  <p>
+    When normalized, <strong>the cross product alone directly yields the instantaneous frequency</strong> with zero trigonometric operations!
+  </p>
+
+  <h3>Minimax &amp; Chebyshev Rational Approximation</h3>
+
+  <p>
+    For wideband FSK where $\Delta\phi$ spans up to $\pm \frac{\pi}{2}$, we use an octant-reduced rational minimax approximation. For an argument ratio $u = Y/X$ where $|u| \le 1$:
+  </p>
+
+  $$\text{atan}(u) \approx \frac{u}{1.0 + 0.28086 u^2}$$
+
+  <p>
+    This rational approximation delivers maximum absolute error under $0.005\text{ rad}$ ($< 0.28^\circ$) across the entire interval $[-1, 1]$ using only one division, one squaring, and two FMA (fused multiply-add) instructions per SIMD lane.
+  </p>
+
+  <p>
+    Here is how this delay-line discriminator kernel maps directly into vectorized code using Zig's native <code>@Vector</code> primitives:
+  </p>
+
+  <pre><code>// Vectorized delay-line quadrature discriminator in Zig
+const std = @import("std");
+
+pub fn discriminate_chunk_simd(
+    i_samples: []const f32,
+    q_samples: []const f32,
+    out_freq: []f32,
+    prev_i: *f32,
+    prev_q: *f32,
+) void {
+    const VecWidth = 8;
+    const V = @Vector(VecWidth, f32);
+
+    var last_i = prev_i.*;
+    var last_q = prev_q.*;
+
+    var idx: usize = 0;
+    while (idx + VecWidth <= i_samples.len) : (idx += VecWidth) {
+        const i_vec: V = i_samples[idx..][0..VecWidth].*;
+        const q_vec: V = q_samples[idx..][0..VecWidth].*;
+
+        // Construct delayed vectors [i_prev, i_0, i_1, ...]
+        var i_delayed: V = undefined;
+        var q_delayed: V = undefined;
+
+        i_delayed[0] = last_i;
+        q_delayed[0] = last_q;
+        inline for (1..VecWidth) |lane| {
+            i_delayed[lane] = i_vec[lane - 1];
+            q_delayed[lane] = q_vec[lane - 1];
+        }
+
+        // Cartesian conjugate product: d[n] = z[n] * conj(z[n-1])
+        // Re = I[n]*I[n-1] + Q[n]*Q[n-1]
+        // Im = Q[n]*I[n-1] - I[n]*Q[n-1]
+        const re: V = (i_vec * i_delayed) + (q_vec * q_delayed);
+        const im: V = (q_vec * i_delayed) - (i_vec * q_delayed);
+
+        // Fast rational arctan: u = im / re; atan(u) ~ u / (1.0 + 0.28086 * u^2)
+        const u: V = im / (re + @as(V, @splat(1e-12))); // Prevent div-by-zero
+        const c1: V = @splat(0.28086);
+        const one: V = @splat(1.0);
+        const delta_phi: V = u / (one + c1 * (u * u));
+
+        out_freq[idx..][0..VecWidth].* = delta_phi;
+
+        last_i = i_vec[VecWidth - 1];
+        last_q = q_vec[VecWidth - 1];
+    }
+
+    prev_i.* = last_i;
+    prev_q.* = last_q;
+}</code></pre>
+
+  <h2>5. Parabolic Noise Shaping &amp; Baseband Filtering</h2>
+
+  <p>
+    There is a critical physical consequence to frequency discrimination that every DSP engineer must account for: <strong>noise differentiation</strong>.
+  </p>
+
+  <p>
+    Because frequency is the derivative of phase, the frequency discriminator acts as an ideal differentiator operator $\mathcal{H}(f) = j2\pi f$. Its power transfer function is:
+  </p>
+
+  $$|\mathcal{H}(f)|^2 = (2\pi f)^2$$
+
+  <p>
+    If the complex input signal contains flat Additive White Gaussian Noise (AWGN) with constant Power Spectral Density $S_{ww}(f) = \frac{N_0}{2}$, the noise power spectral density at the discriminator output becomes <strong>parabolic</strong>:
+  </p>
+
+  $$S_{nn}(f) = |\mathcal{H}(f)|^2 S_{ww}(f) = (2\pi f)^2 \frac{N_0}{2}$$
+
+  <div class="callout warning">
+    <div class="callout-title">The Parabolic Noise Penalty</div>
+    <p>
+      High-frequency noise is amplified dramatically relative to low-frequency noise. At twice the frequency, noise power increases fourfold ($+6\text{ dB/octave}$). If left unfiltered, wideband discriminator noise will overwhelm symbol detection. Therefore, the discriminator output <strong>must</strong> immediately pass through a low-pass filter (or matched filter) matched to the symbol rate ($B \approx 1.2 R$) before threshold slicing.
+    </p>
+  </div>
+
+  <h2>6. Slicing, NRZI Decoding, and HDLC Framing</h2>
+
+  <p>
+    Once the discriminator output is low-pass filtered, we obtain the baseband audio signal. For Bell 202 AFSK, the signal oscillates between $1200\text{ Hz}$ and $2200\text{ Hz}$. After a mark/space bandpass filter pair (or second stage audio discriminator) and a DC-tracking slicer, the analog waveform is quantized into a discrete binary bitstream.
+  </p>
+
+  <p>
+    However, the raw sliced bits cannot be interpreted directly as ASCII or packet data. The AX.25 physical layer applies two encoding transforms: <strong>NRZI</strong> and <strong>Bit Stuffing</strong>.
+  </p>
+
+  <h3>NRZI (Non-Return-to-Zero Inverted)</h3>
+
+  <p>
+    Standard asynchronous UART uses levels (Mark = High, Space = Low). But RF channels suffer from phase reversals and transmitter tone inversions. AX.25 eliminates polarity sensitivity using <strong>NRZI encoding</strong>:
+  </p>
+
+  <ul>
+    <li><strong>Bit 0:</strong> Represents a transition in state (tone changes from Mark to Space, or Space to Mark).</li>
+    <li><strong>Bit 1:</strong> Represents NO transition (the tone remains on whichever frequency it was already transmitting).</li>
+  </ul>
+
+  <p>
+    The receiver decodes NRZI with a single XOR and NOT operation between adjacent sliced bits:
+  </p>
+
+  $$b_{\text{data}}[n] = \neg (b_{\text{raw}}[n] \oplus b_{\text{raw}}[n-1])$$
+
+  <p>
+    Notice that if the entire RF signal is frequency-inverted (swapping Mark and Space), transitions still occur on 0 and no transitions occur on 1. <em>NRZI is completely polarity-invariant!</em>
+  </p>
+
+  <h3>HDLC Bit Stuffing &amp; Flag Delimiters</h3>
+
+  <p>
+    AX.25 packets are framed using standard <strong>HDLC (High-Level Data Link Control)</strong>:
+  </p>
+
+  <ul>
+    <li><strong>Flag Delimiter:</strong> The unique 8-bit octet <code>01111110</code> (hex <code>0x7E</code>) marks the start and end of every frame.</li>
+    <li><strong>Bit Stuffing (Transmitter):</strong> Whenever the transmitter encounters five consecutive <code>1</code> bits in the data payload, it forcibly inserts a dummy <code>0</code> bit immediately after them. This guarantees that data bytes (such as <code>0x7E</code> in an uncompressed GPS coordinate) never accidentally mimic a flag delimiter.</li>
+    <li><strong>Bit Unstuffing (Receiver):</strong> The receiver maintains a running count of consecutive <code>1</code>s:
+      <ul>
+        <li>If five <code>1</code>s are followed by a <code>0</code>: The <code>0</code> is discarded (unstuffed).</li>
+        <li>If six <code>1</code>s are followed by a <code>0</code>: The sequence is recognized as the <code>0x7E</code> flag.</li>
+        <li>If seven or more consecutive <code>1</code>s appear: The frame is flagged as an invalid abort sequence.</li>
+      </ul>
+    </li>
+  </ul>
+
+  <div class="callout upside">
+    <div class="callout-title">Clock Recovery via Transitions</div>
+    <p>
+      Because every <code>0</code> causes a tone transition, and bit stuffing guarantees that a <code>0</code> is injected at least once every 5 consecutive <code>1</code>s, the received signal is guaranteed to transition at least once every 6 baud periods. This rich transition density keeps digital phase-locked loops (DPLL) and Gardner timing recovery algorithms tightly locked to the transmitter's symbol clock.
+    </p>
+  </div>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-23-1">
+    <div class="quiz-question">
+      1. Why does the delay-line conjugate discriminator $d[n] = z[n] \cdot z^*[n-1]$ completely eliminate phase unwrapping?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The hardware Floating Point Unit automates modulo $2\pi$ arithmetic inside native registers.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Multiplying by the conjugate rotates the differential vector directly into the positive real half-plane.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The complex conjugate operation reflects negative frequencies into positive Nyquist intervals.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Conjugate multiplication forces the envelope magnitude $|z[n]|$ to strictly equal unit power.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> In polar form, $z[n] \cdot z^*[n-1] = |z[n]||z[n-1]| e^{j(\phi[n] - \phi[n-1])}$. Because consecutive samples in an oversampled system have a small phase change $(|\Delta\phi| \ll \pi)$, the product vector $d[n]$ lies close to the positive real axis (positive half-plane $X > 0$). It is far from the branch cut at $-\pi$, so $\text{Arg}(d[n])$ never crosses the discontinuity.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-23-2">
+    <div class="quiz-question">
+      2. Why does unconstrained frequency discrimination result in a parabolic noise power spectrum $S(f) \propto f^2$?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Quadrature mixer imbalance folds second-order intermodulation harmonics into audio baseband.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Quantization noise in 8-bit RTL-SDR converters follows a quadratic distribution across channels.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Frequency is the time derivative of phase, acting as an ideal differentiator whose power gain is $(2\pi f)^2$.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The polynomial minimax approximation of $\arctan(x)$ introduces quadratic truncation residues.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> Differentiating a signal in the time domain is equivalent to multiplying its spectrum by $j2\pi f$ in the frequency domain. The power transfer function of the differentiation operator is therefore $|\mathcal{H}(f)|^2 = (2\pi f)^2$. When flat white noise is differentiated, high-frequency spectral components are magnified quadratically.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-23-3">
+    <div class="quiz-question">
+      3. In AX.25 APRS packet framing, what is the primary operational purpose of HDLC bit stuffing?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        To pad variable-length packet payloads to match 64-byte BEAM reference binary boundaries.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        To inject redundant parity bits for forward error correction under weak-signal AWGN fading.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        To prevent arbitrary payload data from inadvertently matching the unique 0x7E flag delimiter.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        To enforce continuous phase trajectory transitions whenever the baud rate shifts dynamically.
+      </li>
+    </ul>
+    <div class="quiz-explanation" data-custom-text="true">
+      <strong>Correct!</strong> The flag byte <code>01111110</code> (<code>0x7E</code>) uniquely identifies frame boundaries. If data within a packet happens to contain six consecutive <code>1</code> bits, an unstuffed receiver would misidentify it as an end-of-frame delimiter. The transmitter forcibly inserts a <code>0</code> after five consecutive <code>1</code>s, guaranteeing unambiguous framing.
+    </div>
+  </div>
+
+  <h2>Summary &amp; Architecture Implications</h2>
+
+  <p>
+    The delay-line conjugate discriminator is one of the most elegant gems in digital signal processing:
+  </p>
+
+  <ol>
+    <li>It converts phase differentiation into <strong>four real multiplications and two additions</strong> per sample.</li>
+    <li>It circumvents branchy phase unwrapping by rotating the differential phase vector away from the branch cut.</li>
+    <li>It maps cleanly onto SIMD vector registers (AVX2/NEON) and integrates smoothly with Erlang NIFs and streaming flowgraphs.</li>
+    <li>Coupled with low-pass filtering, NRZI decoding, and HDLC bit unstuffing, it forms a complete, real-time amateur packet radio receiver.</li>
+  </ol>
+
+  <div class="footer">
+    <span>Have questions on SIMD vector widths, discriminator delays, or AX.25 CRC-16? Ask your tutor agent!</span>
+    <span><a href="0013-zigler-in-sdr-architecture.html">&larr; Lesson 0013</a> | Lesson 0023</span>
+  </div>
+</body>
+</html>

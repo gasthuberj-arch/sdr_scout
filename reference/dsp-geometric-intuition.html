@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Reference: DSP Through Linear Algebra &amp; Geometric Intuition</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    .vector-box {
+      background: #fdfdf8;
+      border: 1px solid #dcdcd0;
+      border-radius: 8px;
+      padding: 1.2rem;
+      margin: 1.5rem 0;
+    }
+    .math-highlight {
+      font-weight: 600;
+      color: #8b0000;
+    }
+  </style>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-arch">Visual Reference</span>
+    <span>Intuitive DSP Foundations</span>
+  </div>
+
+  <h1>DSP Through Linear Algebra: The Geometric Intuition</h1>
+
+  <p>
+    Signal processing textbooks often drown learners in integral calculus and differential equations. But for anyone with a background in computer science or computational engineering, <strong>discrete signal processing is simply linear algebra in disguise</strong>.
+  </p>
+
+  <h2>1. Signals are Just Vectors in $\mathbb{R}^N$ or $\mathbb{C}^N$</h2>
+  <p>
+    An array of $N$ audio or radio samples is not an abstract continuous wave—it is literally a single point (or vector) in an $N$-dimensional Euclidean space:
+  </p>
+  $$\mathbf{x} = \begin{bmatrix} x_0 \\ x_1 \\ \vdots \\ x_{N-1} \end{bmatrix} \in \mathbb{R}^N$$
+
+  <h2>2. Correlation is Just the Vector Dot Product</h2>
+  <p>
+    Remember the standard vector dot product from analytic geometry:
+  </p>
+  $$\mathbf{x} \cdot \mathbf{y} = \|\mathbf{x}\| \|\mathbf{y}\| \cos\theta$$
+
+  <div class="vector-box">
+    <p><strong>What does the angle $\theta$ tell us?</strong></p>
+    <ul>
+      <li><strong>$\theta = 0^\circ$ ($\cos\theta = 1$):</strong> The signal $\mathbf{x}$ has the <em>exact same shape</em> as template $\mathbf{y}$. The dot product produces the maximum possible value.</li>
+      <li><strong>$\theta = 90^\circ$ ($\cos\theta = 0$):</strong> The signals are <strong>orthogonal</strong>. They share zero information. Even if $\mathbf{x}$ is blaring at full power, it creates zero output in a detector tuned to $\mathbf{y}$.</li>
+      <li><strong>Random White Noise $\mathbf{w}$ against Template $\mathbf{y}$:**</strong> Because white noise has random, uncorrelated samples in all $N$ dimensions, its energy is distributed evenly across all $N$ orthogonal directions. When projected onto your 1-dimensional template $\mathbf{y}$, almost all the noise energy cancels out!</li>
+    </ul>
+  </div>
+
+  <h2>3. Why Does Convolution Flip the Filter? (The Time-Reversal Mystery)</h2>
+  <p>
+    In textbooks, discrete convolution is defined with a confusing minus sign:
+  </p>
+  $$(x * h)[n] = \sum_{k} x[k] h[n - k]$$
+
+  <p>
+    Why $n - k$? Why reverse the filter?
+  </p>
+  <p>
+    Because if your filter $h$ is defined as the <strong>time-reversed template</strong> of the signal you want to find ($h[k] = s[-k]$), then convolution becomes:
+  </p>
+  $$(x * h)[n] = \sum_{k} x[k] s[k - n] = \mathbf{x} \cdot \mathbf{s}_{\text{shifted}}$$
+
+  <p>
+    <strong>A matched filter is not black magic: it is literally sliding a template across your data and taking the dot product at every single sample index!</strong>
+  </p>
+
+  <h2>4. How This Powers Amateur (HAM) Radio Modes</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>HAM Mode</th>
+        <th>Physical Principle</th>
+        <th>Linear Algebra Interpretation</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>2m APRS (1200 baud Bell 202)</strong></td>
+        <td>Toggles between 1200 Hz ("Mark" = 1) and 2200 Hz ("Space" = 0).</td>
+        <td>Two orthogonal basis vectors $\mathbf{v}_{1200}$ and $\mathbf{v}_{2200}$. Calculate dot products $\langle \mathbf{x}, \mathbf{v}_{1200}\rangle$ and $\langle \mathbf{x}, \mathbf{v}_{2200}\rangle$. Whichever projection is longer wins the bit decision!</td>
+      </tr>
+      <tr>
+        <td><strong>HF FT8 (Weak Signal)</strong></td>
+        <td>8 distinct audio tones spaced by only 6.25 Hz, lasting 15 seconds.</td>
+        <td>An 8-dimensional orthogonal basis. Projecting over 15 seconds (thousands of samples) compresses the noise to zero while the coherent tone builds a massive dot product, decoding signals <strong>24 dB below the noise floor</strong>!</td>
+      </tr>
+      <tr>
+        <td><strong>ADS-B / Mode-S (1090 MHz)</strong></td>
+        <td>16-chip pulse preamble followed by pulse position modulation (PPM).</td>
+        <td>A 16-sample binary template vector $\mathbf{p} = [1, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0]$. Take the sliding dot product against magnitude; when the peak crosses threshold, lock frame!</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="footer">
+    <span>Reference: Geometric DSP</span>
+    <span><a href="../lessons/0005-demystifying-dsp-geometric-filters-and-ham-modes.html">Go to Lesson 0005 &rarr;</a></span>
+  </div>
+</body>
+</html>

@@ -11,14 +11,34 @@ defmodule SdrScout.Pipeline.DetectorConsumer do
     GenStage.start_link(__MODULE__, opts)
   end
 
+  @doc """
+  Flushes all in-flight event batches before replying.
+  """
+  def sync(consumer, timeout \\ 5000) do
+    GenStage.call(consumer, :sync, timeout)
+  end
+
+  @doc """
+  Returns raw DSP telemetry `[samples, preambles, crc_ok, fixed]`.
+  """
+  def get_telemetry(consumer) do
+    GenStage.call(consumer, :get_telemetry)
+  end
+
   @impl true
   def init(opts) do
     producer = Keyword.fetch!(opts, :producer)
     airspace = Keyword.get(opts, :airspace, SdrScout.Airspace)
+    collector = Keyword.get(opts, :collector, nil)
     ctx = Dsp.new_context()
 
-    {:consumer, %{ctx: ctx, airspace: airspace},
-     subscribe_to: [{producer, max_demand: 4, min_demand: 1}]}
+    state = %{
+      ctx: ctx,
+      airspace: airspace,
+      collector: collector
+    }
+
+    {:consumer, state, subscribe_to: [{producer, max_demand: 4, min_demand: 1}]}
   end
 
   @impl true
@@ -28,24 +48,37 @@ defmodule SdrScout.Pipeline.DetectorConsumer do
   end
 
   @impl true
+  def handle_call(:sync, _from, state) do
+    {:reply, :ok, [], state}
+  end
+
+  @impl true
   def handle_events(chunks, _from, state) do
     for chunk <- chunks do
       frames = Dsp.process_chunk(state.ctx, chunk)
 
       for frame <- frames do
-        cond do
-          is_pid(state.airspace) ->
-            send(state.airspace, {:"$gen_cast", {:process_frame, frame}})
-
-          is_atom(state.airspace) and state.airspace != nil ->
-            GenServer.cast(state.airspace, {:process_frame, frame})
-
-          true ->
-            :ok
-        end
+        dispatch_frame(frame, state)
       end
     end
 
     {:noreply, [], state}
+  end
+
+  defp dispatch_frame(frame, state) do
+    if is_pid(state.collector) do
+      send(state.collector, {:frame, frame})
+    end
+
+    cond do
+      is_pid(state.airspace) ->
+        send(state.airspace, {:"$gen_cast", {:process_frame, frame}})
+
+      is_atom(state.airspace) and state.airspace != nil ->
+        GenServer.cast(state.airspace, {:process_frame, frame})
+
+      true ->
+        :ok
+    end
   end
 end

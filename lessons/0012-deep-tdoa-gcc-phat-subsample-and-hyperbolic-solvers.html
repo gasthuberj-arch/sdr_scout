@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 12: Deep TDOA — GCC-PHAT, Sub-Sample Fitting, &amp; Hyperbolic Solvers</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0012</span>
+    <span class="badge badge-arch">Deep Signal Processing &amp; Geolocation</span>
+    <span>Reading time: 10 minutes</span>
+  </div>
+
+  <h1>Deep TDOA: GCC-PHAT, Sub-Sample Fitting, &amp; Hyperbolic Solvers</h1>
+
+  <p>
+    In Lesson 11, we saw the high-level geometry of Time Difference of Arrival (TDOA). But when you sit down to implement a multi-receiver correlation system in code, you immediately collide with two brutal physical realities:
+  </p>
+  <ol>
+    <li><strong>Multipath Reflection Smear:</strong> In urban and terrestrial RF channels, radio waves bounce off hills, buildings, and ground plane conductors. Standard cross-correlation yields a wide, noisy blob with multiple false peaks.</li>
+    <li><strong>The 2.0 MSPS Coarseness Limit:</strong> At a 2.0 MSPS sample rate, one discrete sample interval is $T_s = 0.5\ \mu\text{s}$. Because light travels 300 meters per microsecond, <strong>a single integer sample error equals 150 meters of positional uncertainty</strong>!</li>
+  </ol>
+
+  <p>
+    Let's examine how professional electronic surveillance (SIGINT) and multilateration systems solve these two problems.
+  </p>
+
+  <h2>1. GCC-PHAT: The Mathematics of Phase Whitening</h2>
+
+  <p>
+    In naive cross-correlation, we compute the cross-power spectral density:
+  </p>
+  $$G_{xy}(f) = X(f) \cdot Y^*(f)$$
+  $$R_{xy}(\tau) = \mathcal{F}^{-1} \big\{ G_{xy}(f) \big\}$$
+
+  <p>
+    The fatal flaw is that frequency bands with high power dominate the summation, while multipath reflections produce constructive and destructive interference ripples across the spectrum.
+  </p>
+
+  <h3>The Phase Transform (PHAT)</h3>
+  <p>
+    In 1976, Knapp and Carter introduced the <strong>Generalized Cross-Correlation with Phase Transform (GCC-PHAT)</strong>. It applies an adaptive whitening filter that normalizes the magnitude of every frequency bin to unity:
+  </p>
+  $$\psi_{\text{PHAT}}(f) = \frac{1}{|G_{xy}(f)| + \epsilon}$$
+
+  <p>
+    The GCC-PHAT correlation function is defined as:
+  </p>
+  $$R_{xy}^{\text{PHAT}}(\tau) = \mathcal{F}^{-1} \left\{ \frac{X(f) \cdot Y^*(f)}{|X(f) \cdot Y^*(f)| + \epsilon} \right\}$$
+
+  <div class="callout upside">
+    <div class="callout-title">The Dirac Delta Miracle</div>
+    <p>
+      Look at what remains inside the inverse Fourier transform:
+    </p>
+    $$\frac{X(f) \cdot Y^*(f)}{|X(f) \cdot Y^*(f)|} = e^{j \angle G_{xy}(f)} = e^{-j 2\pi f \Delta t}$$
+    <p>
+      Every single frequency bin has had its magnitude stripped away to <strong>exactly 1.0</strong>, preserving <strong>strictly the phase slope</strong> across frequency!
+    </p>
+    <p>
+      The inverse Fourier transform of a pure linear phase exponential with flat unity magnitude is:
+    </p>
+    $$\mathcal{F}^{-1} \big\{ e^{-j 2\pi f \Delta t} \big\} = \mathbf{\delta(t - \Delta t)}$$
+    <p>
+      <strong>A razor-sharp Dirac delta spike!</strong> The multipath smearing and signal amplitude variations collapse into an ultra-narrow impulse right at the true time delay $\Delta t$.
+    </p>
+  </div>
+
+  <h2>2. Sub-Sample Resolution: The Parabolic Extremum Interpolator</h2>
+
+  <p>
+    After computing GCC-PHAT, we find the highest discrete peak at integer array index $k_{\text{peak}}$.
+    Because $T_s = 0.5\ \mu\text{s} \equiv 150\text{ meters}$, picking only the nearest integer index yields unacceptable $\pm 150\text{m}$ quantization steps.
+  </p>
+
+  <p>
+    However, the underlying physical electromagnetic wave is continuous. The true analog peak falls somewhere at a fractional offset $\delta \in (-0.5, +0.5)$ around $k_{\text{peak}}$.
+  </p>
+
+  <h3>Deriving the 3-Point Parabolic Estimator</h3>
+  <p>
+    We sample three discrete points around the peak:
+  </p>
+  <ul>
+    <li>$y_0 = R[k_{\text{peak}}]$ (The discrete maximum)</li>
+    <li>$y_{-1} = R[k_{\text{peak}} - 1]$ (Left neighbor)</li>
+    <li>$y_{+1} = R[k_{\text{peak}} + 1]$ (Right neighbor)</li>
+  </ul>
+
+  <p>
+    Fit a local continuous quadratic polynomial $y(x) = a x^2 + b x + c$, setting $x = 0$ at $k_{\text{peak}}$:
+  </p>
+  $$y(0) = c = y_0$$
+  $$y(-1) = a - b + y_0 = y_{-1}$$
+  $$y(+1) = a + b + y_0 = y_{+1}$$
+
+  <p>
+    Subtracting and adding the equations solves directly for coefficients $a$ and $b$:
+  </p>
+  $$b = \frac{y_{+1} - y_{-1}}{2}, \qquad a = \frac{y_{+1} - 2y_0 + y_{-1}}{2}$$
+
+  <p>
+    The continuous peak occurs where the derivative is zero: $y'(x) = 2ax + b = 0$:
+  </p>
+  $$\delta = -\frac{b}{2a} = \frac{y_{-1} - y_{+1}}{2(y_{-1} - 2y_0 + y_{+1})}$$
+
+  <div class="callout upside">
+    <div class="callout-title">Achieving 5-Meter Accuracy from a 2 MSPS Dongle</div>
+    <p>
+      The true continuous time difference of arrival is:
+    </p>
+    $$\Delta t_{\text{true}} = (k_{\text{peak}} + \delta) \cdot T_s$$
+    <p>
+      Under typical signal-to-noise ratios, parabolic fitting extracts fractional timing down to <strong>$1/25\text{th}$ to $1/50\text{th}$ of a sample</strong>:
+    </p>
+    $$\text{Position Error} \approx \frac{150\text{ meters}}{30} \approx \mathbf{5\text{ meters}}!$$
+    <p>
+      A $30 RTL-SDR sampling at only 2.0 MSPS achieves the spatial precision of a 60 MSPS high-end laboratory digitizer!
+    </p>
+  </div>
+
+  <h2>3. The Algorithm in 15 Lines of Code</h2>
+
+  <pre><code>import numpy as np
+
+def gcc_phat_subsample(sig_a, sig_b, fs=2.0e6, eps=1e-6):
+    # 1. Frequency domain cross-spectrum
+    X = np.fft.fft(sig_a)
+    Y = np.fft.fft(sig_b)
+    G = X * np.conj(Y)
+    
+    # 2. Phase Transform (whitening magnitude to 1.0)
+    R_phat = np.fft.ifft(G / (np.abs(G) + eps)).real
+    
+    # 3. Integer peak
+    k_peak = np.argmax(R_phat)
+    
+    # 4. 3-point parabolic sub-sample refinement
+    y_m1 = R_phat[(k_peak - 1) % len(R_phat)]
+    y_0  = R_phat[k_peak]
+    y_p1 = R_phat[(k_peak + 1) % len(R_phat)]
+    
+    delta = (y_m1 - y_p1) / (2.0 * (y_m1 - 2.0 * y_0 + y_p1))
+    
+    # 5. Continuous time delay
+    delay_seconds = (k_peak + delta) / fs
+    return delay_seconds</code></pre>
+
+  <h2>4. Solving the Hyperbolic System: Bancroft's Algorithm</h2>
+
+  <p>
+    Once you have measured range differences $r_{i, 1} = c \cdot \Delta t_{i, 1}$ across 4 or more synchronized receivers:
+  </p>
+  $$r_{i, 1} = \|\mathbf{x} - \mathbf{x}_i\| - \|\mathbf{x} - \mathbf{x}_1\|$$
+
+  <p>
+    In 1985, Stephen Bancroft developed a closed-form algebraic algorithm using the <strong>Minkowski spacetime Lorentz metric</strong> $M = \text{diag}(1, 1, 1, -1)$.
+  </p>
+  <p>
+    By treating the receiver coordinates and pseudoranges as 4-vectors in Minkowski spacetime, the non-linear hyperbolic equations collapse into a simple quadratic equation:
+  </p>
+  $$A \lambda^2 + B \lambda + C = 0$$
+  <p>
+    which is solved in constant time with zero iterative gradient steps and zero risk of local minima trapping!
+  </p>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-12-1">
+    <div class="quiz-question">
+      1. Why does GCC-PHAT normalize the cross-power spectrum magnitude to unity before taking the Inverse FFT?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Normalizing to unity doubles the physical antenna gain across the RF front-end receiver amplifier.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Retaining only the phase slope collapses multipath smearing into a sharp Dirac delta impulse.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It forces the BEAM slab allocator to store the resulting FFT array inside L1 CPU cache.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Dividing by magnitude prevents the discrete Fourier transform from producing negative frequency bins.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> Dividing by $|X(f) \cdot Y^*(f)|$ strips out signal amplitude fluctuations and multipath spectral ripples, leaving a pure linear phase slope $e^{-j 2\pi f \Delta t}$. The inverse Fourier transform of a flat phase slope is a sharp Dirac impulse $\delta(t - \Delta t)$.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-12-2">
+    <div class="quiz-question">
+      2. If an SDR samples at 2.0 MSPS (Ts = 0.5 µs), how does 3-point parabolic peak interpolation improve positional resolution?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        It increases the physical speed of light through the atmosphere to reduce propagation delay.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It overclocks the RTL-SDR local oscillator crystal to run at sixty mega-samples per second.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        It estimates the continuous fractional offset between discrete samples, cutting uncertainty from 150m to ~5m.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It maps the 24-bit Mode-S CRC syndrome table directly to longitude and latitude coordinates.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> By fitting a continuous quadratic polynomial to $y_{-1}, y_0, y_{+1}$, we locate the continuous peak at sub-sample resolution $\delta \in (-0.5, 0.5)$. This achieves $1/30\text{th}$ of a sample period accuracy, reducing positional coarseness from 150 meters down to $\approx 5$ meters.
+    </div>
+  </div>
+
+  <h2>Recommended Primary Source</h2>
+  <p>
+    For the foundational derivation of the Phase Transform:
+    <br>
+    <a href="https://ieeexplore.ieee.org/document/1162830" target="_blank" rel="noopener"><strong>Knapp &amp; Carter: The Generalized Correlation Method for Estimation of Time Delay (IEEE Trans. ASSP)</strong></a>.
+  </p>
+
+  <p>
+    Review our definitions of <em>GCC-PHAT</em> and <em>Parabolic Sub-Sample Interpolation</em> in <a href="../GLOSSARY.md">GLOSSARY.md</a>.
+  </p>
+
+  <div class="footer">
+    <span>Questions on GCC-PHAT, Bancroft's solver, or parabolic derivations? Ask your tutor agent!</span>
+    <span><a href="0011-clustering-sdrs-tdoa-and-distributed-correlation.html">&larr; Lesson 0011</a> | Lesson 0012</span>
+  </div>
+</body>
+</html>

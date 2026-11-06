@@ -5,7 +5,7 @@ defmodule Mix.Tasks.Sdr.Radar do
   """
   use Mix.Task
   alias SdrScout.Synth.Scenario
-  alias SdrScout.Pipeline.{Producer, DetectorConsumer}
+  alias SdrScout.Pipeline
   alias SdrScout.TUI
 
   @shortdoc "Runs the live terminal ADS-B radar scope"
@@ -25,19 +25,19 @@ defmodule Mix.Tasks.Sdr.Radar do
 
     chunks = Scenario.generate_stream(num_chunks: num_chunks)
 
-    {:ok, producer} = Producer.start_link(mode: mode, chunks: chunks)
-    {:ok, consumer} = DetectorConsumer.start_link(producer: producer)
+    {:ok, pipeline} = Pipeline.start_link(mode: mode, chunks: chunks)
 
     # Refresh TUI every 200 ms
-    loop(consumer, 15)
+    loop(pipeline, 15)
+    Pipeline.stop(pipeline)
   end
 
-  defp loop(_consumer, 0), do: :ok
+  defp loop(_pipeline, 0), do: :ok
 
-  defp loop(consumer, iterations) do
-    telemetry = GenServer.call(consumer, :get_telemetry)
+  defp loop(pipeline, iterations) do
+    telemetry = Pipeline.get_telemetry(pipeline)
     IO.puts(TUI.render_frame(51.5, 4.0, telemetry))
     Process.sleep(200)
-    loop(consumer, iterations - 1)
+    loop(pipeline, iterations - 1)
   end
 end

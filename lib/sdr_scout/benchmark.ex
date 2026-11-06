@@ -5,7 +5,7 @@ defmodule SdrScout.Benchmark do
   """
   alias SdrScout.Synth.Scenario
   alias SdrScout.Native.Dsp
-  alias SdrScout.Pipeline.{Producer, DetectorConsumer}
+  alias SdrScout.Pipeline
 
   @doc """
   Runs an unthrottled raw Zig SIMD NIF benchmark across `num_chunks` (default: 50).
@@ -50,19 +50,14 @@ defmodule SdrScout.Benchmark do
 
     test_pid = self()
 
-    {:ok, producer} = Producer.start_link(mode: :benchmark, chunks: chunks)
-    {:ok, consumer} = DetectorConsumer.start_link(producer: producer, airspace: test_pid)
-
     t0 = System.monotonic_time(:microsecond)
 
-    # Wait until all chunks are drained
-    wait_drain(producer)
+    {:ok, _frames, [samples, preambles, crc_ok, fixed]} =
+      Pipeline.run(chunks, airspace: test_pid)
 
     t1 = System.monotonic_time(:microsecond)
     elapsed_s = (t1 - t0) / 1_000_000.0
     msps = total_samples / elapsed_s / 1_000_000.0
-
-    [samples, preambles, crc_ok, fixed] = GenServer.call(consumer, :get_telemetry)
 
     %{
       pipeline_msps: Float.round(msps, 2),
@@ -72,21 +67,5 @@ defmodule SdrScout.Benchmark do
       crc_valid: crc_ok,
       single_bit_recovered: fixed
     }
-  end
-
-  defp wait_drain(producer) do
-    case :sys.get_state(producer) do
-      %GenStage{state: %{chunks: []}} ->
-        Process.sleep(50)
-        :ok
-
-      %{chunks: []} ->
-        Process.sleep(50)
-        :ok
-
-      _ ->
-        Process.sleep(10)
-        wait_drain(producer)
-    end
   end
 end

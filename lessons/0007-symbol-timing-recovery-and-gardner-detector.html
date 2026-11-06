@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 7: Symbol Timing Recovery, the Eye Diagram, and the Gardner Detector</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0007</span>
+    <span class="badge badge-arch">Synchronization &amp; DSP</span>
+    <span>Reading time: 8 minutes</span>
+  </div>
+
+  <h1>Symbol Timing Recovery, the Eye Diagram, and the Gardner Detector</h1>
+
+  <p>
+    Up to this point, our digital demodulators assumed a convenient fiction: that the receiver knows <em>exactly which discrete sample</em> corresponds to the center of each transmitted symbol.
+  </p>
+
+  <p>
+    In reality, wireless transmitters and receivers operate on independent quartz crystals. Without a dedicated physical clock line connecting them, your receiver must extract the symbol clock <strong>directly from the fluctuating data stream</strong>.
+  </p>
+
+  <h2>1. The Clock Drift Dilemma</h2>
+
+  <p>
+    Suppose an APRS transmitter sends packets at a nominal 1200 baud. Because its microcontroller crystal has slight manufacturing error and thermal drift, it actually transmits at:
+  </p>
+  $$R_{\text{tx}} = 1200.05\text{ baud}$$
+
+  <p>
+    Your SDR receiver samples at a nominal 48,000 Hz, but its oscillator runs at:
+  </p>
+  $$f_s = 47,998\text{ Hz}$$
+
+  <p>
+    The true ratio of samples per symbol is:
+  </p>
+  $$N_{\text{sps}} = \frac{47,998}{1200.05} = 39.99666\dots \text{ samples/symbol}$$
+
+  <div class="callout warning">
+    <div class="callout-title">The Inevitable Eye Closure</div>
+    <p>
+      If your software simply reads every 40th sample:
+    </p>
+    $$\text{Clock Drift per Symbol} = 40.0 - 39.99666 = 0.00334\text{ samples/symbol}$$
+    <p>
+      After transmitting a standard 100-byte packet (800 bits):
+    </p>
+    $$\Delta t_{\text{accumulated}} = 800 \times 0.00334 = 2.67\text{ samples}$$
+    <p>
+      In high-speed modes (like 9600 baud GFSK or DMR where $N_{\text{sps}} = 4$ or $5$), drifting by 2.5 samples means you are no longer sampling at the peak of the pulse—<strong>you are sampling right in the middle of the transition edge</strong>, where noise causes a 50% bit error rate!
+    </p>
+  </div>
+
+  <h2>2. The Eye Diagram: Finding the Optimal Aperture</h2>
+
+  <p>
+    If you slice a continuous stream of demodulated symbols into single-symbol intervals and overlay them on an oscilloscope, you produce an <strong>Eye Diagram</strong>:
+  </p>
+
+  <div class="callout upside">
+    <div class="callout-title">Reading the Eye</div>
+    <ul>
+      <li><strong>Aperture Center ("Wide Open Eye"):</strong> The instant of maximum signal separation and maximum Signal-to-Noise Ratio (SNR). This is where our software <em>must</em> sample.</li>
+      <li><strong>Aperture Width:</strong> The timing margin before intersymbol interference (ISI) corrupts the decision.</li>
+      <li><strong>Cross-Over Nodes ("Closed Eye"):</strong> The zero-crossing transition boundaries between consecutive bits. Sampling here is completely ambiguous.</li>
+    </ul>
+  </div>
+
+  <h2>3. The Gardner Timing Error Detector (TED)</h2>
+
+  <p>
+    How can software dynamically track the center of the eye without knowing the message beforehand?
+  </p>
+  <p>
+    In 1986, Floyd Gardner published the definitive algorithm used in modern SDRs: the <strong>Gardner Timing Error Detector</strong>. It requires only <strong>2 samples per symbol</strong>:
+  </p>
+  <ul>
+    <li>$x[k]$: The current on-time symbol sample.</li>
+    <li>$x[k - 1]$: The previous on-time symbol sample.</li>
+    <li>$x[k - 1/2]$: The mid-point sample halfway between them.</li>
+  </ul>
+
+  <p>
+    The Gardner error formula is remarkably compact:
+  </p>
+  $$e[k] = x\left[k - \frac{1}{2}\right] \cdot \Big( x[k] - x[k - 1] \Big)$$
+
+  <h3>Why This Formula is Mathematical Genius</h3>
+  <p>
+    Let's trace what the algebra does across all possible symbol sequences:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Scenario</th>
+        <th>Sample Values</th>
+        <th>Gardner Error Output ($e[k]$)</th>
+        <th>Loop Reaction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>No Transition ($+1 \to +1$)</strong></td>
+        <td>$x[k] = +1$, $x[k-1] = +1$</td>
+        <td>$(+1 - 1) = 0 \implies \mathbf{e[k] = 0}$</td>
+        <td>No clock information. Do nothing.</td>
+      </tr>
+      <tr>
+        <td><strong>Transition ($-1 \to +1$), Perfect Timing</strong></td>
+        <td>$x[k] = +1$, $x[k-1] = -1$, mid-point crosses zero: $x[k - 1/2] = 0$</td>
+        <td>$0 \cdot (+1 - (-1)) = \mathbf{e[k] = 0}$</td>
+        <td>Perfect lock. Clock is on target.</td>
+      </tr>
+      <tr>
+        <td><strong>Transition ($-1 \to +1$), Sampled Late</strong></td>
+        <td>The mid-point was sampled after the zero crossing: $x[k - 1/2] > 0$</td>
+        <td>$(>0) \cdot (+2) \implies \mathbf{e[k] > 0}$</td>
+        <td><strong>Positive error</strong>: tells loop to slow down.</td>
+      </tr>
+      <tr>
+        <td><strong>Transition ($-1 \to +1$), Sampled Early</strong></td>
+        <td>The mid-point was sampled before the zero crossing: $x[k - 1/2] < 0$</td>
+        <td>$(<0) \cdot (+2) \implies \mathbf{e[k] < 0}$</td>
+        <td><strong>Negative error</strong>: tells loop to speed up.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout upside">
+    <div class="callout-title">Non-Data-Aided Simplicity</div>
+    <p>
+      Notice that the Gardner detector requires <strong>zero training preambles</strong> and <strong>zero knowledge of the transmitted bits</strong>! A single multiplication and subtraction computes the exact magnitude and sign of your clock drift on every bit transition.
+    </p>
+  </div>
+
+  <h2>4. The Software Clock Tracking Loop</h2>
+
+  <p>
+    In a complete receiver (such as GNU Radio or an optimized Zig kernel), the Gardner error drives a standard <strong>Phase-Locked Loop (PLL)</strong>:
+  </p>
+  <pre><code>[Raw Samples] ──► [Fractional Interpolator] ──► [On-time Sample x[k]]
+                           ▲                               │
+                           │                               ▼
+                    [NCO Integrator] ◄── [PI Loop Filter] ◄── [Gardner Detector e[k]]</code></pre>
+
+  <p>
+    When the Gardner detector outputs error $e[k]$, a Proportional-Integral (PI) filter adjusts a Numerically Controlled Oscillator (NCO).
+    Because the required sampling instant falls <em>between</em> discrete ADC samples, a polynomial interpolator (such as a 4-tap cubic Hermite or Farrow filter) reconstructs the exact value of the continuous wave at the optimal eye-opening instant!
+  </p>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-7-1">
+    <div class="quiz-question">
+      1. What happens to the Gardner error metric e[k] when consecutive transmitted symbols do not change state (e.g. +1 followed by +1)?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The error metric saturates to the maximum positive floating point integer value.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The difference term (x[k] - x[k-1]) evaluates to zero, yielding zero timing error.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The fractional interpolator resets its internal tap weights to the initial state.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The loop filter forces the receiver to double its incoming ADC sampling frequency.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> When there is no transition between consecutive symbols, $x[k] - x[k-1] \approx 0$, so $e[k] = 0$. Timing information can only be extracted from signal transitions across the zero crossing.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-7-2">
+    <div class="quiz-question">
+      2. Why does a software SDR require a polynomial interpolator (such as Farrow) in its timing recovery loop?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Physical antennas cannot receive radio signals unless voltages are smoothed by cubic polynomials.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        BEAM garbage collectors require streaming audio buffers to be aligned to power-of-two boundaries.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The optimal eye-opening sampling instant typically falls between discrete integer ADC sample points.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The Gardner detector produces non-linear harmonic distortion that must be filtered before bit slicing.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> Because transmitter and receiver oscillators are asynchronous, the optimal peak of the eye diagram rarely lands exactly on an integer sample index ($n \in \mathbb{Z}$). The interpolator reconstructs the continuous signal at fractional sample offsets ($n + \mu$, where $0 \le \mu < 1$).
+    </div>
+  </div>
+
+  <h2>Recommended Primary Source</h2>
+  <p>
+    For a visual deep dive into symbol timing recovery and Farrow interpolators:
+    <br>
+    <a href="https://pysdr.org/content/sync.html#symbol-clock-recovery" target="_blank" rel="noopener"><strong>PySDR: Symbol Clock Recovery &amp; The Gardner TED</strong> by Dr. Marc Lichtman</a>.
+  </p>
+
+  <p>
+    Review our canonical definitions in <a href="../GLOSSARY.md">GLOSSARY.md</a> and reference architectures in <a href="../reference/sdr-architecture-comparison.html">SDR Architecture Comparison</a>.
+  </p>
+
+  <div class="footer">
+    <span>Questions on loop damping, Farrow interpolator taps, or clock jitter? Ask your tutor agent!</span>
+    <span><a href="0006-phase-invariance-iq-projections-and-resolution.html">&larr; Lesson 0006</a> | Lesson 0007</span>
+  </div>
+</body>
+</html>

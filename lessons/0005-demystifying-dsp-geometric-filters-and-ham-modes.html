@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 5: Demystifying DSP — Vector Projections, APRS, and FT8</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0005</span>
+    <span class="badge badge-arch">Intuitive DSP &amp; HAM Radio</span>
+    <span>Reading time: 7 minutes</span>
+  </div>
+
+  <h1>Demystifying DSP: Vector Projections, APRS, and FT8</h1>
+
+  <p>
+    If the integral calculus and Galois Field polynomial math in Lesson 4 felt heavy, take heart: <strong>you don't need continuous integrals to build or understand SDR systems</strong>.
+  </p>
+
+  <p>
+    Because you understand arrays, vectors, and linear algebra, you already have the exact mental model needed. In discrete signal processing, <strong>every filter is just a vector dot product</strong>.
+  </p>
+
+  <h2>1. The Core Mental Model: Filters are Dot Products</h2>
+
+  <p>
+    Suppose you record a short burst of 40 audio samples into an array:
+  </p>
+  <pre><code>x = [0.12, 0.45, 0.89, 0.95, 0.67, 0.15, -0.35, ...]  // 40 samples</code></pre>
+
+  <p>
+    In linear algebra, $\mathbf{x}$ is simply a vector in a 40-dimensional space ($\mathbb{R}^{40}$).
+  </p>
+
+  <p>
+    Recall what the vector dot product actually measures:
+  </p>
+  $$\mathbf{x} \cdot \mathbf{y} = \|\mathbf{x}\| \|\mathbf{y}\| \cos\theta$$
+
+  <div class="callout upside">
+    <div class="callout-title">The Three Geometric Outcomes</div>
+    <ul>
+      <li><strong>Parallel ($\theta = 0^\circ$):</strong> When signal $\mathbf{x}$ has the exact same pattern/shape as template $\mathbf{y}$, the dot product spikes to its maximum possible value.</li>
+      <li><strong>Orthogonal ($\theta = 90^\circ$):</strong> When signal $\mathbf{x}$ has a different frequency from $\mathbf{y}$, their dot product is <strong>zero</strong>. They share zero information.</li>
+      <li><strong>Random Noise:</strong> Thermal noise is random across all 40 dimensions. When you project it onto your 1-dimensional template $\mathbf{y}$, the random positive and negative spikes cancel out toward zero.</li>
+    </ul>
+  </div>
+
+  <h2>2. Building an APRS (2-meter HAM Radio) Demodulator</h2>
+
+  <p>
+    Let's see how this translates into a real amateur radio mode: <strong>APRS (Automatic Packet Reporting System)</strong>, used by HAMs on 144.390 MHz to beacon positions, weather, and messages.
+  </p>
+
+  <p>
+    APRS uses Bell 202 Audio Frequency Shift Keying (AFSK) at 1200 baud:
+  </p>
+  <ul>
+    <li><strong>Bit 1 ("Mark"):</strong> A 1200 Hz audio sine wave.</li>
+    <li><strong>Bit 0 ("Space"):</strong> A 2200 Hz audio sine wave.</li>
+  </ul>
+
+  <p>
+    At a standard 48 kHz audio sample rate, each bit lasts $\frac{1}{1200\text{ s}} = \mathbf{40\text{ samples}}$.
+  </p>
+
+  <h3>The Demodulator in 10 Lines of Pseudocode</h3>
+  <p>
+    To decode APRS, you don't need complex frequency transforms. You simply precompute two 40-sample template vectors:
+  </p>
+
+  <pre><code>// Precompute the two basis vectors:
+for n in 0..40:
+    template_1200[n] = cos(2.0 * PI * 1200.0 * n / 48000.0)
+    template_2200[n] = cos(2.0 * PI * 2200.0 * n / 48000.0)
+
+// For every incoming 40-sample window x:
+dot_1200 = dot_product(x, template_1200)
+dot_2200 = dot_product(x, template_2200)
+
+if dot_1200 > dot_2200:
+    emit_bit(1)
+else:
+    emit_bit(0)</code></pre>
+
+  <p>
+    That is literally an entire FSK radio demodulator! The "matched filter" is just <code>template_1200</code> and <code>template_2200</code>.
+  </p>
+
+  <h2>3. Why FT8 Can Hear Signals -24 dB Below the Noise Floor</h2>
+
+  <p>
+    You might have heard HAM radio operators marveling at <strong>FT8</strong>, the wildly popular digital mode that allows low-power stations to communicate across the globe even when conditions are too noisy for human speech.
+  </p>
+
+  <p>
+    How can an SDR decode an audio signal when the background static is <strong>20 times louder than the signal itself</strong>?
+  </p>
+
+  <div class="callout upside">
+    <div class="callout-title">The Coherent Integration Trick</div>
+    <p>
+      In FT8, the transmitter sends an 8-tone frequency shift keying (8-FSK) sequence where each tone lasts for <strong>0.16 seconds</strong> (thousands of samples).
+    </p>
+    <p>
+      When your software takes the dot product over $N$ samples:
+    </p>
+    <ol>
+      <li><strong>The Tone:</strong> Every sample in the transmitted tone aligns in phase with your template. The signal amplitudes add <em>coherently</em>: $\text{Signal Amplitude} \propto N \implies \text{Signal Power} \propto \mathbf{N^2}$.</li>
+      <li><strong>The Noise:</strong> White noise samples are uncorrelated random steps (a random walk). The noise power adds <em>incoherently</em>: $\text{Noise Power} \propto \mathbf{N}$.</li>
+    </ol>
+    <p>
+      The output signal-to-noise ratio improves by a factor of:
+    </p>
+    $$\text{Processing Gain} = \frac{\text{Signal Power}}{\text{Noise Power}} \propto \frac{N^2}{N} = \mathbf{N}$$
+    <p>
+      By integrating over a large number of samples $N$, the dot product acts like a spotlight, building up the true signal while squashing the noise down to a flat background average!
+    </p>
+  </div>
+
+  <h2>4. Connecting Back to SdrScout</h2>
+
+  <p>
+    Now look back at the Mode-S preamble correlator we saw in Lesson 4:
+  </p>
+  <pre><code>template: [1, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0]</code></pre>
+  <p>
+    When SdrScout computes:
+  </p>
+  $$C[n] = \sum_{p \in \{0, 2, 7, 9\}} M[n+p] - \frac{1}{3}\sum_{q \in \text{quiet}} M[n+q]$$
+  <p>
+    It is doing the exact same thing: taking a 16-sample vector dot product as it slides along memory. When a real aircraft packet passes under the window, the 4 pulses align with the 1s, producing a large positive dot product that fires our detector!
+  </p>
+
+  <h2>Checking Your Intuition</h2>
+
+  <div class="quiz-container" id="quiz-5-1">
+    <div class="quiz-question">
+      1. Geometrically, why does an APRS 1200 Hz tone create almost zero output in the 2200 Hz detector?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The hardware antenna automatically grounds all incoming electrical frequencies above two kilohertz.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The 1200 Hz and 2200 Hz sample vectors are nearly orthogonal over the 40-sample window.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Erlang GenStage drops all audio packets that do not match the expected baud rate exactly.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The 2200 Hz detector divides the signal by zero whenever a lower frequency tone appears.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> Over the 40-sample bit period, the dot product between the 1200 Hz discrete sinusoid and the 2200 Hz discrete sinusoid is approximately zero ($\theta \approx 90^\circ$). Orthogonality allows the two tones to represent distinct bits without mutual interference.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-5-2">
+    <div class="quiz-question">
+      2. Why does increasing the integration window (more samples N) allow FT8 to extract signals buried under noise?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Longer integration times cause the radio hardware amplifier to generate higher physical transmitter wattage.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Taking more samples forces the BEAM scheduler to run on higher priority operating system threads.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Coherent signal energy grows quadratically with N while uncorrelated noise power grows only linearly.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Thermal noise vanishes completely from the universe if sampled for more than ten consecutive seconds.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> Coherent signal amplitudes add in phase ($\propto N$, power $\propto N^2$), while uncorrelated white noise samples add like a random walk (variance $\propto N$). The resulting processing gain scales directly with $N$, pulling weak signals out of deep static.
+    </div>
+  </div>
+
+  <h2>Recommended Primary Source</h2>
+  <p>
+    To see interactive visualizations of dot products and orthogonal tones:
+    <br>
+    <a href="https://pysdr.org/content/frequency_domain.html" target="_blank" rel="noopener"><strong>PySDR: The Frequency Domain &amp; Discrete Fourier Transform</strong> by Dr. Marc Lichtman</a>.
+  </p>
+
+  <p>
+    Also check our <a href="../reference/dsp-geometric-intuition.html">DSP Through Linear Algebra Reference Sheet</a>.
+  </p>
+
+  <div class="footer">
+    <span>Have questions on orthogonal tones or processing gain? Ask your tutor agent!</span>
+    <span><a href="0004-matched-filters-preamble-correlation-and-syndromes.html">&larr; Lesson 0004</a> | Lesson 0005</span>
+  </div>
+</body>
+</html>

@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 11: Clustering SDRs — Multilateration (TDOA) and Distributed BEAM Nodes</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0011</span>
+    <span class="badge badge-arch">Distributed SDR &amp; Geolocation</span>
+    <span>Reading time: 10 minutes</span>
+  </div>
+
+  <h1>Clustering SDRs: Multilateration (TDOA) and Distributed BEAM Nodes</h1>
+
+  <p>
+    What happens when you deploy <strong>two Portenta X8 boards</strong>, each equipped with an RTL-SDR dongle and separated by a baseline distance (e.g., 500 meters or across town)?
+  </p>
+
+  <p>
+    You transform individual radio listeners into a <strong>distributed sensor aperture</strong> capable of:
+  </p>
+  <ul>
+    <li><strong>Spatial Diversity:</strong> Overcoming multipath signal fades (if Node A sits in an RF null, Node B captures the packet).</li>
+    <li><strong>Passive Emitter Geolocation (TDOA):</strong> Pinpointing the location of unknown or rogue radio transmitters without their cooperation.</li>
+  </ul>
+
+  <h2>1. The Physics of Time Difference of Arrival (TDOA)</h2>
+
+  <p>
+    Radio waves propagate through the atmosphere at the speed of light:
+  </p>
+  $$c \approx 3 \times 10^8\text{ m/s} = \mathbf{300\text{ meters per microsecond}} \quad (0.3\text{ meters/ns})$$
+
+  <p>
+    Suppose an unknown radio transmitter (e.g., an airplane, drone, or pirate ham station) transmits a signal at an unknown instant $t_0$. The wavefront reaches our two receivers at times $t_A$ and $t_B$:
+  </p>
+  $$t_A = t_0 + \frac{d_A}{c}, \qquad t_B = t_0 + \frac{d_B}{c}$$
+
+  <p>
+    Subtracting the two arrival times eliminates the unknown transmission instant $t_0$:
+  </p>
+  $$\Delta t = t_A - t_B = \frac{d_A - d_B}{c} \implies d_A - d_B = c \cdot \Delta t$$
+
+  <div class="callout upside">
+    <div class="callout-title">The Hyperbolic Geolocation Line</div>
+    <p>
+      In geometry, the locus of all 2D points where the difference in distances to two focal points ($|d_A - d_B|$) is constant forms a <strong>hyperbola</strong>.
+    </p>
+    <p>
+      With just <strong>two receivers</strong>, measuring $\Delta t$ proves that the transmitter sits somewhere along that specific hyperbolic curve on the map!
+    </p>
+    <p>
+      With <strong>three or four clustered receivers</strong>, multiple hyperbolas intersect, pinpointing the exact coordinates of the transmitter in 3D space—even if the transmitter never broadcasts its GPS location!
+    </p>
+  </div>
+
+  <h2>2. Measuring $\Delta t$: The Cross-Correlation Theorem</h2>
+
+  <p>
+    How do two Portenta nodes calculate the arrival time difference $\Delta t$ from raw I/Q baseband samples?
+  </p>
+  <p>
+    We compute the <strong>Cross-Correlation</strong> $R_{xy}(\tau)$ between the signal $x(t)$ captured by Node A and $y(t)$ captured by Node B:
+  </p>
+  $$R_{xy}(\tau) = \int_{-\infty}^{\infty} x(t) y^*(t - \tau) dt$$
+
+  <p>
+    By the cross-correlation theorem, this is computed at wire speed in the frequency domain:
+  </p>
+  $$R_{xy}(\tau) = \mathcal{F}^{-1} \Big\{ X(f) \cdot Y^*(f) \Big\}$$
+
+  <ol>
+    <li>Node A computes the FFT of its I/Q burst: $X(f) = \text{FFT}(x)$.</li>
+    <li>Node B computes the FFT of its I/Q burst: $Y(f) = \text{FFT}(y)$.</li>
+    <li>Multiply $X(f)$ by the complex conjugate $Y^*(f)$ and take the Inverse FFT.</li>
+    <li>The index of the maximum peak in the resulting array gives the exact sub-microsecond time delay $\Delta t$!</li>
+  </ol>
+
+  <h2>3. The Architecture: Distributed BEAM Cluster Across Portentas</h2>
+
+  <p>
+    In C, Python, or Go, clustering two embedded Linux boards requires setting up ZeroMQ, gRPC, Redis, or Kafka.
+  </p>
+  <p>
+    In <strong>Elixir / BEAM</strong> running on the Portenta X8's Cortex-A53 Linux cores, <strong>clustering is a native language primitive</strong>:
+  </p>
+
+  <pre><code># On Portenta Node A (192.168.1.10):
+PORTENTA=1 iex --name node_a@192.168.1.10 --cookie sdr_secret -S mix
+
+# On Portenta Node B (192.168.1.11):
+PORTENTA=2 iex --name node_b@192.168.1.11 --cookie sdr_secret -S mix</code></pre>
+
+  <p>
+    Inside Elixir, connecting the nodes is a single function call:
+  </p>
+  <pre><code>Node.connect(:"node_b@192.168.1.11")
+
+# Both nodes join the distributed process group:
+:pg.join(:sdr_cluster, self())</code></pre>
+
+  <p>
+    When Node B detects an RF burst or decodes a frame, it broadcasts an Erlang message across the cluster. The BEAM transparently serializes and transfers the binary over an encrypted TCP link with zero external broker infrastructure.
+  </p>
+
+  <h2>4. The Engineering Trap: The Nanosecond Synchronization Barrier</h2>
+
+  <p>
+    Here is the catch that trips up every junior SDR engineer:
+  </p>
+
+  <div class="callout warning">
+    <div class="callout-title">The Cruel Clock Math</div>
+    <p>
+      Because light travels 300 meters per microsecond:
+    </p>
+    <ul>
+      <li>A timing error of <strong>1 microsecond ($\mu\text{s}$)</strong> creates a position error of <strong>300 meters</strong>.</li>
+      <li>A standard Network Time Protocol (NTP) sync over Wi-Fi has <strong>1 to 10 milliseconds of jitter</strong> $\implies \mathbf{300 \text{ to } 3,000 \text{ kilometers}}$ of error! NTP is completely useless for TDOA.</li>
+    </ul>
+  </div>
+
+  <h3>How to Synchronize Two Portenta X8s in Reality</h3>
+  <p>
+    Fortunately, the Portenta X8 provides two elegant hardware solutions:
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Synchronization Method</th>
+        <th>Implementation Mechanism</th>
+        <th>Achieved Accuracy</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>GPS PPS Interrupt via STM32H7</strong></td>
+        <td>Connect a $15 GPS module (u-blox) to a GPIO pin on each board's STM32H7. The GPS <strong>Pulse-Per-Second (PPS)</strong> pin fires an interrupt accurate to $\pm 20\text{ ns}$. The M7 timestamps the sample stream on every PPS edge.</td>
+        <td><strong>&plusmn; 20 nanoseconds</strong> (&plusmn; 6 meters error)</td>
+      </tr>
+      <tr>
+        <td><strong>Opportunistic Calibration (Reference Tower)</strong></td>
+        <td>Both SDRs tune to a known stationary broadcast tower (e.g. a local FM station or fixed airport beacon). Because the tower's distance is fixed and known, cross-correlating its signal continuously measures and subtracts the internal clock offset $\Delta t_{\text{clock}}$.</td>
+        <td><strong>&plusmn; 50 nanoseconds</strong> (&plusmn; 15 meters error, <em>zero extra hardware!</em>)</td>
+      </tr>
+      <tr>
+        <td><strong>Hardware PTP (IEEE 1588)</strong></td>
+        <td>Connect the two Portentas via Ethernet switch. The Portenta’s Ethernet PHY hardware stamps packets at the MAC layer.</td>
+        <td><strong>&plusmn; 100 nanoseconds</strong> (&plusmn; 30 meters error)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-11-1">
+    <div class="quiz-question">
+      1. If two clustered SDRs measure a signal arrival time difference of $\Delta t = 2.0\ \mu\text{s}$, what is the physical distance difference $(d_A - d_B)$ to the transmitter?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The distance difference equals precisely one hundred and fifty meters along the line.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The distance difference equals precisely six hundred meters along the hyperbolic locus.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The distance difference equals precisely three kilometers across the baseline antenna array.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The distance difference equals zero meters because radio waves travel at infinite velocity.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> Using $d_A - d_B = c \cdot \Delta t$: $(300\text{ meters}/\mu\text{s}) \times 2.0\ \mu\text{s} = \mathbf{600\text{ meters}}$.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-11-2">
+    <div class="quiz-question">
+      2. Why does computing cross-correlation in the frequency domain ($R_{xy} = \mathcal{F}^{-1}\{X(f) \cdot Y^*(f)\}$) scale better than direct time-domain convolution?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The frequency domain eliminates the speed of light delay between the two receiving antennas.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Erlang process groups can only transmit complex numbers when formatted in polar coordinates.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        FFT-based correlation reduces computational complexity from $O(N^2)$ to $O(N \log N)$ operations.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Complex conjugation physically forces the two asynchronous local oscillators into phase lock.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> For a burst of $N$ samples (e.g. $N = 32,768$), direct time-domain cross-correlation requires $O(N^2) \approx 10^9$ operations. Using the FFT cross-correlation theorem takes $O(N \log N) \approx 5 \times 10^5$ operations—over **2,000 times faster**!
+    </div>
+  </div>
+
+  <h2>Recommended Primary Source</h2>
+  <p>
+    For the mathematical formulation of TDOA hyperbolic multilateration:
+    <br>
+    <a href="https://pysdr.org/content/sync.html#cross-correlation" target="_blank" rel="noopener"><strong>PySDR: Cross-Correlation &amp; TDOA Positioning</strong> by Dr. Marc Lichtman</a>.
+  </p>
+
+  <p>
+    Review our definitions of <em>TDOA</em>, <em>Cross-Correlation</em>, and <em>Distributed Erlang Cluster</em> in <a href="../GLOSSARY.md">GLOSSARY.md</a>.
+  </p>
+
+  <div class="footer">
+    <span>Questions on TDOA geometry, GPS PPS interrupts, or cross-correlation? Ask your tutor agent!</span>
+    <span><a href="0010-live-codebase-tour-zigler-simd-and-genstage.html">&larr; Lesson 0010</a> | Lesson 0011</span>
+  </div>
+</body>
+</html>

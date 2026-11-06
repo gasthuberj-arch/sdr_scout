@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 2: Complex Baseband (I/Q) &amp; SIMD Vector Processing</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = {
+      tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] }
+    };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0002</span>
+    <span class="badge badge-arch">DSP &amp; Systems</span>
+    <span>Reading time: 7 minutes</span>
+  </div>
+
+  <h1>Complex Baseband (I/Q) &amp; SIMD Vector Processing</h1>
+
+  <p>
+    In audio recording, an analog-to-digital converter (ADC) samples a single physical voltage along a wire. If you plug a microphone into a 48 kHz ADC, you get scalar numbers: $s_0, s_1, s_2 \in \mathbb{R}$.
+  </p>
+
+  <p>
+    In software-defined radio, however, every hardware receiver (RTL-SDR, HackRF, USRP, BladeRF) hands your software <strong>interleaved pairs of numbers</strong>:
+  </p>
+  <pre><code>[I0, Q0, I1, Q1, I2, Q2, I3, Q3, ...]</code></pre>
+
+  <p>
+    Why do radios require complex numbers? And how do we design high-throughput systems that process these streams at gigabytes per second without cache thrashing? Let's break down the computational engineering of I/Q.
+  </p>
+
+  <h2>1. The Problem with Real Signals: The Negative Frequency Blindspot</h2>
+
+  <p>
+    Euler's formula defines a complex sinusoid as:
+  </p>
+  $$e^{j\omega t} = \cos(\omega t) + j\sin(\omega t)$$
+
+  <p>
+    A physical antenna captures real scalar voltages. By Euler's identity, a real cosine wave is actually the sum of two counter-rotating complex vectors:
+  </p>
+  $$\cos(\omega t) = \frac{e^{j\omega t} + e^{-j\omega t}}{2}$$
+
+  <p>
+    Because the Fourier transform of any real-valued signal is Hermitian symmetric ($X(-f) = X^*(f)$), the positive and negative frequency spectra are mirror images.
+  </p>
+
+  <div class="callout warning">
+    <div class="callout-title">The Downconversion Dilemma</div>
+    <p>
+      Suppose you tune to an amateur radio frequency (e.g., 144.390 MHz for APRS) and mix the RF carrier down to baseband using a single real local oscillator.
+    </p>
+    <p>
+      A transmission at <strong>+10 kHz</strong> above the carrier and an interfering transmission at <strong>-10 kHz</strong> below the carrier will both fold directly onto the exact same 10 kHz baseband audio tone! A single ADC cannot determine whether the signal was above or below the carrier.
+    </p>
+  </div>
+
+  <h2>2. Quadrature Downconversion: Creating the Analytic Signal</h2>
+
+  <p>
+    To resolve ambiguity, an SDR front-end splits the incoming RF signal into two paths and mixes them with two local oscillator tones <strong>shifted by 90° ($\pi/2$ radians)</strong>:
+  </p>
+
+  <ul>
+    <li><strong>In-Phase ($I$):</strong> Mixed with $\cos(2\pi f_c t)$</li>
+    <li><strong>Quadrature ($Q$):</strong> Mixed with $-\sin(2\pi f_c t)$</li>
+  </ul>
+
+  <p>
+    By feeding both branches into dual ADCs, we obtain an <strong>analytic signal</strong>:
+  </p>
+  $$s(t) = I(t) + jQ(t) = A(t)e^{j\phi(t)}$$
+
+  <p>
+    Now, the vector has a direction of rotation in the complex plane. Counter-clockwise rotation indicates positive frequency $+f$; clockwise rotation indicates negative frequency $-f$.
+  </p>
+
+  <div class="callout upside">
+    <div class="callout-title">The Nyquist Bandwidth Advantage</div>
+    <p>
+      For real-valued ADCs, the Nyquist-Shannon theorem dictates that the maximum unaliased signal bandwidth is $f_s / 2$.
+    </p>
+    <p>
+      For complex baseband ($I/Q$), because the spectrum is asymmetric and does not fold over zero, <strong>the usable unaliased RF bandwidth equals the full sample rate $f_s$!</strong>
+      A 2.0 MSPS complex stream provides a full 2.0 MHz window of radio spectrum.
+    </p>
+  </div>
+
+  <h2>3. Systems Engineering: Memory Layout &amp; SIMD Vectorization</h2>
+
+  <p>
+    An RTL-SDR delivers samples as interleaved 8-bit unsigned integers (<code>u8</code>), centered around <code>127.5</code>:
+  </p>
+  <pre><code>Raw byte:   [ 128,  127,  255,  128,    0,  128, ... ]
+Offset:      I=0.5, Q=-0.5, I=127.5, Q=0.5, I=-127.5, Q=0.5</code></pre>
+
+  <h3>Interleaved vs. Planar Layout</h3>
+  <p>
+    In C, Rust, or Zig, how you lay out this memory governs CPU cache efficiency:
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Layout Pattern</th>
+        <th>Memory Representation</th>
+        <th>Cache &amp; SIMD Tradeoff</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Interleaved (AoS)</strong></td>
+        <td><code>[I0, Q0, I1, Q1, I2, Q2...]</code></td>
+        <td>Default hardware format. Excellent for point-wise operations like magnitude $|z| = \sqrt{I^2 + Q^2}$.</td>
+      </tr>
+      <tr>
+        <td><strong>Planar (SoA)</strong></td>
+        <td><code>[I0, I1, I2...], [Q0, Q1, Q2...]</code></td>
+        <td>Requires deinterleaving pass. Ideal for FFTs and FIR filters where $I$ and $Q$ paths run independent convolutions.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>SIMD Vectorization in Zig: The Magnitude Calculation</h3>
+  <p>
+    To detect pulses (such as Mode-S PPM pulses or CW Morse dits), we compute the instantaneous signal magnitude:
+  </p>
+  $$|z| = \sqrt{I^2 + Q^2}$$
+
+  <p>
+    In this codebase, Zig uses explicit 16-lane SIMD vectors (<code>@Vector(16, f32)</code>):
+  </p>
+
+  <pre><code>// In SdrScout Zig DSP:
+const Vec16 = @Vector(16, f32);
+
+pub fn iq_to_magnitude_simd(i_vec: Vec16, q_vec: Vec16) Vec16 {
+    const i_sq = i_vec * i_vec;
+    const q_sq = q_vec * q_vec;
+    return @sqrt(i_sq + q_sq);
+}</code></pre>
+
+  <div class="callout upside">
+    <div class="callout-title">Why 64 KB Chunks Fit L2 Cache</div>
+    <p>
+      A 64 KB chunk represents 32,768 $I/Q$ sample pairs (16.384 milliseconds of real-time air at 2 MSPS).
+    </p>
+    <p>
+      Modern x86 and ARM cores feature 512 KB to 1 MB of dedicated L2 cache per core. A 64 KB chunk, along with its unpacked float vector workspace (~128 KB), fits <strong>entirely inside L2 cache</strong>. The CPU never stalls waiting for main memory (DRAM) during the matched filter and bit-slicing passes!
+    </p>
+  </div>
+
+  <h2>Checking Your Understanding</h2>
+
+  <div class="quiz-container" id="quiz-iq-1">
+    <div class="quiz-question">
+      1. Why does an SDR sample both In-Phase (I) and Quadrature (Q) components rather than a single voltage?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Sampling two channels doubles hardware analog amplification power across the antenna front-end.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Complex representation eliminates spectral mirroring and distinguishes positive from negative frequency shifts.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Erlang binary pattern matching fails whenever streaming buffers contain scalar single-channel real floats.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Standard RF coaxial transmission cables cannot transmit electromagnetic energy without two distinct conductor lines.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> A single real-valued ADC produces a symmetric spectrum where $+f$ and $-f$ fold onto each other. Quadrature mixing produces an analytic signal that preserves direction of rotation (phase) and full bandwidth.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-iq-2">
+    <div class="quiz-question">
+      2. If an SDR samples complex I/Q baseband at 2.4 MSPS, what is its maximum unaliased RF bandwidth?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Exactly 1.2 MHz because the Nyquist theorem halves sample rate for all discrete signals.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Exactly 4.8 MHz because combining two orthogonal channels doubles theoretical spectrum capacity.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Exactly 2.4 MHz because complex baseband signals eliminate conjugate negative frequency folding.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Exactly 0.6 MHz because anti-aliasing hardware filters discard three quarters of incoming energy.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> For real sampling, bandwidth is $f_s / 2$. For complex I/Q sampling, the bandwidth spans from $-f_s / 2$ to $+f_s / 2$, yielding a total usable unaliased bandwidth of exactly $f_s$ (2.4 MHz).
+    </div>
+  </div>
+
+  <h2>Recommended Primary Source</h2>
+  <p>
+    For a deep dive into complex sinusoids, rotational phase, and frequency domain math, read:
+    <br>
+    <a href="https://pysdr.org/content/iq_complex.html" target="_blank" rel="noopener"><strong>PySDR: Complex Numbers in DSP &amp; I/Q Sampling</strong> by Dr. Marc Lichtman</a>.
+  </p>
+
+  <p>
+    Review our canonical definitions in <a href="../GLOSSARY.md">GLOSSARY.md</a> and architectural matrix in <a href="../reference/sdr-architecture-comparison.html">SDR Architecture Comparison</a>.
+  </p>
+
+  <div class="footer">
+    <span>Have questions on SIMD vector widths, cache lines, or FFT tradeoffs? Ask your tutor agent!</span>
+    <span><a href="0001-sdr-pipeline-architectures-and-tradeoffs.html">&larr; Lesson 0001</a> | Lesson 0002</span>
+  </div>
+</body>
+</html>

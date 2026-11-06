@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>SDR &amp; DSP Architecture Learning Portal</title>
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-arch">SdrScout Learning Portal</span>
+    <span>SDR Systems Architecture &amp; DSP</span>
+  </div>
+
+  <h1>SDR Systems Architecture &amp; DSP Portal</h1>
+  <p>
+    An engineering-grade learning workspace dissecting high-throughput software-defined radio systems, digital signal processing (I/Q baseband, filtering, correlation), and modern concurrent architectures (Elixir/OTP + Zig NIFs vs. GNU Radio vs. Pure C/Rust).
+  </p>
+
+  <h2>Available Lessons</h2>
+  <ul>
+    <li>
+      <strong><a href="lessons/0001-sdr-pipeline-architectures-and-tradeoffs.html">Lesson 0001: SDR Pipeline Architectures &amp; Trade-offs</a></strong>
+      <br>
+      <em>Why combine Elixir and Zig? Zero-copy binary passing, GenStage demand backpressure, the 1ms NIF trap, and suitability for HAM radio networks.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0002-complex-baseband-iq-and-simd-dsp.html">Lesson 0002: Complex Baseband (I/Q) &amp; SIMD Vector Processing</a></strong>
+      <br>
+      <em>Euler's formula, the negative frequency ambiguity, quadrature mixing, complex Nyquist bandwidth ($B = f_s$), AoS vs. SoA layouts, L2 cache fit, and <code>@Vector(16, f32)</code> SIMD magnitude.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0003-streaming-dsp-boundaries-and-frequency-offsets.html">Lesson 0003: Carrier Frequency Offsets, Non-Coherent Detection, and Chunk Boundaries</a></strong>
+      <br>
+      <em>Mathematical derivation of phase rotation ($\Delta\phi = 2\pi\Delta f T$), why non-coherent magnitude $|z|$ bypasses Costas loops, the 0.73% chunk boundary loss theorem, and why persistent NIF tail-buffers beat Linux <code>vm_circbuf</code> double-mmap on the BEAM.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0004-matched-filters-preamble-correlation-and-syndromes.html">Lesson 0004: Matched Filters, Preamble Correlation, and GF(2) Syndromes</a></strong>
+      <br>
+      <em>Cauchy-Schwarz derivation of the matched filter's optimal $2E_s/N_0$ SNR bound, differential correlation vs. SIMD vector division penalties, and $O(1)$ single-bit error recovery via linear polynomial syndromes over $\text{GF}(2)$.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0005-demystifying-dsp-geometric-filters-and-ham-modes.html">Lesson 0005: Demystifying DSP — Vector Projections, APRS, and FT8</a></strong>
+      <br>
+      <em>Bridging DSP to linear algebra: why every filter is just a vector dot product ($\mathbf{x} \cdot \mathbf{y} = \|\mathbf{x}\|\|\mathbf{y}\|\cos\theta$), building an APRS 1200 baud AFSK demodulator in 10 lines, and how FT8 pulls signals from -24 dB noise via coherent processing gain ($N^2 / N$).</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0006-phase-invariance-iq-projections-and-resolution.html">Lesson 0006: Phase Invariance, I/Q Quadrature Projections, and the Rayleigh Limit</a></strong>
+      <br>
+      <em>Why a single cosine template drops out completely at $90^\circ$ phase shift, achieving phase invariance via dual I/Q projections ($I^2 + Q^2$), the Rayleigh tone resolution bound ($\Delta f \cdot \Delta t \ge 1$), and the DFT as a bank of orthogonal dot products.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0007-symbol-timing-recovery-and-gardner-detector.html">Lesson 0007: Symbol Timing Recovery, the Eye Diagram, and the Gardner Detector</a></strong>
+      <br>
+      <em>Why independent transmitter/receiver crystals drift into transition edges, reading the Eye Diagram, and the mathematical elegance of the Gardner Timing Error Detector ($e[k] = x[k-1/2](x[k] - x[k-1])$) paired with fractional interpolators.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0008-polyphase-filterbanks-and-channelization.html">Lesson 0008: Polyphase Filterbanks — Channelizing 32 Radios on One CPU Core</a></strong>
+      <br>
+      <em>The 10-billion MACs/sec naive channelizer trap, the Noble Identity (decimating before filtering), decomposing prototype filters into parallel polyphase branches, and using an IFFT for a 440x computational speedup.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0009-dsp-and-sdr-in-devsecops-and-cybersecurity.html">Lesson 0009: From Radio Waves to Cloud Security — SDR &amp; DSP in DevSecOps</a></strong>
+      <br>
+      <em>Bridging DSP to your day job: GPS/PTP spoofing attacks on cloud data center consensus (Spanner/CockroachDB), detecting C2 malware beaconing in proxy logs via FFT and autocorrelation, and applying zero-copy backpressure to eBPF/SIEM firehoses.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0010-live-codebase-tour-zigler-simd-and-genstage.html">Lesson 0010: Live Codebase Tour — Inside SdrScout's Zigler SIMD &amp; GenStage</a></strong>
+      <br>
+      <em>Walking the production implementation: persistent <code>DspContext</code> resource memory, 16-lane SIMD magnitude, in-place $O(1)$ syndrome recovery, GenStage bounded demand contracts, and 27.5 MSPS (13.8x real-time) benchmarks.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0011-clustering-sdrs-tdoa-and-distributed-correlation.html">Lesson 0011: Clustering SDRs — Multilateration (TDOA) and Distributed BEAM Nodes</a></strong>
+      <br>
+      <em>Connecting two Portenta X8s with RTL-SDRs: the physics of hyperbolic TDOA ($300\text{ m}/\mu\text{s}$), $O(N \log N)$ frequency-domain cross-correlation ($R_{xy} = \mathcal{F}^{-1}\{X \cdot Y^*\}$), native distributed Erlang clustering, and overcoming the nanosecond clock sync barrier via GPS PPS or opportunistic reference towers.</em>
+    </li>
+    <li>
+      <strong><a href="lessons/0012-deep-tdoa-gcc-phat-subsample-and-hyperbolic-solvers.html">Lesson 0012: Deep TDOA — GCC-PHAT, Sub-Sample Fitting, &amp; Hyperbolic Solvers</a></strong>
+      <br>
+      <em>Going deep into real SIGINT/TDOA: why standard correlation smears in multipath, phase whitening via GCC-PHAT ($R = \mathcal{F}^{-1}\{(XY^*)/|XY^*|\}$) to produce a Dirac delta, 3-point parabolic peak interpolation cutting 150m coarseness to ~5m, and Bancroft's spacetime Minkowski solver.</em>
+    </li>
+  </ul>
+
+  <h2>Reference Documents &amp; Glossaries</h2>
+  <ul>
+    <li>
+      <strong><a href="reference/dsp-geometric-intuition.html">DSP Through Linear Algebra Reference Sheet</a></strong>
+      <br>
+      <em>Visual intuition on discrete signals as vectors, correlation as dot products, why convolution time-reverses templates, and orthogonal HAM modes.</em>
+    </li>
+    <li>
+      <strong><a href="reference/sdr-architecture-comparison.html">SDR Architecture Reference Sheet</a></strong>
+      <br>
+      <em>Side-by-side comparative matrix of Elixir+Zig, GNU Radio, and Pure C/Rust across throughput, jitter, fault tolerance, and HAM modes.</em>
+    </li>
+  </ul>
+
+  <h2>Workspace Specifications</h2>
+  <ul>
+    <li><a href="MISSION.md">MISSION.md</a> &mdash; Stated purpose, constraints, and learning compass</li>
+    <li><a href="GLOSSARY.md">GLOSSARY.md</a> &mdash; Canonical technical terminology</li>
+    <li><a href="RESOURCES.md">RESOURCES.md</a> &mdash; High-trust primary texts and communities</li>
+  </ul>
+
+  <div class="footer">
+    <span>SDR &amp; Amateur Radio Learning Portal</span>
+    <span>Host: port 8080</span>
+  </div>
+</body>
+</html>

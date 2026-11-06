@@ -3,7 +3,7 @@ defmodule SdrScout.Aircraft do
   Domain model for an individual tracked aircraft.
   Handles kinematic state and message updates.
   """
-  alias SdrScout.ModeS.CPR
+  alias SdrScout.ModeS
 
   defstruct [
     :icao,
@@ -72,7 +72,7 @@ defmodule SdrScout.Aircraft do
       end
 
     if ac.cpr_even != nil and ac.cpr_odd != nil do
-      case CPR.decode_global(ac.cpr_even, ac.cpr_odd) do
+      case ModeS.resolve_position(ac.cpr_even, ac.cpr_odd) do
         {:ok, {lat, lon}} ->
           %{ac | latitude: lat, longitude: lon}
 

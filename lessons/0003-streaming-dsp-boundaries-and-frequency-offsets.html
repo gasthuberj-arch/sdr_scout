@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 3: Carrier Frequency Offsets, Non-Coherent Detection, and Chunk Boundaries</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = {
+      tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] }
+    };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0003</span>
+    <span class="badge badge-arch">DSP &amp; Systems Architecture</span>
+    <span>Reading time: 8 minutes</span>
+  </div>
+
+  <h1>Carrier Frequency Offsets, Non-Coherent Detection, and Chunk Boundaries</h1>
+
+  <p>
+    In real radio environments, physical hardware violates ideal mathematical assumptions. Local oscillator (LO) crystals drift, Doppler shifts alter center frequencies, and streaming chunks chop continuous radio frames in half.
+  </p>
+
+  <p>
+    This lesson examines two fundamental engineering challenges:
+  </p>
+  <ol>
+    <li><strong>The RF Domain:</strong> How Carrier Frequency Offset (CFO) rotates constellations, and why non-coherent magnitude detection bypasses phase tracking.</li>
+    <li><strong>The Systems Domain:</strong> How streaming architectures solve the chunk-straddling boundary problem (contrasting GNU Radio's MMU page aliasing with Zigler's stateful tail-buffer NIF).</li>
+  </ol>
+
+  <h2>1. Carrier Frequency Offset (CFO) and Phase Rotation</h2>
+
+  <p>
+    Suppose an aircraft or satellite transmits a modulated signal $s(t)$ on nominal carrier frequency $f_c$. The receiver's local oscillator attempts to mix down with frequency $f_{lo}$. In practice, $f_c \ne f_{lo}$ due to:
+  </p>
+  <ul>
+    <li><strong>Oscillator Tolerance:</strong> A typical consumer SDR crystal (such as RTL-SDR without TCXO) has a frequency error of up to $\pm 20\text{ ppm}$. At $1090\text{ MHz}$, $20\text{ ppm} \times 1090\text{ MHz} = \mathbf{21.8\text{ kHz}}$ of carrier offset.</li>
+    <li><strong>Doppler Shift:</strong> An aircraft flying at $500\text{ knots} \approx 257\text{ m/s}$ induces a Doppler shift of $\Delta f_D = \frac{v}{c} f_c \approx \pm 934\text{ Hz}$.</li>
+  </ul>
+
+  <p>
+    When mixed to complex baseband, the received analytic signal $r(t)$ contains an uncompensated angular rotation term:
+  </p>
+  $$r(t) = s(t) e^{j(2\pi \Delta f t + \theta_0)} + w(t)$$
+  <p>
+    where $\Delta f = (f_c - f_{lo}) \pm \Delta f_D$, $\theta_0$ is initial phase, and $w(t)$ is Additive White Gaussian Noise (AWGN).
+  </p>
+
+  <h3>What Happens to the Phase Over Time?</h3>
+  <p>
+    The phase rotates at angular velocity $\omega = \frac{d\phi}{dt} = 2\pi \Delta f$. Over a time window of duration $T$, total accumulated phase shift is:
+  </p>
+  $$\Delta \phi = 2\pi \Delta f T \text{ radians}$$
+
+  <div class="callout warning">
+    <div class="callout-title">The Quantitative Catastrophe for Coherent Demodulation</div>
+    <p>
+      Consider a Mode-S extended squitter frame: $T = 120\ \mu\text{s}$ (8 µs preamble + 112 µs data).
+      With a modest $20\text{ kHz}$ frequency offset:
+    </p>
+    $$\Delta \phi = 2\pi \times (20,000\text{ s}^{-1}) \times (120 \times 10^{-6}\text{ s}) = 4.8\pi \text{ radians} \approx 864^\circ$$
+    <p>
+      The constellation rotates <strong>2.4 complete revolutions</strong> during a single 120-microsecond message!
+    </p>
+    <p>
+      If you attempted coherent demodulation (e.g., standard BPSK/QPSK measuring phase angles relative to the I-axis), the symbol decisions would be entirely scrambled unless tracked by an agile discrete Phase-Locked Loop (PLL) or Costas Loop.
+    </p>
+  </div>
+
+  <h2>2. Why Pulse Position Modulation (PPM) Uses Non-Coherent Detection</h2>
+
+  <p>
+    Because aircraft fly at high velocities and transmitters use cheap non-stabilized oscillators, Mode-S specifies <strong>Pulse Position Modulation (PPM)</strong>.
+  </p>
+  <p>
+    In PPM, each 1 µs bit period is divided into two 0.5 µs chips:
+  </p>
+  <ul>
+    <li><strong>Bit 1:</strong> Pulse in first 0.5 µs, silence in second 0.5 µs.</li>
+    <li><strong>Bit 0:</strong> Silence in first 0.5 µs, pulse in second 0.5 µs.</li>
+  </ul>
+
+  <p>
+    Notice what happens when we calculate the complex envelope magnitude $|r(t)|$:
+  </p>
+  $$|r(t)| = \left| s(t) e^{j(2\pi \Delta f t + \theta_0)} \right| = |s(t)| \cdot \underbrace{\left| e^{j(2\pi \Delta f t + \theta_0)} \right|}_{= 1} = |s(t)|$$
+
+  <div class="callout upside">
+    <div class="callout-title">Non-Coherent Immunity</div>
+    <p>
+      By demodulating the scalar magnitude $|z| = \sqrt{I^2 + Q^2}$, <strong>the entire frequency offset and phase drift term drops to exactly 1</strong>. The receiver requires zero phase tracking, zero Costas loops, and zero synchronization lock time, making it robust against massive frequency offsets!
+    </p>
+  </div>
+
+  <h2>3. Systems Architecture: The Chunk Boundary Problem</h2>
+
+  <p>
+    In <code>SdrScout</code>, the Elixir <code>GenStage</code> producer streams raw baseband samples into Zig in <strong>64 KB chunks</strong> (65,536 bytes). At 2.0 MSPS with interleaved <code>u8</code> I/Q, this represents:
+  </p>
+  $$\frac{65,536 \text{ bytes}}{2 \text{ bytes/sample}} = 32,768 \text{ complex samples} \approx 16.384 \text{ ms of airtime}$$
+
+  <p>
+    A Mode-S transmission is 120 µs long = <strong>240 complex samples</strong> = <strong>480 bytes</strong> of I/Q data.
+  </p>
+
+  <h3>The Mathematics of Boundary Loss</h3>
+  <p>
+    Aircraft transmit asynchronously at random times. If the start of a frame is uniformly distributed across the chunk, any frame that begins in the final 480 bytes of Chunk $K$ will be split across the chunk boundary:
+  </p>
+  $$P(\text{Straddle}) = \frac{\text{Frame Size}}{\text{Chunk Size}} = \frac{480 \text{ bytes}}{65,536 \text{ bytes}} \approx 0.732\%$$
+  <p>
+    Without boundary handling, your receiver automatically drops nearly 1 out of every 135 messages before decoding even begins!
+  </p>
+
+  <h2>4. Architectural Approaches: GNU Radio vs. Stateful Zig NIF</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Design Pattern</th>
+        <th>Mechanism</th>
+        <th>Latency &amp; Memory Cost</th>
+        <th>Engineering Tradeoff</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>GNU Radio MMU Aliasing (<code>vm_circbuf</code>)</strong></td>
+        <td>Uses Linux <code>mmap</code> / <code>shm_open</code> to map the same physical RAM page twice into contiguous virtual addresses.</td>
+        <td>Zero memory copy; hardware MMU translates pointer wrap-around automatically.</td>
+        <td>Requires page-aligned allocations (4 KB boundaries), kernel syscalls on setup, and POSIX shared memory hooks. Incompatible with standard BEAM heap allocators.</td>
+      </tr>
+      <tr>
+        <td><strong>Stateful Zig Tail Buffer (<code>SdrScout</code>)</strong></td>
+        <td>Zig NIF maintains a persistent 480-byte ring tail in an Erlang Resource struct. Chunk $K+1$ prepends the 480-byte tail from Chunk $K$.</td>
+        <td>Copies exactly 480 bytes per 64 KB chunk (a negligible 0.73% copy ratio). Remaining 99.27% is strictly zero-copy.</td>
+        <td>Preserves BEAM allocator isolation; zero kernel syscalls; works seamlessly with ref-counted binaries on standard Erlang schedulers.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-3-1">
+    <div class="quiz-question">
+      1. A receiver experiences an uncompensated carrier offset of $\Delta f = 5\text{ kHz}$. Over a 200 µs telemetry frame, how much phase rotation accumulates?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Total rotation accumulates precisely one quarter of a radian across the entire duration.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Total rotation accumulates precisely two times pi radians across the entire frame.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Total rotation accumulates precisely ten times pi radians across the entire frame.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Total rotation accumulates precisely zero radians because baseband downconversion eliminates all phase shifts.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> Using $\Delta\phi = 2\pi \Delta f T$: $\Delta\phi = 2\pi \times 5000\text{ s}^{-1} \times (200 \times 10^{-6}\text{ s}) = 2\pi \text{ radians} = 360^\circ$ (one full rotation).
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-3-2">
+    <div class="quiz-question">
+      2. Why does SdrScout use a 480-byte tail buffer in a persistent Zig NIF resource instead of Linux virtual memory double-mapping (vm_circbuf)?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The Linux kernel limits the maximum number of shared memory mappings to sixteen per system.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Zig SIMD vector instructions cannot read contiguous memory addresses that cross page boundaries.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        BEAM heap refc binaries cannot be arbitrarily remapped without costly page-aligned allocations.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Copying 480 bytes across memory caches consumes more CPU cycles than making kernel mmap syscalls.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> BEAM refc binaries are allocated by Erlang's slab allocators on the shared heap. They are not guaranteed to be page-aligned (4 KB), and re-mapping them with POSIX `mmap` would require heavy kernel context switches on every 64 KB chunk. Copying 480 bytes (less than eight 64-byte cache lines) is orders of magnitude faster.
+    </div>
+  </div>
+
+  <h2>Recommended Primary Source</h2>
+  <p>
+    To master phase tracking loops and carrier synchronization, study:
+    <br>
+    <a href="https://pysdr.org/content/sync.html" target="_blank" rel="noopener"><strong>PySDR: Synchronization in Digital Communications (Carrier &amp; Costas Loops)</strong> by Dr. Marc Lichtman</a>.
+  </p>
+
+  <p>
+    Review our architecture matrix in <a href="../reference/sdr-architecture-comparison.html">SDR Architecture Comparison</a> and definitions in <a href="../GLOSSARY.md">GLOSSARY.md</a>.
+  </p>
+
+  <div class="footer">
+    <span>Questions on phase estimation, PLL loop bandwidths, or cache line packing? Ask your tutor agent!</span>
+    <span><a href="0002-complex-baseband-iq-and-simd-dsp.html">&larr; Lesson 0002</a> | Lesson 0003</span>
+  </div>
+</body>
+</html>

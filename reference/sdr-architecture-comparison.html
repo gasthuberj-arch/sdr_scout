@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>SDR Architecture Reference: Tradeoffs & Paradigms</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    @media print {
+      body { max-width: 100%; margin: 0; padding: 1cm; font-size: 11pt; }
+      .no-print { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-arch">Reference Document</span>
+    <span>SDR Systems & HAM Radio</span>
+  </div>
+
+  <h1>SDR Architecture Reference: Comparative Tradeoffs</h1>
+
+  <p>
+    When receiving radio signals, an SDR pipeline converts analog electromagnetic waves into digitized baseband I/Q samples, then passes them through digital filtering, synchronization, demodulation, bit-framing, and state management. The choice of runtime architecture fundamentally dictates system throughput, latency jitter, and operational safety.
+  </p>
+
+  <h2>Architectural Comparison Matrix</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Dimension</th>
+        <th>Elixir + Zig NIF (SdrScout)</th>
+        <th>GNU Radio (C++ Core + Python)</th>
+        <th>Pure C / Rust (e.g., Direwolf, csdr)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Primary Philosophy</strong></td>
+        <td>Native SIMD DSP core + OTP actor concurrency and supervision</td>
+        <td>Flowgraph of modular C++ stream blocks scheduled in thread pools</td>
+        <td>Monolithic single-process or Unix pipe composition</td>
+      </tr>
+      <tr>
+        <td><strong>DSP Throughput</strong></td>
+        <td><strong>High (2–10 MSPS)</strong> with zero-copy binary passing and SIMD</td>
+        <td><strong>Maximum (20–100+ MSPS)</strong> via circular buffers and SIMD (VOLK)</td>
+        <td><strong>Maximum (20–100+ MSPS)</strong> with hand-tuned cache locality</td>
+      </tr>
+      <tr>
+        <td><strong>Latency & Jitter</strong></td>
+        <td>Predictable soft realtime; risk of BEAM stall if NIF runs &gt;1ms</td>
+        <td>Extremely low buffer latency; deterministic DSP block execution</td>
+        <td>Hard/near-hard realtime; lowest possible jitter for TX/PTT timing</td>
+      </tr>
+      <tr>
+        <td><strong>Flow Control & Backpressure</strong></td>
+        <td><strong>GenStage demand-driven</strong> pull backpressure prevents memory leaks</td>
+        <td>Circular buffer full/empty signaling with block backpressure</td>
+        <td>OS pipe buffers (`FIFO`), explicit ring buffers, or dropped packets</td>
+      </tr>
+      <tr>
+        <td><strong>Fault Tolerance</strong></td>
+        <td><strong>Supervision trees</strong>: decoder crashes self-heal without killing radio stream</td>
+        <td>Single segfault or unhandled exception terminates whole flowgraph</td>
+        <td>Crash terminates daemon; requires external init/systemd restart</td>
+      </tr>
+      <tr>
+        <td><strong>Cluster / Networking</strong></td>
+        <td><strong>Native OTP / :pg distribution</strong> across nodes with zero extra code</td>
+        <td>Requires external ZeroMQ, TCP sinks, or MQTT glue services</td>
+        <td>Requires custom socket programming or external forwarders</td>
+      </tr>
+      <tr>
+        <td><strong>Protocol Dissection</strong></td>
+        <td><strong>Elite</strong>: pattern-matching bitstrings (`&lt;&lt;flag::1, data::7&gt;&gt;`)</td>
+        <td>Awkward: manual C++ bitshifts or Python bridging overhead</td>
+        <td>Performant but verbose: manual bitmasks (`(b &gt;&gt; 3) &amp; 0x07`)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Suitability for Amateur (HAM) Radio Modes</h2>
+
+  <div class="callout upside">
+    <div class="callout-title">Ideal Fits for Elixir + Zig</div>
+    <ul>
+      <li><strong>Distributed APRS / AX.25 Digipeaters:</strong> Connecting multiple RF receivers over mesh or internet, deduplicating packets, and publishing to APRS-IS.</li>
+      <li><strong>Multi-Channel FT8 / WSPR Decoders:</strong> Splitting audio-frequency bands into parallel worker processes, doing FFT in Zig and message state tracking in Elixir.</li>
+      <li><strong>Telemetry & Satellite Ground Stations:</strong> Cubesat telemetry reception (e.g. NOAA APT, AX.25 Fox-1), where stateful flight tracking and web/telemetry broadcasting shine.</li>
+    </ul>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">When to Avoid Elixir + Zig (Use Pure C/Rust or GNU Radio Instead)</div>
+    <ul>
+      <li><strong>Ultra-Wideband Sweep / Spectrum Analysis:</strong> HackRF sweeps at 20+ MSPS require gigabytes/sec of raw RAM bandwidth and direct GPU/FPGA offloading.</li>
+      <li><strong>Strict Half-Duplex / Full-Duplex Transceivers (TX/RX switching):</strong> HAM PTT (Push-To-Talk) turnaround and TDMA slots (such as DMR tier II 30ms time slots) require microsecond-level phase lock that BEAM garbage collectors can disrupt if unshielded.</li>
+      <li><strong>Embedded Microcontrollers:</strong> Running on microcontrollers (ESP32, STM32) without a full OS or BEAM VM.</li>
+    </ul>
+  </div>
+
+  <div class="footer">
+    <span>Reference: SDR Architectures</span>
+    <span><a href="../lessons/0001-sdr-pipeline-architectures-and-tradeoffs.html">Go to Lesson 0001 &rarr;</a></span>
+  </div>
+</body>
+</html>

@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 6: Phase Invariance, I/Q Quadrature Projections, and the Rayleigh Limit</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0006</span>
+    <span class="badge badge-arch">DSP Deepening &amp; Systems</span>
+    <span>Reading time: 8 minutes</span>
+  </div>
+
+  <h1>Phase Invariance, I/Q Projections, and the Rayleigh Limit</h1>
+
+  <p>
+    In Lesson 5, we saw that any radio tone detector is fundamentally a vector dot product: $\langle \mathbf{x}, \mathbf{template} \rangle$.
+  </p>
+
+  <p>
+    Now, let's stress-test that code against the physical realities of radio propagation. Two critical questions emerge:
+  </p>
+  <ol>
+    <li><strong>The Phase Blindspot:</strong> What happens when a radio wave arrives with an unknown phase shift? Why does a single cosine template fail, and how do $I$ and $Q$ fix it?</li>
+    <li><strong>The Rayleigh Limit:</strong> Why can FT8 pack tones just 6.25 Hz apart, while APRS requires 1000 Hz spacing?</li>
+  </ol>
+
+  <h2>1. The Fatal Blindspot of a Single Dot Product</h2>
+
+  <p>
+    In Lesson 5, our simple APRS detector took the dot product against a pure cosine wave:
+  </p>
+  <pre><code>template[n] = cos(2.0 * PI * 1200.0 * n / fs)
+dot = dot_product(x, template)</code></pre>
+
+  <p>
+    In the real world, a radio transmitter is miles away. The antenna distance introduces an arbitrary propagation delay $\tau$, meaning the incoming tone arrives with an unknown phase offset $\phi = 2\pi f \tau$:
+  </p>
+  $$x[n] = A \cos(\omega n + \phi)$$
+
+  <p>
+    Expanding using angle-addition trigonometry:
+  </p>
+  $$x[n] = A \cos\phi \cos(\omega n) - A \sin\phi \sin(\omega n)$$
+
+  <p>
+    When we compute the dot product against our cosine template:
+  </p>
+  $$\langle \mathbf{x}, \cos(\omega n) \rangle = A \cos\phi \sum_{n=0}^{N-1} \cos^2(\omega n) \approx A \cos\phi \left( \frac{N}{2} \right)$$
+
+  <div class="callout warning">
+    <div class="callout-title">The Complete Signal Dropout</div>
+    <p>
+      Look closely at the multiplier: $\mathbf{\cos\phi}$.
+    </p>
+    <p>
+      What happens if the signal arrives with a phase delay of $\phi = 90^\circ$ ($\pi/2$ radians)?
+      At 144 MHz, a $90^\circ$ phase shift corresponds to an antenna distance change of just <strong>52 centimeters</strong>!
+    </p>
+    $$\cos(90^\circ) = 0 \implies \langle \mathbf{x}, \cos(\omega n) \rangle = \mathbf{0}$$
+    <p>
+      Even if the transmitter is outputting 100 Watts right next to your antenna, <strong>your detector outputs exactly zero</strong>! The signal is completely invisible to a single cosine template.
+    </p>
+  </div>
+
+  <h2>2. The Quadrature Solution: The I/Q Energy Detector</h2>
+
+  <p>
+    To make our receiver completely immune to arrival phase $\phi$, we project the incoming vector onto <strong>two orthogonal templates</strong> 90° apart:
+  </p>
+
+  <ul>
+    <li><strong>In-Phase Projection ($I$):</strong> Dot product against $\cos(\omega n)$</li>
+    <li><strong>Quadrature Projection ($Q$):</strong> Dot product against $-\sin(\omega n)$</li>
+  </ul>
+
+  $$I = \langle \mathbf{x}, \cos(\omega n) \rangle = \frac{A N}{2} \cos\phi$$
+  $$Q = \langle \mathbf{x}, -\sin(\omega n) \rangle = \frac{A N}{2} \sin\phi$$
+
+  <p>
+    Now compute the total energy (the squared magnitude $|z|^2$):
+  </p>
+  $$E = I^2 + Q^2 = \left( \frac{A N}{2} \right)^2 \cos^2\phi + \left( \frac{A N}{2} \right)^2 \sin^2\phi = \left( \frac{A N}{2} \right)^2 \underbrace{(\cos^2\phi + \sin^2\phi)}_{= 1}$$
+
+  <div class="callout upside">
+    <div class="callout-title">Phase Invariance Achieved!</div>
+    <p>
+      By Pythagorean identity ($\cos^2\phi + \sin^2\phi = 1$), <strong>the arrival phase $\phi$ cancels out completely</strong>!
+    </p>
+    <p>
+      Whether the wave arrives at $0^\circ, 37^\circ, 90^\circ,$ or $180^\circ$, the computed energy $I^2 + Q^2$ is completely identical. This is why complex baseband ($I + jQ$) is universal across all SDR software.
+    </p>
+  </div>
+
+  <h2>3. The Rayleigh Limit: Tone Spacing vs. Observation Time</h2>
+
+  <p>
+    Why can FT8 pack 8 tones separated by only <strong>6.25 Hz</strong>, while APRS requires <strong>1000 Hz</strong> between 1200 Hz and 2200 Hz?
+  </p>
+
+  <p>
+    This is governed by the Fourier uncertainty principle (the <strong>Rayleigh criterion</strong>):
+  </p>
+  $$\Delta f \cdot \Delta t \ge 1 \iff \Delta f_{\text{min}} = \frac{1}{\Delta t}$$
+
+  <p>
+    Two sinusoids at frequencies $f_1$ and $f_2 = f_1 + \Delta f$ are strictly orthogonal over a window of duration $\Delta t$ if and only if $\Delta f$ is an integer multiple of $1/\Delta t$.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Protocol</th>
+        <th>Symbol Duration ($\Delta t$)</th>
+        <th>Minimum Orthogonal Spacing ($1/\Delta t$)</th>
+        <th>Actual Tone Spacing Used</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>APRS (1200 baud)</strong></td>
+        <td>$1 / 1200\text{ s} \approx 0.833\text{ ms}$</td>
+        <td>$1 / 0.000833 = \mathbf{1200\text{ Hz}}$</td>
+        <td>$1000\text{ Hz}$ (historical Bell 202 standard)</td>
+      </tr>
+      <tr>
+        <td><strong>FT8 (Slow MFSK)</strong></td>
+        <td>$0.160\text{ seconds}$</td>
+        <td>$1 / 0.160 = \mathbf{6.25\text{ Hz}}$</td>
+        <td>$\mathbf{6.25\text{ Hz}}$ (exact Rayleigh bound!)</td>
+      </tr>
+      <tr>
+        <td><strong>WSPR (Ultra-slow HF)</strong></td>
+        <td>$0.683\text{ seconds}$</td>
+        <td>$1 / 0.683 = \mathbf{1.46\text{ Hz}}$</td>
+        <td>$\mathbf{1.46\text{ Hz}}$ (exact Rayleigh bound!)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout upside">
+    <div class="callout-title">The Engineering Tradeoff</div>
+    <p>
+      If you want narrow tone spacing to pack hundreds of signals into a tiny sliver of radio spectrum (like FT8), <strong>physics demands that each symbol must last a long time</strong>.
+    </p>
+    <p>
+      If you want fast data rates (short $\Delta t$ like APRS or packet radio), <strong>your tones must be widely separated in frequency</strong> to remain orthogonal!
+    </p>
+  </div>
+
+  <h2>4. The Discrete Fourier Transform (DFT) Unmasked</h2>
+
+  <p>
+    In FT8, there are 8 tones. Do we need to write 8 separate pairs of dot product loops?
+  </p>
+  <p>
+    No! That is precisely what the <strong>Discrete Fourier Transform (DFT)</strong> does:
+  </p>
+  $$X[k] = \sum_{n=0}^{N-1} x[n] e^{-j 2\pi k n / N} = \underbrace{\sum_{n=0}^{N-1} x[n] \cos\left(\frac{2\pi k n}{N}\right)}_{I_k} - j \underbrace{\sum_{n=0}^{N-1} x[n] \sin\left(\frac{2\pi k n}{N}\right)}_{-Q_k}$$
+
+  <p>
+    An FFT is nothing more than a bank of $N$ simultaneous, orthogonal $I/Q$ dot products computed simultaneously using an $O(N \log N)$ divide-and-conquer algorithm!
+  </p>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-6-1">
+    <div class="quiz-question">
+      1. Why does an SDR demodulator compute $I^2 + Q^2$ instead of relying on a single cosine dot product?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Summing two squared numbers doubles the memory throughput bandwidth across the host system bus.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The Pythagorean sum of orthogonal projections guarantees constant energy regardless of carrier arrival phase.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Erlang actor processes require binary inputs to be formatted as complex IEEE floating point pairs.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Hardware antennas reject electromagnetic fields whose voltage does not oscillate along two physical planes.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> Because $\cos^2\phi + \sin^2\phi = 1$, summing the squares of the In-Phase and Quadrature dot products completely eliminates the arbitrary propagation phase delay $\phi$, preventing catastrophic signal dropouts.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-6-2">
+    <div class="quiz-question">
+      2. If an amateur radio digital mode uses tones spaced by 50 Hz, what is the minimum symbol duration required to keep the tones mutually orthogonal?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Exactly fifty milliseconds because frequency and time scale by equal integer multiples of ten.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Exactly five milliseconds because high frequency tones require shorter integration windows to prevent attenuation.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Exactly twenty milliseconds because the Rayleigh criterion requires symbol duration equal to one divided by spacing.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Exactly two hundred milliseconds because real analog audio channels introduce ten times additional group delay.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> By the Rayleigh criterion $\Delta t = 1 / \Delta f = 1 / 50\text{ Hz} = 0.020\text{ seconds} = 20\text{ ms}$. Any symbol shorter than 20 ms will cause spectral leakage and cross-talk between the 50 Hz tones.
+    </div>
+  </div>
+
+  <h2>Recommended Primary Source</h2>
+  <p>
+    For a visual demonstration of the Rayleigh criterion and spectral leakage:
+    <br>
+    <a href="https://pysdr.org/content/frequency_domain.html#fft-in-python" target="_blank" rel="noopener"><strong>PySDR: FFTs, Windows, &amp; Frequency Resolution</strong> by Dr. Marc Lichtman</a>.
+  </p>
+
+  <p>
+    Review our canonical definitions in <a href="../GLOSSARY.md">GLOSSARY.md</a> and geometric diagrams in <a href="../reference/dsp-geometric-intuition.html">DSP Through Linear Algebra Reference Sheet</a>.
+  </p>
+
+  <div class="footer">
+    <span>Questions on phase recovery, FFT bin spacing, or windowing? Ask your tutor agent!</span>
+    <span><a href="0005-demystifying-dsp-geometric-filters-and-ham-modes.html">&larr; Lesson 0005</a> | Lesson 0006</span>
+  </div>
+</body>
+</html>

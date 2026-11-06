@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 8: Polyphase Filterbanks — Channelizing 32 Radios on One CPU Core</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0008</span>
+    <span class="badge badge-arch">Multirate DSP &amp; Channelization</span>
+    <span>Reading time: 9 minutes</span>
+  </div>
+
+  <h1>Polyphase Filterbanks: Channelizing 32 Radios on One CPU Core</h1>
+
+  <p>
+    If you thought the Gardner detector was pure mathematical elegance, prepare yourself for what is widely considered the crown jewel of digital signal processing: the <strong>Polyphase Filterbank (PFB) Channelizer</strong>.
+  </p>
+
+  <p>
+    In analog radio days, if you wanted to monitor 32 distinct amateur radio channels on the 2-meter band simultaneously, you had to buy 32 separate physical transceivers, 32 power supplies, and 32 audio cables.
+  </p>
+
+  <p>
+    With a $30 RTL-SDR dongle, your software captures a continuous 2.4 MHz spectrum swath (e.g. 144.0 to 146.4 MHz) containing all 32 channels. But how do you demultiplex 32 independent channels in real time without melting your CPU?
+  </p>
+
+  <h2>1. The Naive Architecture (The 10 Billion Operation Trap)</h2>
+
+  <p>
+    Suppose we want to extract $M = 32$ channels, each with a bandwidth of 25 kHz, from our 2.4 MSPS complex baseband input stream ($f_s = 2.4\text{ MHz}$).
+  </p>
+
+  <p>
+    The naive textbook approach builds 32 parallel processing pipelines:
+  </p>
+  <ol>
+    <li><strong>Mixer:</strong> Multiply input by $e^{-j 2\pi f_m t}$ to shift channel $m$ down to 0 Hz (center frequency).</li>
+    <li><strong>Low-Pass Filter:</strong> Run an anti-aliasing FIR filter (e.g. $L = 128$ taps) to isolate the 25 kHz channel.</li>
+    <li><strong>Decimate:</strong> Downsample by factor $M = 32$ to reduce the sample rate from 2.4 MHz to 75 kHz.</li>
+  </ol>
+
+  <div class="callout warning">
+    <div class="callout-title">The Absurd Arithmetic Waste</div>
+    <p>
+      Let's calculate the computational cost of this naive approach:
+    </p>
+    $$\text{Operations} = M \times L \times f_s = 32 \times 128 \times 2,400,000 \approx \mathbf{9.83 \times 10^9 \text{ MACs/second}}$$
+    <p>
+      Nearly <strong>10 Billion multiply-accumulates per second</strong>!
+    </p>
+    <p>
+      Why is this so wasteful? Because in step 3, the decimator immediately <strong>throws away 31 out of every 32 computed outputs</strong>! 96.8% of your CPU's precious floating-point instructions are discarded in the trash!
+    </p>
+  </div>
+
+  <h2>2. Step 1: The Noble Identity (Decimate First!)</h2>
+
+  <p>
+    In multirate signal processing, the <strong>Noble Identity</strong> proves that filtering at high rate followed by downsampling by $M$ is mathematically identical to <em>downsampling first</em> and filtering at the low rate, provided we decompose the filter into $M$ smaller sub-filters!
+  </p>
+
+  <p>
+    Instead of running our $L = 128$ tap prototype filter on every single sample, we split it into 32 interleaved sub-filters (the <strong>polyphase components</strong>):
+  </p>
+  <ul>
+    <li>$e_0 = [h_0, h_{32}, h_{64}, h_{96}]$ (only 4 taps!)</li>
+    <li>$e_1 = [h_1, h_{33}, h_{65}, h_{97}]$ (only 4 taps!)</li>
+    <li>...</li>
+    <li>$e_{31} = [h_{31}, h_{63}, h_{95}, h_{127}]$ (only 4 taps!)</li>
+  </ul>
+
+  <p>
+    Incoming samples enter an input <strong>commutator</strong> (a simple 32-sample circular buffer delay line). Each 4-tap sub-filter runs <em>only once per 32 incoming samples</em>—operating strictly at the slow 75 kHz output rate!
+  </p>
+
+  <h2>3. Step 2: The Inverse FFT as a Universal Frequency Shifter</h2>
+
+  <p>
+    Now we have 32 filtered outputs, but they all still sit at baseband. How do we shift each channel to its proper RF carrier frequency without running 32 independent complex mixers?
+  </p>
+
+  <p>
+    Recall the formula for an $M$-point Inverse Discrete Fourier Transform (IDFT):
+  </p>
+  $$y_k = \frac{1}{M} \sum_{m=0}^{M-1} X_m e^{j 2\pi k m / M}$$
+
+  <p>
+    Notice the phase term $e^{j 2\pi k m / M}$: it is the <strong>exact discrete complex exponential required to shift channel $m$ to frequency $k$</strong>!
+  </p>
+
+  <div class="callout upside">
+    <div class="callout-title">The Polyphase Filterbank Architecture</div>
+    <pre><code>[Raw 2.4 MSPS I/Q Stream]
+           │
+           ▼
+[Commutator: 32-Sample Delay Line]
+  ├── e0:  4-tap FIR ──► y0 ──┐
+  ├── e1:  4-tap FIR ──► y1 ──┤
+  ├── e2:  4-tap FIR ──► y2 ──┼──► [ 32-point Inverse FFT ]
+  ├── ...                     │             │
+  └── e31: 4-tap FIR ──► y31 ─┘             ▼
+                               [32 Parallel 75 kHz Channels Output!]</code></pre>
+
+    <p>
+      By feeding the 32 polyphase sub-filter outputs into a single <strong>32-point Inverse Fast Fourier Transform (IFFT)</strong>, the IFFT computes the channel mixing for all 32 channels simultaneously in $O(M \log M)$ time!
+    </p>
+  </div>
+
+  <h2>4. The Quantitative Comparison: A 440x Speedup</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Architecture</th>
+        <th>Filter Operations</th>
+        <th>Mixing Operations</th>
+        <th>Total Ops / Second</th>
+        <th>CPU Load (Single Core)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Naive Parallel Tuners</strong></td>
+        <td>$32 \times 128 \times 2.4\text{M} = 9.8\text{G}$</td>
+        <td>$32 \text{ mixers} \times 2.4\text{M} = 76.8\text{M}$</td>
+        <td><strong>~9,900,000,000</strong></td>
+        <td><strong>100% (Pegged / Stalling)</strong></td>
+      </tr>
+      <tr>
+        <td><strong>Polyphase Filterbank (PFB)</strong></td>
+        <td>$128 \times 75\text{k} = 9.6\text{M}$</td>
+        <td>$75\text{k} \times (32 \log_2 32) = 12\text{M}$</td>
+        <td><strong>~21,600,000</strong></td>
+        <td><strong>&lt; 1.5% CPU</strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout upside">
+    <div class="callout-title">The Architectural Magic</div>
+    <p>
+      By combining polyphase decomposition (filtering at the decimated rate) with an IFFT (mixing all channels simultaneously), we transformed a 10-billion operation/sec monstrosity into a tiny <strong>21 million operation/sec</strong> task.
+    </p>
+    <p>
+      That is a <strong>440x reduction in CPU cycles</strong>! An ordinary Raspberry Pi 4 can easily listen to, filter, and decode 32 channels across the entire amateur radio band without breaking a sweat.
+    </p>
+  </div>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-8-1">
+    <div class="quiz-question">
+      1. Why is the polyphase decomposition computationally superior to filtering before downsampling?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        It eliminates the need for anti-aliasing low-pass prototype filtering across the spectrum.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        It executes all filter multiplications at the lower decimated rate, discarding zero work.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It converts complex floating point numbers into single-byte ASCII strings before convolution.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It allows the host operating system kernel to bypass standard MMU virtual memory paging.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> In the naive approach, you filter at the high input rate and then discard 31 out of 32 outputs. In polyphase filtering, the downsampling occurs before the sub-filters, ensuring 100% of computed samples are preserved.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-8-2">
+    <div class="quiz-question">
+      2. In an M-channel polyphase filterbank, what role does the Inverse FFT play?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        It synchronizes the symbol clock transitions across the asynchronous analog antenna inputs.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It generates linear cyclic redundancy check syndrome vectors to correct parity bit errors.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        It shifts all M channels to their respective carrier frequencies in parallel O(M log M) time.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It compresses the 64-kilobyte streaming binary buffers into Erlang refc heap pointers.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> The complex exponential kernel $e^{j 2\pi k m / M}$ of the IFFT is mathematically identical to a bank of $M$ discrete frequency mixers, shifting all $M$ polyphase branches to their distinct RF channels in a single pass.
+    </div>
+  </div>
+
+  <h2>Recommended Primary Source</h2>
+  <p>
+    For the mathematical derivation and block diagrams of polyphase channelizers:
+    <br>
+    <a href="https://wirelesspi.com/polyphase-channelizer/" target="_blank" rel="noopener"><strong>Wireless Pi: The Polyphase Filterbank Channelizer Explained</strong> by Dr. Qasim Chaudhari</a>.
+  </p>
+
+  <p>
+    Review our definitions of <em>Polyphase Filterbank</em>, <em>Noble Identities</em>, and <em>Decimation</em> in <a href="../GLOSSARY.md">GLOSSARY.md</a>.
+  </p>
+
+  <div class="footer">
+    <span>Questions on commutator delay lines, polyphase tap indexing, or spectral overlap? Ask your tutor agent!</span>
+    <span><a href="0007-symbol-timing-recovery-and-gardner-detector.html">&larr; Lesson 0007</a> | Lesson 0008</span>
+  </div>
+</body>
+</html>

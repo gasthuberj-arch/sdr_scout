@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 10: Live Codebase Tour — Inside SdrScout's Zigler SIMD &amp; GenStage</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0010</span>
+    <span class="badge badge-arch">Codebase Architecture</span>
+    <span>Reading time: 9 minutes</span>
+  </div>
+
+  <h1>Live Codebase Tour: Inside SdrScout's Zigler SIMD &amp; GenStage</h1>
+
+  <p>
+    While we explored signal theory, the builder agent constructed the complete implementation of <strong><code>SdrScout</code></strong> right here in this repository.
+  </p>
+
+  <p>
+    Let's examine how the theoretical concepts we discussed (tail buffers, SIMD magnitude, differential preambles, $O(1)$ syndromes, and backpressure) are implemented in production code.
+  </p>
+
+  <h2>1. The Native Core: Zigler NIF (<code>lib/sdr_scout/native/dsp.ex</code>)</h2>
+
+  <p>
+    Open <a href="file:///root/code/sdr_scout/lib/sdr_scout/native/dsp.ex"><code>lib/sdr_scout/native/dsp.ex</code></a>. Notice how Zigler embeds native Zig code directly inside an Elixir module via <code>~Z"""</code>.
+  </p>
+
+  <h3>A. The Persistent Tail Buffer Context (Lines 113–138)</h3>
+  <p>
+    Recall our discussion from Lesson 3 about the 0.73% boundary loss problem. Here is how Zig stores the trailing 480 bytes between GenStage chunks:
+  </p>
+
+  <pre><code>pub const DspData = struct {
+    overlap_buf: [480]u8,
+    overlap_len: usize,
+    samples_processed: u64,
+    preambles_detected: u64,
+    crc_valid: u64,
+    single_bit_recovered: u64,
+};
+
+pub const DspContext = beam.Resource(*DspData, @import("root"), .{});</code></pre>
+
+  <p>
+    By defining <code>DspContext</code> as a <code>beam.Resource</code>, the Erlang VM automatically manages its lifecycle, garbage collecting the native memory only when the Elixir process terminates.
+  </p>
+
+  <h3>B. SIMD Magnitude Vectorization (Lines 186–207)</h3>
+  <p>
+    Here is the exact 16-lane SIMD loop we studied in Lesson 2:
+  </p>
+
+  <pre><code>const simd_lanes = 16;
+while (s_idx &lt;= simd_limit) : (s_idx += simd_lanes) {
+    var i_vec: @Vector(simd_lanes, f32) = undefined;
+    var q_vec: @Vector(simd_lanes, f32) = undefined;
+
+    inline for (0..simd_lanes) |lane| {
+        const byte_pos = (s_idx + lane) * 2;
+        i_vec[lane] = @as(f32, @floatFromInt(iq_buf[byte_pos])) - 127.5;
+        q_vec[lane] = @as(f32, @floatFromInt(iq_buf[byte_pos + 1])) - 127.5;
+    }
+
+    const mag2 = i_vec * i_vec + q_vec * q_vec;
+    const mag = @sqrt(mag2);
+
+    inline for (0..simd_lanes) |lane| {
+        mag_buf[s_idx + lane] = mag[lane];
+    }
+}</code></pre>
+
+  <h3>C. $O(1)$ Syndrome Error Recovery (Lines 239–256)</h3>
+  <p>
+    When a frame fails CRC-24, notice how Zig looks up the 24-bit remainder against the precomputed table:
+  </p>
+
+  <pre><code>while (bit_pos &lt; 112) : (bit_pos += 1) {
+    if (SYNDROME_TABLE[bit_pos] == syndrome) {
+        // Found the exact corrupted bit: flip it in place!
+        candidate_frame[bit_pos / 8] ^= (@as(u8, 1) &lt;&lt; @intCast(7 - (bit_pos % 8)));
+        ctx.single_bit_recovered += 1;
+        frames[num_frames] = candidate_frame;
+        num_frames += 1;
+        recovered = true;
+        break;
+    }
+}</code></pre>
+
+  <h2>2. The Streaming Pipeline (<code>lib/sdr_scout/pipeline/</code>)</h2>
+
+  <p>
+    Open <a href="file:///root/code/sdr_scout/lib/sdr_scout/pipeline/detector_consumer.ex"><code>lib/sdr_scout/pipeline/detector_consumer.ex</code></a>.
+  </p>
+
+  <div class="callout upside">
+    <div class="callout-title">The Demand Contract</div>
+    <pre><code>def init(opts) do
+  ...
+  {:consumer, %{ctx: ctx, airspace: airspace},
+   subscribe_to: [{producer, max_demand: 4, min_demand: 1}]}
+end</code></pre>
+    <p>
+      Notice <code>max_demand: 4, min_demand: 1</code>! The consumer only asks for up to 4 chunks (256 KB) at a time. If Zig is busy processing, the producer pauses emission. Memory usage is strictly bounded—no unbounded queues, no OOM killer.
+    </p>
+  </div>
+
+  <h2>3. The Protocol Dissector (<code>lib/sdr_scout/mode_s/decoder.ex</code>)</h2>
+
+  <p>
+    Compare C bit-shifting against Elixir's bitstring syntax in <a href="file:///root/code/sdr_scout/lib/sdr_scout/mode_s/decoder.ex"><code>lib/sdr_scout/mode_s/decoder.ex</code></a>:
+  </p>
+
+  <pre><code>def decode(&lt;&lt;17::5, ca::3, icao::24, me::binary-size(7), pi::24&gt;&gt; = frame) do
+  ...
+end
+
+# Deconstructing Type Code 1..4 (Callsign):
+defp decode_identification(
+       &lt;&lt;cat::3, c1::6, c2::6, c3::6, c4::6, c5::6, c6::6, c7::6, c8::6&gt;&gt;,
+       base
+     )</code></pre>
+
+  <p>
+    In a single pattern match, Elixir extracts 6-bit characters, 24-bit ICAO identifiers, and 5-bit downlink formats directly from raw memory.
+  </p>
+
+  <h2>4. Empirical Benchmark on this System</h2>
+
+  <p>
+    We ran a 100-chunk benchmark (6.55 Megabytes of continuous I/Q baseband samples) using <code>SdrScout.Benchmark.run_nif(100)</code>:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Metric</th>
+        <th>Measured Result</th>
+        <th>Engineering Significance</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Total Samples</strong></td>
+        <td><strong>3,276,800 complex samples</strong></td>
+        <td>100 chunks of 64 KB (1.63 seconds of real-time air)</td>
+      </tr>
+      <tr>
+        <td><strong>Elapsed CPU Time</strong></td>
+        <td><strong>0.1191 seconds</strong></td>
+        <td>Processed 1.63s of radio data in 119 ms!</td>
+      </tr>
+      <tr>
+        <td><strong>Throughput</strong></td>
+        <td><strong>27.51 MSPS (55.01 MB/s)</strong></td>
+        <td>Far exceeds RTL-SDR hardware transfer rate (2.0 MSPS)</td>
+      </tr>
+      <tr>
+        <td><strong>Realtime Factor</strong></td>
+        <td><strong>13.8x Real-Time</strong></td>
+        <td>Consumes only <strong>~7.2% of a single CPU core</strong></td>
+      </tr>
+      <tr>
+        <td><strong>Chunk Execution Time</strong></td>
+        <td><strong>~1.19 ms per 64 KB chunk</strong></td>
+        <td>Safely conforms to the BEAM soft-realtime scheduler budget</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-10-1">
+    <div class="quiz-question">
+      1. Why is DspContext defined as a beam.Resource rather than an ordinary raw C memory pointer?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Raw C pointers cannot be dereferenced by SIMD vector instructions on modern x86 chips.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        BEAM resources track lifecycle and automatically free native memory when Elixir processes terminate.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Erlang GenStage requires all producer subscriptions to be serialized into JSON format strings.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The Zig compiler rejects functions that accept mutable pointers to struct array memory buffers.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> A `beam.Resource` ties the lifecycle of native C/Zig heap memory to an Erlang reference. When the holding Elixir process dies or the reference is garbage collected, the BEAM calls the resource destructor, preventing memory leaks.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-10-2">
+    <div class="quiz-question">
+      2. In DetectorConsumer, why does setting max_demand to 4 prevent out-of-memory (OOM) failures under heavy load?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        It restricts the radio hardware antenna to receiving signals from no more than four airplanes.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It forces the operating system kernel to limit physical DRAM memory allocation to four megabytes.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The consumer only requests four chunks at a time, preventing upstream producers from filling queues.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Setting demand above four causes the Zig SIMD vector loop to trigger division by zero faults.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> In GenStage's pull model, the upstream producer cannot emit chunks until the consumer explicitly requests them. Restricting demand to 4 chunks ensures there are never more than 256 KB of in-flight buffers, making buffer bloat and OOM crashes impossible.
+    </div>
+  </div>
+
+  <h2>Recommended Primary Source</h2>
+  <p>
+    To understand the Erlang/Elixir NIF Resource model in depth:
+    <br>
+    <a href="https://www.erlang.org/doc/system/erl_nif.html#enif_alloc_resource" target="_blank" rel="noopener"><strong>Erlang Documentation: Resource Objects in Native Implemented Functions</strong></a>.
+  </p>
+
+  <p>
+    Review our canonical definitions in <a href="../GLOSSARY.md">GLOSSARY.md</a> and reference matrices in <a href="../reference/sdr-architecture-comparison.html">SDR Architecture Comparison</a>.
+  </p>
+
+  <div class="footer">
+    <span>Questions on Zigler NIFs, SIMD intrinsics, or GenStage pipelines? Ask your tutor agent!</span>
+    <span><a href="0009-dsp-and-sdr-in-devsecops-and-cybersecurity.html">&larr; Lesson 0009</a> | Lesson 0010</span>
+  </div>
+</body>
+</html>

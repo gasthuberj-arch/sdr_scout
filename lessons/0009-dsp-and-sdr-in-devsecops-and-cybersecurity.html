@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 9: From Radio Waves to Cloud Security — SDR &amp; DSP in DevSecOps</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0009</span>
+    <span class="badge badge-arch">DevSecOps &amp; Cloud Security</span>
+    <span>Reading time: 9 minutes</span>
+  </div>
+
+  <h1>From Radio Waves to Cloud Security: SDR &amp; DSP in DevSecOps</h1>
+
+  <p>
+    When working in DevSecOps, cloud architecture, and security, it is easy to assume that digital signal processing belongs solely to electrical engineers and ham radio hobbyists.
+  </p>
+
+  <p>
+    In reality, <strong>the mathematical principles of DSP and the streaming systems architectures of SDRs directly govern modern cloud security, threat hunting, and infrastructure resilience</strong>.
+  </p>
+
+  <h2>1. Physical Infrastructure Attacks: The GPS / PTP Time Synchronization Vulnerability</h2>
+
+  <p>
+    Modern cloud architectures rely heavily on microsecond-accurate time:
+  </p>
+  <ul>
+    <li><strong>Distributed Database Consensus:</strong> Google Spanner's <em>TrueTime</em> API, CockroachDB, and Cassandra rely on bounded clock uncertainty ($\epsilon$) to ensure serializable transaction ordering without locking.</li>
+    <li><strong>Security &amp; Authentication:</strong> Kerberos tickets, TLS certificate validity windows, TOTP tokens, and security log audit trails depend on trustworthy timestamps.</li>
+  </ul>
+
+  <div class="callout warning">
+    <div class="callout-title">The RF Threat Vector</div>
+    <p>
+      Data centers synchronize their Stratum-1 Network Time Protocol (NTP) and Precision Time Protocol (PTP) grandmaster clocks using GPS/GNSS antennas mounted on facility roofs.
+    </p>
+    <p>
+      GPS signals from orbit arrive at the ground at an infinitesimal power level of <strong>$-130\text{ dBm}$ (10 attowatts)</strong>—far below background thermal noise!
+    </p>
+    <p>
+      With an inexpensive SDR (like a HackRF) and open-source software (<code>gps-sdr-sim</code>), an attacker can easily broadcast synthetic GPS RF signals at $-80\text{ dBm}$, completely overpowering authentic satellites.
+    </p>
+    <p>
+      <strong>The Impact:</strong> By subtly skewing time backward or forward, attackers can:
+    </p>
+    <ul>
+      <li>Force distributed databases into split-brain state or transaction abort loops.</li>
+      <li>Bypass expired TLS certificates or replay authentication tokens.</li>
+      <li>Corrupt the cryptographic chronological sequencing of SIEM audit logs.</li>
+    </ul>
+  </div>
+
+  <h2>2. Threat Hunting with DSP: Detecting C2 Beaconing via FFT</h2>
+
+  <p>
+    Modern malware (e.g., Cobalt Strike, Mythic, Sliver) maintains persistence by periodically "beaconing" home to a Command and Control (C2) server.
+  </p>
+  <p>
+    To evade naive firewall threshold rules, malware authors inject "jitter":
+  </p>
+  $$\text{Sleep Time} = T_{\text{base}} \pm 20\% \text{ random noise}$$
+
+  <p>
+    In raw proxy, DNS, or VPC flow logs with millions of legitimate microservice requests, this low-and-slow beaconing looks like random noise in the time domain.
+  </p>
+
+  <div class="callout upside">
+    <div class="callout-title">The DSP Solution: Spectral Analysis &amp; Autocorrelation</div>
+    <p>
+      Instead of writing fragile regexes or threshold rules, security data engineers treat request timestamps as a discrete time-series impulse train:
+    </p>
+    $$x[n] = \sum_{k} \delta[n - t_k]$$
+
+    <p>
+      Now apply the exact same mathematical tools we used for radio signals:
+    </p>
+    <ol>
+      <li><strong>The Discrete Fourier Transform (FFT):</strong> While legitimate human and microservice traffic distributes energy across broad diurnal curves and random frequencies, <strong>even heavily jittered periodic C2 beacons concentrate their energy into a sharp, undeniable spectral peak</strong>!</li>
+      <li><strong>Autocorrelation ($\mathbf{x} \cdot \mathbf{x}_{\text{lag}}$):</strong> By computing the sliding dot product of the log sequence against itself, random network traffic cancels out to near zero, while the periodic beacon produces a massive correlation spike at the exact repetition interval $\tau = T_{\text{base}}$.</li>
+    </ol>
+  </div>
+
+  <h2>3. High-Throughput Security Pipelines: Why SDR Architecture Mirrors DevSecOps</h2>
+
+  <p>
+    Consider what a modern DevSecOps logging pipeline does:
+  </p>
+  <ul>
+    <li>eBPF kernel probes (Cilium, Falco, Datadog) capture millions of system calls per second.</li>
+    <li>Log forwarders (Vector, Fluent Bit) ingest gigabytes of raw JSON/binary logs per second.</li>
+    <li>Security Information and Event Management (SIEM) engines ingest the firehose into ClickHouse, Kafka, or Elasticsearch.</li>
+  </ul>
+
+  <h3>The Three Architectural Traps (And Their SDR Solutions)</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Failure Mode in DevSecOps</th>
+        <th>Root Cause</th>
+        <th>The SDR Pipeline Fix (from SdrScout)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Logging agent killed by Linux OOM-killer</strong> during security incidents</td>
+        <td>Unbounded push queues buffer millions of events when network or indexing slows down.</td>
+        <td><strong>Demand-driven pull backpressure (GenStage):</strong> Downstream consumers explicitly request $N$ batches; upstream throttles gracefully instead of accumulating RAM.</td>
+      </tr>
+      <tr>
+        <td><strong>Kafka consumer rebalance storms</strong> and dropped network packets</td>
+        <td>Long garbage collection (GC) pauses in logging daemons trigger health check timeouts.</td>
+        <td><strong>Zero-copy ref-counted binaries:</strong> Allocating large buffers outside process heaps prevents GC scan overhead and eliminates pointer churn.</td>
+      </tr>
+      <tr>
+        <td><strong>Kernel probe dropped events</strong> in eBPF / Falco</td>
+        <td>Parsing routines in user space exceed budget, overflowing kernel ring buffers.</td>
+        <td><strong>SIMD native kernels &amp; the 1ms rule:</strong> High-throughput parsing (SIMD in Zig/Rust) must run in bounded sub-millisecond slices to avoid thread starvation.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-9-1">
+    <div class="quiz-question">
+      1. How does applying an FFT (Fourier Transform) help threat hunters detect stealthy C2 malware beaconing in noisy proxy logs?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        It automatically decrypts the underlying AES ciphertext payload using hardware vector registers.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It blocks outgoing HTTP requests by injecting artificial carrier frequency offsets into DNS queries.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        It concentrates recurring periodic request energy into distinct spectral peaks above random background noise.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        It translates JSON log strings into 16-sample Mode-S preambles for zero-copy transmission.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> Random background web traffic distributes energy broadly across the frequency domain. Even with randomized jitter, periodic beaconing signals constructively add in the Fourier domain, producing sharp peaks that highlight the underlying beacon period.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-9-2">
+    <div class="quiz-question">
+      2. Why are cloud data center distributed databases (like Google Spanner or CockroachDB) vulnerable to RF GPS spoofing attacks?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        GPS satellites host the central Raft consensus leader nodes that execute all cloud database queries.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Serial transaction ordering and consensus rely on bounded clock uncertainty from rooftop Stratum-1 GNSS receivers.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        SDR transmitters generate high-power electromagnetic pulses that physically short-circuit database hard drive platters.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Database TLS handshakes fail whenever the underlying operating system kernel executes polyphase filterbanks.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> Distributed databases use bounded clock uncertainty ($\epsilon$) provided by Stratum-1 GPS grandmasters to commit serializable transactions without distributed lock contention. Spoofing the unencrypted GPS signal skews node time, leading to split-brains, transaction aborts, or integrity corruption.
+    </div>
+  </div>
+
+  <h2>Recommended Primary Source</h2>
+  <p>
+    For research on detecting C2 beacons via periodicity and spectral analysis:
+    <br>
+    <a href="https://www.sans.org/white-papers/37920/" target="_blank" rel="noopener"><strong>SANS Institute: Detecting Command and Control Traffic via Periodic Analysis</strong></a>.
+  </p>
+
+  <p>
+    For RF GPS time security in cloud infrastructure:
+    <br>
+    <a href="https://www.cisa.gov/resources-tools/resources/time-guidance-critical-infrastructure" target="_blank" rel="noopener"><strong>CISA Guidance: Resilient Positioning, Navigation, and Timing (PNT) for Infrastructure</strong></a>.
+  </p>
+
+  <div class="footer">
+    <span>Questions on eBPF ring buffers, time attacks, or spectral threat hunting? Ask your tutor agent!</span>
+    <span><a href="0008-polyphase-filterbanks-and-channelization.html">&larr; Lesson 0008</a> | Lesson 0009</span>
+  </div>
+</body>
+</html>

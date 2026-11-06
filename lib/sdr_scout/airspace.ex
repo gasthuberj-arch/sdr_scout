@@ -7,7 +7,7 @@ defmodule SdrScout.Airspace do
   - Broadcasts updates and evictions via local `Registry` and distributed `:pg`
   """
   use GenServer
-  alias SdrScout.ModeS.Decoder
+  alias SdrScout.ModeS
   alias SdrScout.Aircraft
 
   @pubsub_registry SdrScout.Airspace.PubSub
@@ -67,7 +67,7 @@ defmodule SdrScout.Airspace do
 
   @impl true
   def handle_cast({:process_frame, frame}, state) do
-    case Decoder.decode(frame) do
+    case ModeS.decode(frame) do
       {:ok, decoded} ->
         now = System.monotonic_time(:millisecond)
         icao = decoded.icao

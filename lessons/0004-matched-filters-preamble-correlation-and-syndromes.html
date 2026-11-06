@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 4: Matched Filters, Preamble Correlation, and GF(2) Syndromes</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+  <script>
+    MathJax = {
+      tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] }
+    };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0004</span>
+    <span class="badge badge-arch">DSP &amp; Algebraic Coding</span>
+    <span>Reading time: 9 minutes</span>
+  </div>
+
+  <h1>Matched Filters, Preamble Correlation, and GF(2) Syndromes</h1>
+
+  <p>
+    Once baseband I/Q samples are converted to instantaneous magnitude values in our SIMD registers, the receiver enters the signal detection phase.
+  </p>
+
+  <p>
+    In this lesson, we examine two elegant mathematical frameworks powering high-performance SDR receivers:
+  </p>
+  <ol>
+    <li><strong>The Matched Filter Theorem:</strong> Proving why time-reversed correlation is the mathematically optimal linear operator for maximizing signal-to-noise ratio in AWGN channels.</li>
+    <li><strong>Algebraic Error Recovery over $\text{GF}(2)$:</strong> How linear block codes and syndrome vectors permit single-bit error repair in deterministic $O(1)$ native time.</li>
+  </ol>
+
+  <h2>1. Deriving the Matched Filter Theorem</h2>
+
+  <p>
+    Suppose an incoming discrete signal $r(t) = s(t) + n(t)$ enters a linear time-invariant (LTI) filter with impulse response $h(t)$ and frequency response $H(f)$. The channel noise $n(t)$ is zero-mean Additive White Gaussian Noise (AWGN) with two-sided power spectral density:
+  </p>
+  $$S_n(f) = \frac{N_0}{2}$$
+
+  <p>
+    The filtered output signal at sampling instant $t_0$ is:
+  </p>
+  $$s_o(t_0) = \int_{-\infty}^{\infty} H(f) S(f) e^{j 2\pi f t_0} df$$
+
+  <p>
+    The output noise power (variance $\sigma_o^2$) is the integral of the noise spectral density passed through the filter:
+  </p>
+  $$\sigma_o^2 = \int_{-\infty}^{\infty} S_n(f) |H(f)|^2 df = \frac{N_0}{2} \int_{-\infty}^{\infty} |H(f)|^2 df$$
+
+  <p>
+    We define the peak output signal-to-noise ratio as:
+  </p>
+  $$\text{SNR}_{\text{out}} = \frac{|s_o(t_0)|^2}{\sigma_o^2} = \frac{\left| \int_{-\infty}^{\infty} H(f) S(f) e^{j 2\pi f t_0} df \right|^2}{\frac{N_0}{2} \int_{-\infty}^{\infty} |H(f)|^2 df}$$
+
+  <h3>Applying the Cauchy-Schwarz Inequality</h3>
+  <p>
+    The continuous Cauchy-Schwarz inequality for $L^2$ complex functions states:
+  </p>
+  $$\left| \int_{-\infty}^{\infty} A(f) B(f) df \right|^2 \le \int_{-\infty}^{\infty} |A(f)|^2 df \int_{-\infty}^{\infty} |B(f)|^2 df$$
+  <p>
+    with equality if and only if $A(f) = k B^*(f)$ for some arbitrary scalar $k \in \mathbb{C}$.
+  </p>
+
+  <p>
+    Let $A(f) = H(f)$ and $B(f) = S(f) e^{j 2\pi f t_0}$. Substituting into our SNR numerator:
+  </p>
+  $$\left| \int_{-\infty}^{\infty} H(f) \left( S(f) e^{j 2\pi f t_0} \right) df \right|^2 \le \int_{-\infty}^{\infty} |H(f)|^2 df \int_{-\infty}^{\infty} |S(f)|^2 df$$
+
+  <p>
+    Notice how $\int_{-\infty}^{\infty} |H(f)|^2 df$ cancels directly out of the numerator and denominator:
+  </p>
+  $$\text{SNR}_{\text{out}} \le \frac{\int_{-\infty}^{\infty} |H(f)|^2 df \int_{-\infty}^{\infty} |S(f)|^2 df}{\frac{N_0}{2} \int_{-\infty}^{\infty} |H(f)|^2 df} = \frac{\int_{-\infty}^{\infty} |S(f)|^2 df}{\frac{N_0}{2}} = \frac{2E_s}{N_0}$$
+  <p>
+    where $E_s = \int |S(f)|^2 df$ is total signal energy.
+  </p>
+
+  <div class="callout upside">
+    <div class="callout-title">The Fundamental Optimal Condition</div>
+    <p>
+      The maximum theoretical SNR ($2E_s / N_0$) is attained if and only if equality holds:
+    </p>
+    $$H(f) = k S^*(f) e^{-j 2\pi f t_0}$$
+    <p>
+      Taking the inverse Fourier transform back into the time domain:
+    </p>
+    $$h(t) = k s^*(t_0 - t)$$
+    <p>
+      <strong>The impulse response of the optimal filter is the time-reversed, complex-conjugated replica of the transmitted signal.</strong> Filtering through $h(t)$ is mathematically identical to computing the cross-correlation between the received signal and the known template!
+    </p>
+  </div>
+
+  <h2>2. Discrete Preamble Correlation in SdrScout</h2>
+
+  <p>
+    At 2.0 MSPS, the 8 µs Mode-S preamble spans 16 discrete samples:
+  </p>
+  <pre><code>Index:   0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
+Pulse:  [1,  0,  1,  0,  0,  0,  0,  1,  0,  1,  0,  0,  0,  0,  0,  0]</code></pre>
+
+  <p>
+    We define two index sets:
+  </p>
+  <ul>
+    <li>$\mathcal{P} = \{0, 2, 7, 9\}$ (4 high-energy pulse chips)</li>
+    <li>$\mathcal{Q} = \{1, 3, 4, 5, 6, 8, 10, 11, 12, 13, 14, 15\}$ (12 quiet interval chips)</li>
+  </ul>
+
+  <h3>Why Difference Beats Division in SIMD Kernels</h3>
+  <p>
+    One could test for a preamble using an energy ratio:
+    $R_{\text{ratio}} = \frac{\sum_{p \in \mathcal{P}} M[n+p]}{\sum_{q \in \mathcal{Q}} M[n+q]}$.
+  </p>
+  <p>
+    However, on modern x86/ARM processors, floating-point vector division (<code>_mm256_div_ps</code> / <code>vdivq_f32</code>) carries an instruction latency of 12–30 clock cycles and does not fully pipeline. Vector additions and subtractions carry a throughput of <strong>0.5 to 1 cycle</strong>!
+  </p>
+  <p>
+    Therefore, the Zig DSP kernel implements a differential matched filter:
+  </p>
+  $$C[n] = \sum_{p \in \mathcal{P}} M[n+p] - \frac{4}{12} \sum_{q \in \mathcal{Q}} M[n+q] > \gamma_{\text{threshold}}$$
+  <p>
+    By scaling the quiet sum by $4/12 = 1/3$, the expected value of $C[n]$ over pure uncorrelated white noise is precisely zero:
+  </p>
+  $$\mathbb{E}[C_{\text{noise}}] = 4\mu_{\text{noise}} - \frac{4}{12}(12\mu_{\text{noise}}) = 0$$
+
+  <h2>3. Algebraic Error Recovery over GF(2): The Syndrome Vector</h2>
+
+  <p>
+    A Mode-S frame consists of 112 bits: 88 bits of payload and 24 bits of cyclic redundancy check (CRC-24). In polynomial representation over the Galois Field $\text{GF}(2)$, the transmitted codeword $c(x)$ satisfies:
+  </p>
+  $$c(x) \equiv 0 \pmod{g(x)}$$
+  <p>
+    where $g(x) = x^{24} + x^{23} + x^{22} + \dots + x + 1$ is the generator polynomial.
+  </p>
+
+  <h3>Single-Bit Errors and Polynomial Division</h3>
+  <p>
+    Suppose additive noise inverts a single bit at index $k \in [0, 111]$. The received word polynomial is:
+  </p>
+  $$r(x) = c(x) \oplus x^k$$
+
+  <p>
+    When the receiver computes the CRC remainder (the <strong>syndrome</strong> $S(x)$):
+  </p>
+  $$S(x) = r(x) \bmod g(x) = (c(x) \oplus x^k) \bmod g(x)$$
+  <p>
+    Because $c(x) \bmod g(x) = 0$, by linearity over $\text{GF}(2)$:
+  </p>
+  $$S(x) = (0 \oplus x^k) \bmod g(x) = x^k \bmod g(x)$$
+
+  <div class="callout upside">
+    <div class="callout-title">The O(1) Syndrome Recovery Trick</div>
+    <p>
+      Notice the astounding result: <strong>The syndrome $S(x)$ is completely independent of the message contents $c(x)$!</strong> It depends solely on the error position $k$.
+    </p>
+    <p>
+      Since the degree of $x^k \bmod g(x)$ produces a unique 24-bit remainder for each $k \in [0, 111]$, Zig precomputes a static 112-element table:
+    </p>
+    <pre><code>syndrome_lookup: [112]u24 = compute_syndromes(g);</code></pre>
+    <p>
+      When a frame fails CRC, the receiver matches the resulting remainder against this table. If a match is found at index $k$, <strong>bit $k$ was flipped by noise</strong>. We toggle bit $k$ back to its correct state with zero packet retransmission!
+    </p>
+  </div>
+
+  <h2>Checking Your Mastery</h2>
+
+  <div class="quiz-container" id="quiz-4-1">
+    <div class="quiz-question">
+      1. Under the Cauchy-Schwarz derivation, what property of the channel makes the matched filter optimal for SNR?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        The transmitted radio signal maintains constant phase throughout the entire duration of the packet.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        The noise spectral density is constant (white) and uncorrelated across the signal's bandwidth.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The hardware sampling frequency is at least four times higher than the Nyquist limit.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The modulation scheme relies on non-coherent pulse amplitude rather than continuous phase shift.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> The derivation relies directly on noise spectral density $S_n(f)$ being flat ($N_0 / 2$), which allows the noise integral $\int |H(f)|^2 df$ to cancel out in the Cauchy-Schwarz inequality. If noise is colored (non-white), a pre-whitening filter must precede the matched filter.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-4-2">
+    <div class="quiz-question">
+      2. Why does the GF(2) syndrome remainder S(x) allow deterministic single-bit error repair without knowing the original message?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Erlang refc binaries isolate corrupt memory bits into separate sixty-four byte heap segments.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        The generator polynomial suppresses all odd harmonics generated by phase-locked loop tracking errors.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Linearity ensures the original codeword divides out to zero, leaving only the error monomial.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Single-bit errors always shift the carrier baseband frequency by an integer multiple of pi.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> By linearity over $\text{GF}(2)$, $(c(x) \oplus x^k) \bmod g(x) = (c(x) \bmod g(x)) \oplus (x^k \bmod g(x)) = 0 \oplus (x^k \bmod g(x))$. The payload completely disappears from the remainder, leaving a deterministic 1:1 mapping between error position $k$ and the 24-bit syndrome.
+    </div>
+  </div>
+
+  <h2>Recommended Primary Source</h2>
+  <p>
+    For the formal proof and generalizations of matched filters to colored noise and digital communication bounds:
+    <br>
+    <a href="https://pysdr.org/content/pulse_shaping.html" target="_blank" rel="noopener"><strong>PySDR: Pulse Shaping &amp; Matched Filters</strong> by Dr. Marc Lichtman</a>.
+  </p>
+
+  <p>
+    Also explore <a href="../GLOSSARY.md">GLOSSARY.md</a> for canonical definitions of <em>Matched Filter</em>, <em>CFAR</em>, and <em>Syndrome Vector</em>.
+  </p>
+
+  <div class="footer">
+    <span>Questions on Cauchy-Schwarz bounds or GF(2) polynomial division? Ask your tutor agent!</span>
+    <span><a href="0003-streaming-dsp-boundaries-and-frequency-offsets.html">&larr; Lesson 0003</a> | Lesson 0004</span>
+  </div>
+</body>
+</html>

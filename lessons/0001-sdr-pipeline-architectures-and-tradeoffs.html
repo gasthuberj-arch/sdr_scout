@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lesson 1: SDR Pipeline Architectures &amp; Trade-offs</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <script src="../assets/quiz.js" defer></script>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Lesson 0001</span>
+    <span class="badge badge-arch">Architecture &amp; DSP</span>
+    <span>Reading time: 5 minutes</span>
+  </div>
+
+  <h1>SDR Pipeline Architectures: Why Combine Elixir and Zig?</h1>
+
+  <p>
+    Welcome to your first lesson! Whether you are tracking amateur satellites, decoding APRS weather packets on 2 meters (144.390 MHz), logging FT8 contacts on 20 meters, or tracking 1090 MHz aircraft beacons, every Software Defined Radio (SDR) receiver solves the same physical problem:
+  </p>
+
+  <blockquote>
+    How do you transform a blazing stream of digitized electromagnetic waves (megabytes of raw I/Q numbers every second) into verified, structured digital packets without dropping samples or melting the CPU?
+  </blockquote>
+
+  <p>
+    In this repo, the codebase pairs <strong>Zig</strong> (via <a href="https://github.com/e-flat/zigler">Zigler</a> NIFs) with <strong>Elixir</strong>. Let's dissect the profound strengths and dangerous traps of this architecture for radio enthusiasts.
+  </p>
+
+  <h2>The Anatomy of a Radio Reception Pipeline</h2>
+  <p>
+    An SDR receiver can be cleanly divided into three distinct processing tiers:
+  </p>
+
+  <ol>
+    <li>
+      <strong>Micro-DSP (Heavy Math):</strong> Unsigned 8-bit or 16-bit In-Phase/Quadrature (I/Q) baseband samples arrive at millions of samples per second (2.0 MSPS in RTL-SDR = 4 MB/s continuous stream). Here, we calculate vector magnitude ($\sqrt{I^2 + Q^2}$), run matched filters, correlate preambles, and slice bits.
+    </li>
+    <li>
+      <strong>Frame Dissection (Grammar):</strong> Once bits are identified, they form packet frames. We compute cyclic redundancy checks (CRC-24 / CRC-16), unpack callsigns, extract coordinates, and correct bit errors.
+    </li>
+    <li>
+      <strong>Macro-State &amp; Distribution (Orchestration):</strong> Managing active stations, evicting stale signals, publishing to networks (APRS-IS, local mesh, or web UI), and handling I/O backpressure.
+    </li>
+  </ol>
+
+  <h2>The Upsides of the Elixir + Zig Architecture</h2>
+
+  <div class="callout upside">
+    <div class="callout-title">1. Zero-Copy Binary Architecture</div>
+    <p>
+      In Erlang/Elixir, binaries larger than 64 bytes are allocated on a global ref-counted heap. When Elixir passes a 64 KB chunk of radio I/Q bytes into a Zig NIF, <em>zero memory copying occurs</em>. Zig receives a direct pointer to the BEAM's memory buffer, applies SIMD vector math, and returns without memory allocations.
+    </p>
+  </div>
+
+  <div class="callout upside">
+    <div class="callout-title">2. Natural Backpressure via GenStage</div>
+    <p>
+      In traditional C or Python radio scripts (like bare <code>rtl_fm</code> pipes), if the decoder falls behind, OS buffers fill up, samples silently drop, and packet phase locks fail. In Elixir, <code>GenStage</code> uses <strong>demand-driven flow control</strong>: downstream consumers ask for batches only when they are ready. If the CPU experiences load, the pipeline sheds load gracefully rather than blowing up memory.
+    </p>
+  </div>
+
+  <div class="callout upside">
+    <div class="callout-title">3. Bitstring Pattern Matching for Protocols</div>
+    <p>
+      In C, decoding an amateur radio packet (such as AX.25 or Mode-S) requires tedious bit-shifting and bit-masking logic that is notoriously prone to off-by-one bugs. Elixir's binary syntax lets you extract fields declaratively:
+    </p>
+    <pre><code>&lt;&lt;df::5, ca::3, icao::24, payload::binary-size(7), parity::24&gt;&gt; = frame</code></pre>
+  </div>
+
+  <div class="callout upside">
+    <div class="callout-title">4. Cluster-Ready Radio Networks</div>
+    <p>
+      HAM radio excels at distributed receivers: two antennas 10 miles apart can hear what one misses. Because Elixir runs on the BEAM, broadcasting decoded packets across a distributed mesh or cluster of Raspberry Pis requires almost zero extra networking infrastructure—using built-in <code>:pg</code> (process groups) or <code>Phoenix.PubSub</code>.
+    </p>
+  </div>
+
+  <h2>The Shortcomings &amp; Traps</h2>
+
+  <div class="callout warning">
+    <div class="callout-title">Trap 1: The 1-Millisecond NIF Rule</div>
+    <p>
+      The Erlang VM relies on cooperative, preemptive scheduling. Erlang schedulers expect functions to yield every millisecond. <strong>If a Zig NIF runs longer than 1 millisecond without yielding</strong> (e.g., trying to process a huge 10 MB audio buffer in one tight loop), it blocks the scheduler thread, stalls heartbeat timers, and causes cluster network timeouts!
+    </p>
+    <p>
+      <em>The Fix:</em> Chunk data into bounded slices (such as 64 KB chunks, which take ~32 ms of real radio time at 2 MSPS, but execute in Zig SIMD in under 0.15 ms), or mark long tasks as dirty schedulers.
+    </p>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">Trap 2: Context Switch Overhead</div>
+    <p>
+      Calling across the NIF boundary has a small invocation cost. If you call Zig on every 10 samples, context-switch overhead will devour your CPU. The chunk size must balance latency against boundary overhead.
+    </p>
+  </div>
+
+  <div class="callout warning">
+    <div class="callout-title">Trap 3: Not Suited for Hard Real-Time TX Modulation</div>
+    <p>
+      This architecture is brilliant for <em>receivers</em> (RX) and packet decoders. However, for strict half-duplex transmit (TX) switching—such as hitting precise 30 ms TDMA time-slots in digital mobile radio (DMR)—BEAM garbage collection pauses and OS scheduling jitter make pure microcontroller firmware (C/Zig on bare metal) a better choice.
+    </p>
+  </div>
+
+  <h2>Checking Your Intuition</h2>
+
+  <div class="quiz-container" id="quiz-1">
+    <div class="quiz-question">
+      1. Why is a 64 KB chunk size safer for an SDR Zig NIF than a 10 MB chunk?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Zig cannot compile functions that process memory buffers exceeding one megabyte.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Executing long NIF loops stalls BEAM scheduler threads and harms soft realtime.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Elixir binary pattern matching crashes whenever binaries exceed sixty-four kilobytes.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Radio tuners like RTL-SDR will physically overheat when transferring large chunks.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> Erlang schedulers need threads to yield within ~1 millisecond. Processing smaller 64 KB chunks keeps Zig execution times far under 0.2 ms, ensuring the BEAM schedulers remain responsive and healthy.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-2">
+    <div class="quiz-question">
+      2. Where does this hybrid architecture deliver the highest operational benefit in HAM radio?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">
+        Synthesizing high-precision nanosecond RF carrier pulses for UHF transmitters.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Generating multi-gigahertz radar sweep waveforms on bare microcontroller chips.
+      </li>
+      <li class="quiz-option" data-correct="true">
+        Building distributed receiver networks that decode and deduplicate packet bursts.
+      </li>
+      <li class="quiz-option" data-correct="false">
+        Emulating physical analog inductors and quartz crystal filters inside software.
+      </li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> The combination of fast native DSP (Zig) and painless distributed messaging/supervision (BEAM) makes it unbeatable for multi-receiver digipeaters (like APRS or FT8 monitors) that pass packets across nodes.
+    </div>
+  </div>
+
+  <h2>Recommended Primary Source</h2>
+  <p>
+    To build deep physical intuition for I/Q signals and SDR pipelines, read:
+    <br>
+    <a href="https://pysdr.org/content/sampling.html" target="_blank" rel="noopener"><strong>PySDR: Chapter on I/Q Sampling &amp; Complex Baseband</strong> by Dr. Marc Lichtman</a>.
+    It visually shows how antennas turn real radio waves into two 90-degree offset number streams.
+  </p>
+
+  <p>
+    Also see our <a href="../reference/sdr-architecture-comparison.html">SDR Architecture Comparison Reference Sheet</a> for side-by-side matrices against GNU Radio and pure C.
+  </p>
+
+  <div class="footer">
+    <span>Have questions about I/Q samples, sample rates, or NIF safety? Ask your tutor agent!</span>
+    <span>Lesson 0001 complete</span>
+  </div>
+</body>
+</html>

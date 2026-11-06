@@ -150,7 +150,7 @@ defmodule SdrScout.APRS do
   """
   def decode_frame(raw) when byte_size(raw) >= 16 do
     body_len = byte_size(raw) - 2
-    <<body::binary-size(body_len), rx_fcs::little-16>> = raw
+    <<body::binary-size(^body_len), rx_fcs::little-16>> = raw
 
     expected_fcs = compute_fcs(body)
 

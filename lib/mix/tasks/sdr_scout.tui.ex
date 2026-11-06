@@ -39,28 +39,24 @@ defmodule Mix.Tasks.SdrScout.Tui do
         pid
       end
 
-    # Trap interrupts for graceful teardown
-    System.trap_signal(:sigint, fn ->
+    try do
+      listen_keyboard_loop()
+    after
       cleanup(feeder_pid)
-      exit(:normal)
-    end)
-
-    listen_keyboard_loop(feeder_pid)
+    end
   end
 
-  defp listen_keyboard_loop(feeder_pid) do
+  defp listen_keyboard_loop do
     case IO.getn("", 1) do
       "q" ->
-        cleanup(feeder_pid)
         :ok
 
       "Q" ->
-        cleanup(feeder_pid)
         :ok
 
       " " ->
         TUI.toggle_pause()
-        listen_keyboard_loop(feeder_pid)
+        listen_keyboard_loop()
 
       "c" ->
         if GenServer.whereis(SdrScout.Airspace) do
@@ -70,10 +66,10 @@ defmodule Mix.Tasks.SdrScout.Tui do
           )
         end
 
-        listen_keyboard_loop(feeder_pid)
+        listen_keyboard_loop()
 
       _other ->
-        listen_keyboard_loop(feeder_pid)
+        listen_keyboard_loop()
     end
   end
 

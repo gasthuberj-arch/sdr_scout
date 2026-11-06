@@ -9,9 +9,19 @@ defmodule SdrScout.Benchmark do
 
   @doc """
   Runs an unthrottled raw Zig SIMD NIF benchmark across `num_chunks` (default: 50).
+  Pre-generates a pool of realistic chunks to prevent Elixir heap bloat during high-iteration benchmarks.
   """
   def run_nif(num_chunks \\ 50) do
-    chunks = Scenario.generate_stream(num_chunks: num_chunks)
+    base_count = min(num_chunks, 50)
+    base_chunks = Scenario.generate_stream(num_chunks: base_count)
+
+    chunks =
+      if num_chunks > base_count do
+        Stream.cycle(base_chunks) |> Enum.take(num_chunks)
+      else
+        base_chunks
+      end
+
     total_samples = num_chunks * 32_768
     total_bytes = num_chunks * 65_536
 
@@ -45,7 +55,16 @@ defmodule SdrScout.Benchmark do
   Runs an end-to-end GenStage pipeline benchmark.
   """
   def run_pipeline(num_chunks \\ 50) do
-    chunks = Scenario.generate_stream(num_chunks: num_chunks)
+    base_count = min(num_chunks, 50)
+    base_chunks = Scenario.generate_stream(num_chunks: base_count)
+
+    chunks =
+      if num_chunks > base_count do
+        Stream.cycle(base_chunks) |> Enum.take(num_chunks)
+      else
+        base_chunks
+      end
+
     total_samples = num_chunks * 32_768
 
     test_pid = self()

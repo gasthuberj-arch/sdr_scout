@@ -250,40 +250,50 @@ const mag_vec = @sqrt(mag_sq);</code></pre>
     </tbody>
   </table>
 
-  <div class="quiz-container" data-quiz-id="zigler-sdr-quiz">
-    <h3>Check Your Understanding</h3>
+  <h2>Checking Your Mastery</h2>
 
-    <div class="quiz-question" data-question="1">
-      <p><strong>1. Why is passing a 64 KB SDR chunk from Elixir to Zigler zero-copy?</strong></p>
-      <div class="quiz-options">
-        <button class="quiz-option" data-correct="false">Elixir serializes the binary using Erlang external term format.</button>
-        <button class="quiz-option" data-correct="false">Zigler allocates an internal C array and clones the memory.</button>
-        <button class="quiz-option" data-correct="true">Binaries over 64 bytes are refc and passed as raw pointers.</button>
-        <button class="quiz-option" data-correct="false">The Linux kernel transparently re-maps the pages via double mmap.</button>
-      </div>
-      <div class="quiz-feedback"></div>
+  <div class="quiz-container" id="quiz-13-1">
+    <div class="quiz-question">
+      1. Why is passing a 64 KB SDR chunk from Elixir to Zigler zero-copy?
     </div>
-
-    <div class="quiz-question" data-question="2">
-      <p><strong>2. What happens to the native <code>DspContext</code> memory if the Elixir consumer process crashes?</strong></p>
-      <div class="quiz-options">
-        <button class="quiz-option" data-correct="false">It causes an operating system memory leak until the VM restarts.</button>
-        <button class="quiz-option" data-correct="true">The BEAM GC automatically invokes the resource object destructor.</button>
-        <button class="quiz-option" data-correct="false">It triggers an immediate segfault and halts the Erlang node.</button>
-        <button class="quiz-option" data-correct="false">The OS kernel reclaims it only when the entire machine reboots.</button>
-      </div>
-      <div class="quiz-feedback"></div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">Elixir serializes the binary using Erlang external term format.</li>
+      <li class="quiz-option" data-correct="false">Zigler allocates an internal C array and clones the memory.</li>
+      <li class="quiz-option" data-correct="true">Binaries over 64 bytes are refc and passed as raw pointers.</li>
+      <li class="quiz-option" data-correct="false">The Linux kernel transparently re-maps the pages via double mmap.</li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> The BEAM stores any binary strictly larger than 64 bytes as a reference-counted (refc) binary in shared off-heap memory. When passed into a NIF, ERTS passes the raw pointer directly as a Zig slice (<code>[]const u8</code>) without copying.
     </div>
+  </div>
 
-    <div class="quiz-question" data-question="3">
-      <p><strong>3. Why is CRC-24 and syndrome repair performed inside Zig rather than in Elixir?</strong></p>
-      <div class="quiz-options">
-        <button class="quiz-option" data-correct="false">Elixir does not support bitwise XOR or shift operators on binary.</button>
-        <button class="quiz-option" data-correct="false">Zigler requires all return values to be validated by the compiler.</button>
-        <button class="quiz-option" data-correct="true">It discards invalid candidate frames before creating Elixir terms.</button>
-        <button class="quiz-option" data-correct="false">CRC calculations require direct hardware access to GPU registers.</button>
-      </div>
-      <div class="quiz-feedback"></div>
+  <div class="quiz-container" id="quiz-13-2">
+    <div class="quiz-question">
+      2. What happens to the native <code>DspContext</code> memory if the Elixir consumer process crashes?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">It causes an operating system memory leak until the VM restarts.</li>
+      <li class="quiz-option" data-correct="true">The BEAM GC automatically invokes the resource object destructor.</li>
+      <li class="quiz-option" data-correct="false">It triggers an immediate segfault and halts the Erlang node.</li>
+      <li class="quiz-option" data-correct="false">The OS kernel reclaims it only when the entire machine reboots.</li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> By registering <code>DspContext</code> as a <code>beam.Resource</code>, the native memory allocation is bound to an Erlang reference term. When the process holding the reference terminates, the BEAM Garbage Collector automatically triggers the resource destructor, preventing leaks.
+    </div>
+  </div>
+
+  <div class="quiz-container" id="quiz-13-3">
+    <div class="quiz-question">
+      3. Why is CRC-24 and syndrome repair performed inside Zig rather than in Elixir?
+    </div>
+    <ul class="quiz-options">
+      <li class="quiz-option" data-correct="false">Elixir does not support bitwise XOR or shift operators on binary.</li>
+      <li class="quiz-option" data-correct="false">Zigler requires all return values to be validated by the compiler.</li>
+      <li class="quiz-option" data-correct="true">It discards invalid candidate frames before creating Elixir terms.</li>
+      <li class="quiz-option" data-correct="false">CRC calculations require direct hardware access to GPU registers.</li>
+    </ul>
+    <div class="quiz-explanation">
+      <strong>Correct!</strong> In an SDR receiver, 99.9% of candidate pulses are noise. Computing CRC-24 and syndrome error correction in Zig eliminates invalid candidates in native memory before allocating any Elixir terms or placing garbage on the BEAM heap.
     </div>
   </div>
 

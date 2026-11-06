@@ -78,10 +78,20 @@
       <br>
       <em>Going deep into real SIGINT/TDOA: why standard correlation smears in multipath, phase whitening via GCC-PHAT ($R = \mathcal{F}^{-1}\{(XY^*)/|XY^*|\}$) to produce a Dirac delta, 3-point parabolic peak interpolation cutting 150m coarseness to ~5m, and Bancroft's spacetime Minkowski solver.</em>
     </li>
+    <li>
+      <strong><a href="lessons/0013-zigler-in-sdr-architecture.html">Lesson 0013: Zigler in SDR Scout — Mechanics, Memory Models, and SIMD Seams</a></strong>
+      <br>
+      <em>How Zigler compiles native Zig directly into BEAM NIFs, zero-copy refc binary passing (the 64-byte rule), `beam.Resource` lifecycle safety without GC leaks, `@Vector(16, f32)` AVX2/NEON linear magnitude, and in-Zig CRC-24 syndrome error recovery.</em>
+    </li>
   </ul>
 
   <h2>Reference Documents &amp; Glossaries</h2>
   <ul>
+    <li>
+      <strong><a href="reference/zigler-sdr-nif-reference.html">Zigler NIF Architecture &amp; SIMD DSP Reference Sheet</a></strong>
+      <br>
+      <em>Cheat sheet on Zigler syntax, `beam.Resource` lifecycle, zero-copy slice passing, `@Vector` SIMD vectors, and dirty scheduler boundaries.</em>
+    </li>
     <li>
       <strong><a href="reference/dsp-geometric-intuition.html">DSP Through Linear Algebra Reference Sheet</a></strong>
       <br>

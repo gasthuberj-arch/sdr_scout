@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Reference: Zigler NIF Architecture &amp; SIMD DSP</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    .ref-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 20px 0; }
+    @media (max-width: 800px) { .ref-grid { grid-template-columns: 1fr; } }
+    .card { background: #1e1e2e; border: 1px solid #313244; border-radius: 8px; padding: 16px; }
+    .card h3 { margin-top: 0; color: #89b4fa; border-bottom: 1px solid #313244; padding-bottom: 8px; }
+    pre { margin: 8px 0; background: #181825; }
+    code { font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <div class="lesson-meta">
+    <span class="badge badge-tag">Reference Sheet</span>
+    <span class="badge badge-arch">Native SIMD &amp; NIF Interop</span>
+    <span>SdrScout Native Architecture</span>
+  </div>
+
+  <h1>Zigler NIF Architecture &amp; SIMD DSP Reference</h1>
+
+  <div class="ref-grid">
+    <div class="card">
+      <h3>1. Basic Module Declaration</h3>
+      <pre><code>defmodule SdrScout.Native.Dsp do
+  use Zig,
+    otp_app: :sdr_scout,
+    resources: [:DspContext]
+
+  ~Z"""
+  const std = @import("std");
+  const beam = @import("beam");
+
+  pub fn my_nif(chunk: []const u8) beam.term {
+      return beam.make_i64(42);
+  }
+  """
+end</code></pre>
+      <p><small>Compiles native code directly into <code>priv/lib/Elixir.SdrScout.Native.Dsp.so</code>.</small></p>
+    </div>
+
+    <div class="card">
+      <h3>2. Zero-Copy Refc Binary Passing</h3>
+      <pre><code>// In Elixir:
+# Any binary > 64 bytes is a refc binary
+# stored off-heap in shared memory
+<<chunk::binary-size(65536)>>
+
+// In Zig:
+pub fn process(chunk: []const u8) beam.term {
+    // chunk.ptr points directly to BEAM shared memory
+    // chunk.len == 65536
+    // NO MEMCPY, ZERO ALLOCATION!
+}</code></pre>
+    </div>
+
+    <div class="card">
+      <h3>3. beam.Resource Lifecycle</h3>
+      <pre><code>pub const DspData = struct {
+    overlap_buf: [480]u8,
+    samples_processed: u64,
+};
+
+pub const DspContext =
+    beam.Resource(*DspData, @import("root"), .{});
+
+// Allocation:
+pub fn new_context() beam.term {
+    var ptr = beam.allocator.create(DspData) catch ...;
+    return DspContext.make(ptr, .{}); // -> #Reference<...>
+}
+
+// Unpacking in NIF:
+pub fn run(res: DspContext) beam.term {
+    const ctx = res.unpack(); // returns *DspData
+}</code></pre>
+      <p><small>Destructor is invoked automatically by BEAM GC when reference is collected.</small></p>
+    </div>
+
+    <div class="card">
+      <h3>4. SIMD Vectorization (`@Vector`)</h3>
+      <pre><code>// 16 lanes of 32-bit floats (512-bit / AVX2 / NEON)
+const Vec16 = @Vector(16, f32);
+
+var v_i: Vec16 = undefined;
+var v_q: Vec16 = undefined;
+
+// Fill lanes...
+const mag_sq = (v_i * v_i) + (v_q * v_q);
+const mag_vec = @sqrt(mag_sq); // 16 sqrt in 1 clock cycle!</code></pre>
+      <p><small>Target-independent: lowers to <code>ymm</code> on x86_64 AVX2, or <code>q0-q31</code> on ARM64 NEON.</small></p>
+    </div>
+  </div>
+
+  <div class="ref-grid">
+    <div class="card">
+      <h3>5. Boundary Overlap Buffer Invariant</h3>
+      <p>
+        <strong>Problem:</strong> ADS-B Mode-S frame = 240 samples (480 bytes).
+        Frames straddling 64 KB boundary are dropped without stitching.
+      </p>
+      <pre><code>// Prepend previous chunk tail (480 bytes)
+// to current chunk (65,536 bytes):
+const total_bytes = ctx.overlap_len + chunk.len;
+// Store last 480 bytes of current chunk for next delivery:
+const keep = @min(480, chunk.len);
+@memcpy(ctx.overlap_buf[0..keep], chunk[chunk.len - keep .. chunk.len]);
+ctx.overlap_len = keep;</code></pre>
+    </div>
+
+    <div class="card">
+      <h3>6. Schedulers &amp; 1ms Rule</h3>
+      <ul>
+        <li><strong>Standard NIF:</strong> Must complete in &le; 1 millisecond. Never block BEAM scheduler threads!</li>
+        <li><strong>Dirty Schedulers:</strong> For operations taking &gt; 1ms, specify <code>dirty: :cpu</code> or <code>dirty: :io</code>:
+          <pre><code>// In Zigler options:
+use Zig,
+  otp_app: :sdr_scout,
+  nifs: [process_huge_chunk: [dirty: :cpu]]</code></pre>
+        </li>
+      </ul>
+    </div>
+  </div>
+
+  <p><a href="../lessons/0013-zigler-in-sdr-architecture.html">&larr; Back to Lesson 13</a> | <a href="../index.html">Course Portal</a></p>
+</body>
+</html>

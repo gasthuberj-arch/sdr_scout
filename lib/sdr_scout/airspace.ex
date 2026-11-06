@@ -16,11 +16,9 @@ defmodule SdrScout.Airspace do
   @default_stale_timeout_ms 60_000
   @eviction_interval_ms 5_000
 
-  defstruct [
-    aircraft: %{},
-    stale_timeout_ms: @default_stale_timeout_ms,
-    schedule_eviction: true
-  ]
+  defstruct aircraft: %{},
+            stale_timeout_ms: @default_stale_timeout_ms,
+            schedule_eviction: true
 
   # ===========================================================================
   # Pure Functional API

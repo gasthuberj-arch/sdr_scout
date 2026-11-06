@@ -31,7 +31,9 @@ defmodule SdrScout.AirspaceTest do
 
     test "evicts stale tracks using cutoff timestamp" do
       airspace = Airspace.new(stale_timeout_ms: 5_000)
-      {:ok, _, airspace} = Airspace.ingest(airspace, TestVectors.identification_frame(), now: 1_000)
+
+      {:ok, _, airspace} =
+        Airspace.ingest(airspace, TestVectors.identification_frame(), now: 1_000)
 
       # Before cutoff: track retained
       {evicted_none, airspace} = Airspace.evict_stale(airspace, now: 4_000)
@@ -48,7 +50,11 @@ defmodule SdrScout.AirspaceTest do
   describe "Supervised GenServer process lifecycle" do
     test "synchronous ingest/2 and evict_stale/2 without sleeps" do
       {:ok, pid} =
-        Airspace.start_link(name: :test_airspace_sync, stale_timeout_ms: 30, schedule_eviction: false)
+        Airspace.start_link(
+          name: :test_airspace_sync,
+          stale_timeout_ms: 30,
+          schedule_eviction: false
+        )
 
       frame = TestVectors.identification_frame()
       assert {:ok, ac, snapshot} = Airspace.ingest(pid, frame)
@@ -64,7 +70,11 @@ defmodule SdrScout.AirspaceTest do
 
     test "asynchronous process_frame/2 cast with instance reference" do
       {:ok, pid} =
-        Airspace.start_link(name: :test_airspace_stream, stale_timeout_ms: 50, schedule_eviction: false)
+        Airspace.start_link(
+          name: :test_airspace_stream,
+          stale_timeout_ms: 50,
+          schedule_eviction: false
+        )
 
       frame = TestVectors.identification_frame()
       Airspace.process_frame(pid, frame)
